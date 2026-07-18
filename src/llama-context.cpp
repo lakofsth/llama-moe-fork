@@ -119,6 +119,16 @@ llama_context::llama_context(
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
 
+    // fork/phase-a: MoE router-lookahead prefetch (env LLAMA_MOE_PREFETCH=k[,depth]).
+    // Only when no user eval-callback is installed — we don't chain.
+    if (!cparams.cb_eval) {
+        moe_prefetch = llama_moe_prefetch_create(model);
+        if (moe_prefetch) {
+            cparams.cb_eval           = llama_moe_prefetch_cb;
+            cparams.cb_eval_user_data = moe_prefetch.get();
+        }
+    }
+
     cparams.ctx_other = nullptr;
 
     // TODO: more generic

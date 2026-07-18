@@ -7,6 +7,7 @@
 #include "llama-adapter.h"
 #include "llama-impl.h"
 #include "llama-memory.h"
+#include "llama-moe-prefetch.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -287,6 +288,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // fork/phase-a: MoE router-lookahead prefetch (null unless LLAMA_MOE_PREFETCH is set)
+    llama_moe_prefetch_ptr moe_prefetch;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
