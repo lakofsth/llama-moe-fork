@@ -611,6 +611,7 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_CENTROIDS,
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
+    LLM_TENSOR_FC_NORM, // EAGLE-3.1 per-aux-tap norm (fc_norm.%d)
     LLM_TENSOR_D2T,
 };
 

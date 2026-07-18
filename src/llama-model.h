@@ -615,6 +615,7 @@ struct llama_model {
 
     // eagle3
     struct ggml_tensor * fc  = nullptr;  // feature fusion layer
+    struct ggml_tensor * fc_norm[3] = { nullptr, nullptr, nullptr }; // EAGLE-3.1: per-aux-tap RMSNorm before fc
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
