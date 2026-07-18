@@ -1455,6 +1455,53 @@ UseGgmlGemm2:;
     }
 }
 
+// fork: online expert-heat counting (LLAMA_MOE_HEAT_ONLINE=1). The split graph's CPU
+// branch sees every routed slot exactly once per token in the single-threaded grouping
+// preamble below: valid ids are COLD experts (exact counts), sentinels are hits on the
+// GPU-resident hot set (exact per-layer hit-rate). Layer parsed from the ids tensor
+// name suffix ("ffn_moe_ids_cpu-<il>"). Consumed by the repin logic in llama-context.
+#define GGML_MOE_ONLINE_MAX_LAYERS  128
+#define GGML_MOE_ONLINE_MAX_EXPERTS 1024
+static int64_t g_moe_online_counts[GGML_MOE_ONLINE_MAX_LAYERS][GGML_MOE_ONLINE_MAX_EXPERTS];
+static int64_t g_moe_online_sentinel[GGML_MOE_ONLINE_MAX_LAYERS];
+static int64_t g_moe_online_total[GGML_MOE_ONLINE_MAX_LAYERS];
+
+static int ggml_moe_online_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char * e = getenv("LLAMA_MOE_HEAT_ONLINE");
+        en = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return en;
+}
+
+static int ggml_moe_online_layer_from_name(const char * name) {
+    // only the split graph's CPU-branch ids carry the cold/sentinel encoding we count.
+    // NOTE: the sched renames input copies ("CPU#ffn_moe_ids_cpu-7#0"), so match by
+    // substring and parse the digits right after it, ignoring any suffix.
+    const char * p = strstr(name, "ffn_moe_ids_cpu-");
+    if (!p) return -1;
+    p += 16;
+    if (*p < '0' || *p > '9') return -1;
+    long il = 0;
+    while (*p >= '0' && *p <= '9') { il = il*10 + (*p - '0'); p++; }
+    if (il < 0 || il >= GGML_MOE_ONLINE_MAX_LAYERS) return -1;
+    return (int) il;
+}
+
+const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total) {
+    if (il < 0 || il >= GGML_MOE_ONLINE_MAX_LAYERS) return NULL;
+    if (sentinel) *sentinel = g_moe_online_sentinel[il];
+    if (total)    *total    = g_moe_online_total[il];
+    return g_moe_online_counts[il];
+}
+
+void ggml_cpu_moe_online_reset(void) {
+    memset(g_moe_online_counts,   0, sizeof(g_moe_online_counts));
+    memset(g_moe_online_sentinel, 0, sizeof(g_moe_online_sentinel));
+    memset(g_moe_online_total,    0, sizeof(g_moe_online_total));
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
@@ -1653,6 +1700,9 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // fork: online heat counting piggybacks on this single-threaded ids sweep
+        const int online_il = ggml_moe_online_enabled() ? ggml_moe_online_layer_from_name(ids->name) : -1;
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
@@ -1662,7 +1712,16 @@ static void ggml_compute_forward_mul_mat_id(
                 // another device's branch") — contribute zero and skip the mapping.
                 if (i02 < 0 || i02 >= n_as) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    if (online_il >= 0) {
+                        g_moe_online_sentinel[online_il]++;
+                        g_moe_online_total[online_il]++;
+                    }
                     continue;
+                }
+
+                if (online_il >= 0 && i02 < GGML_MOE_ONLINE_MAX_EXPERTS) {
+                    g_moe_online_counts[online_il][i02]++;
+                    g_moe_online_total[online_il]++;
                 }
 
                 MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};

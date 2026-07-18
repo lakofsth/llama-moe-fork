@@ -2078,6 +2078,40 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // fork: online-heat auto-repin. On tg-shaped decodes, periodically read the live
+    // routing counters; when the GPU hit-rate has decayed (workload/register drift),
+    // re-select the packed experts. Runs synchronously here between decodes — the swap
+    // touches GPU tensors and the mmap originals, both idle at this point.
+    {
+        static const bool online = [] { const char * e = getenv("LLAMA_MOE_HEAT_ONLINE"); return e && atoi(e) != 0; }();
+        if (online && n_outputs > 0) {
+            static const double thresh = [] { const char * e = getenv("LLAMA_MOE_REPIN_THRESH");   return e ? atof(e) : 0.45; }();
+            static const long   minhit = [] { const char * e = getenv("LLAMA_MOE_REPIN_MIN_HITS"); return e ? atol(e) : 20000; }();
+            static int since_check = 0;
+            if (++since_check >= 64) {
+                since_check = 0;
+                int64_t sent_all = 0, tot_all = 0;
+                for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+                    int64_t s = 0, t = 0;
+                    if (ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
+                }
+                if (tot_all >= minhit) {
+                    const double hit = (double) sent_all / (double) tot_all;
+                    if (hit < thresh) {
+                        synchronize();
+                        const int swapped = const_cast<llama_model &>(model).moe_heat_repin();
+                        if (swapped >= 0) {
+                            LLAMA_LOG_INFO("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
+                                           100.0*hit, 100.0*thresh, swapped);
+                        }
+                    } else {
+                        ggml_cpu_moe_online_reset(); // healthy window: restart so drift shows quickly
+                    }
+                }
+            }
+        }
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 

@@ -233,6 +233,12 @@ struct llama_moe_split {
     struct ggml_tensor * map_gpu_pp = nullptr; // I32 [1, n_expert]: packed local id, or G_l (sentinel) if CPU-resident — pp-shaped batches (MMQ helper skips out-of-range; dst zero-fill keeps skipped rows finite). Dummy encoding is FORBIDDEN here: it concentrates >n_tokens rows on expert 0, overflowing MMQ's per-expert row bound (distinct-ids invariant) -> garbage tail rows.
     struct ggml_tensor * mask_cpu = nullptr; // F32 [1, n_expert]: 1.0 where CPU-resident else 0.0
     struct ggml_tensor * mask_gpu = nullptr; // F32 [1, n_expert]: 1.0 where GPU-resident else 0.0
+
+    // fork: online-repin bookkeeping — which experts currently occupy the packed slots
+    // (index = packed slot g) and the heat estimate that put them there
+    std::vector<int32_t> cur_experts;
+    std::vector<float>   cur_heat;
+
     bool active() const { return gate_gpu != nullptr; }
 };
 
@@ -701,6 +707,10 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // fork: online-heat repin hook (no-op unless the heat split is active; see
+    // llama_model_base::moe_heat_repin)
+    virtual int moe_heat_repin() { return -1; }
+
 protected:
     llama_model_params params;
 
@@ -751,6 +761,11 @@ struct llama_model_base : public llama_model {
     void load_arch_hparams(llama_model_loader & ml) override = 0;
     void load_arch_tensors(llama_model_loader & ml) override = 0;
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override = 0;
+
+    // fork: online-heat repin — re-select each split layer's packed experts from the live
+    // routing counters (LLAMA_MOE_HEAT_ONLINE), swapping only changed slots within the
+    // layer's existing quota. Returns number of expert slots swapped, -1 if inactive.
+    int moe_heat_repin() override;
 };
 
 const char * llm_type_name(llm_type type);
