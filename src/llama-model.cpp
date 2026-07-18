@@ -8,6 +8,8 @@
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
 
+#include "ggml-cpu.h" // fork: online-heat counters
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
@@ -1410,6 +1412,17 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
+
+        // fork: online-repin bookkeeping (slot -> expert + normalized heat share)
+        ms.cur_experts.assign(sel[il].begin(), sel[il].end());
+        ms.cur_heat.resize(sel[il].size());
+        {
+            double hsum = 0.0;
+            for (int e : sel[il]) hsum += heat[(size_t) il*n_expert + e];
+            for (size_t g2 = 0; g2 < sel[il].size(); g2++) {
+                ms.cur_heat[g2] = hsum > 0.0 ? (float) (heat[(size_t) il*n_expert + sel[il][g2]] / hsum) : 0.0f;
+            }
+        }
         ggml_backend_tensor_set(ms.mask_cpu, kc.data(), 0, kc.size()*sizeof(float));
         ggml_backend_tensor_set(ms.mask_gpu, kg.data(), 0, kg.size()*sizeof(float));
     }
@@ -1429,6 +1442,116 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     }
     LLAMA_LOG_INFO("moe-heat-split: ENABLED — %d experts across %d layers on GPU (%.1f MiB, per-layer %d..%d), heat='%s', evicted %.1f MiB of originals\n",
             n_sel, n_split_layers, bytes/1024.0/1024.0, gmin, gmax, hf, evicted/1024.0/1024.0);
+}
+
+// fork: online-heat repin. Re-rank each split layer's experts from the live counters
+// (cold experts: exact window counts; GPU-resident experts: the observed hot mass
+// distributed by their current heat shares — censored but slow-drifting) and swap only
+// the changed slots within the layer's existing packed quota. Runs between decodes on
+// the main thread. Sources may have been evicted: tensor_set refaults them from NVMe.
+int llama_model_base::moe_heat_repin() {
+    static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
+    const int n_expert = (int) hparams.n_expert;
+    int swapped_total = 0;
+    bool any_active = false;
+
+    for (size_t il = 0; il < layers.size(); il++) {
+        auto & L  = layers[il];
+        auto & ms = L.moe_split;
+        if (!ms.active() || ms.cur_experts.empty()) continue;
+        any_active = true;
+
+        int64_t sent = 0, tot = 0;
+        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &tot);
+        if (!counts || tot <= 0) continue;
+
+        const size_t G = ms.cur_experts.size();
+
+        // score every expert in a common (count) scale
+        std::vector<double> score(n_expert, 0.0);
+        for (int e = 0; e < n_expert && e < 1024; e++) score[e] = (double) counts[e];
+        double hshare_sum = 0.0;
+        for (float h : ms.cur_heat) hshare_sum += h;
+        for (size_t g = 0; g < G; g++) {
+            const double share = hshare_sum > 0.0 ? ms.cur_heat[g] / hshare_sum : 1.0/(double) G;
+            score[ms.cur_experts[g]] = (double) sent * share;
+        }
+
+        // desired set = top-G by score
+        std::vector<int> order(n_expert);
+        for (int e = 0; e < n_expert; e++) order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + G, order.end(),
+                          [&](int a, int b) { return score[a] > score[b]; });
+        std::vector<char> want(n_expert, 0);
+        for (size_t g = 0; g < G; g++) want[order[g]] = 1;
+
+        // slots to replace and experts to bring in
+        std::vector<size_t> free_slots;
+        for (size_t g = 0; g < G; g++) if (!want[ms.cur_experts[g]]) free_slots.push_back(g);
+        std::vector<int> incoming;
+        {
+            std::vector<char> have(n_expert, 0);
+            for (int e : ms.cur_experts) have[e] = 1;
+            for (size_t g = 0; g < G; g++) if (!have[order[g]]) incoming.push_back(order[g]);
+        }
+        GGML_ASSERT(incoming.size() == free_slots.size());
+
+        const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
+        ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        for (size_t k = 0; k < incoming.size(); k++) {
+            const int    e = incoming[k];
+            const size_t g = free_slots[k];
+            for (int j = 0; j < 3; j++) {
+                const char * src = (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2];
+                ggml_backend_tensor_set(dsts[j], src, (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
+#if defined(__linux__)
+                if (do_evict) {
+                    // madvise-only at repin (loader fds are gone; unmapped-clean pages
+                    // are still preferentially evictable)
+                    const long ps = sysconf(_SC_PAGESIZE);
+                    uintptr_t a0 = ((uintptr_t) src + ps - 1) & ~(uintptr_t)(ps - 1);
+                    uintptr_t a1 = ((uintptr_t) src + srcs[j]->nb[2]) & ~(uintptr_t)(ps - 1);
+                    for (const auto & m : pimpl->mappings) {
+                        if (!m) continue;
+                        const uintptr_t base = (uintptr_t) m->addr();
+                        if (a0 >= base && a1 <= base + m->size() && a1 > a0) {
+                            madvise((void *) a0, a1 - a0, MADV_DONTNEED);
+                            break;
+                        }
+                    }
+                }
+#endif
+            }
+            ms.cur_experts[g] = e;
+        }
+        swapped_total += (int) incoming.size();
+
+        // rebuild the routing maps for the new set
+        std::vector<int32_t> mc(n_expert), mg(n_expert, 0), mgpp(n_expert, (int32_t) G);
+        std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
+        for (int e = 0; e < n_expert; e++) mc[e] = e;
+        for (size_t g = 0; g < G; g++) {
+            const int e = ms.cur_experts[g];
+            mc[e] = n_expert; mg[e] = (int32_t) g; mgpp[e] = (int32_t) g;
+            kc[e] = 0.0f; kg[e] = 1.0f;
+        }
+        ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.mask_cpu,   kc.data(),   0, kc.size()*sizeof(float));
+        ggml_backend_tensor_set(ms.mask_gpu,   kg.data(),   0, kg.size()*sizeof(float));
+
+        // refresh heat shares from this window's scores
+        double ssum = 0.0;
+        for (size_t g = 0; g < G; g++) ssum += score[ms.cur_experts[g]];
+        for (size_t g = 0; g < G; g++) {
+            ms.cur_heat[g] = ssum > 0.0 ? (float) (score[ms.cur_experts[g]] / ssum) : 0.0f;
+        }
+    }
+
+    if (!any_active) return -1;
+    ggml_cpu_moe_online_reset();
+    return swapped_total;
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {

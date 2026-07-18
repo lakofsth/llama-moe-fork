@@ -146,6 +146,12 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    // fork: online MoE expert-heat counters (LLAMA_MOE_HEAT_ONLINE=1) — filled by the
+    // split-graph CPU branch; cold experts get exact counts, GPU-resident hits land in
+    // *sentinel. Returns per-expert counts for layer il, or NULL if il out of range.
+    GGML_BACKEND_API const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total);
+    GGML_BACKEND_API void            ggml_cpu_moe_online_reset(void);
+
 #ifdef __cplusplus
 }
 #endif
