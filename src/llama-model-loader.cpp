@@ -1340,6 +1340,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+    // fork: LLAMA_MMAP_NO_PREFETCH=1 skips the whole-file MADV_WILLNEED. When the model
+    // is larger than the page cache, the prefetch flood self-evicts (each load re-reads
+    // tens of GB from disk); demand-faulting reads only what is actually touched.
+    if (const char * e = getenv("LLAMA_MMAP_NO_PREFETCH"); e && atoi(e) != 0) {
+        prefetch = false;
+    }
     if (use_mmap) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
