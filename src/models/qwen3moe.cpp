@@ -148,7 +148,9 @@ llama_model_qwen3moe::graph::graph(const llama_model & model, const llm_graph_pa
                     nullptr, nullptr,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr,
+                    model.layers[il].moe_split.active() ? &model.layers[il].moe_split : nullptr);
         cb(moe_out, "ffn_moe_out", il);
         cur = moe_out;
 
