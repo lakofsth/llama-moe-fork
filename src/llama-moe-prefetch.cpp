@@ -23,7 +23,7 @@ namespace {
 
 // dequantize a small router-side tensor (F32/F16/BF16) to f32
 static bool tensor_to_f32(const ggml_tensor * t, std::vector<float> & out) {
-    if (!t) return false;
+    if (!t || !t->buffer || !t->data) return false; // not materialized (e.g. fit-params probe context)
     const int64_t n = ggml_nelements(t);
     out.resize(n);
     switch (t->type) {
@@ -156,6 +156,10 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
     }
 
     const auto & hp = model.hparams;
+    // probe/vocab-only contexts (common_fit_params) have hparams but no materialized layers
+    if (model.layers.size() < hp.n_layer()) {
+        return nullptr;
+    }
     p->n_layer  = (int) hp.n_layer();
     p->n_embd   = (int) hp.n_embd;
     p->n_expert = (int) hp.n_expert;
@@ -210,7 +214,7 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
             p->tid2eid.resize((size_t) p->n_hash * p->n_vocab * p->n_used);
             for (int il = 0; il < p->n_hash; il++) {
                 const ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
-                if (!t || t->type != GGML_TYPE_I32 || t->ne[1] != p->n_vocab) { p->tid2eid.clear(); break; }
+                if (!t || !t->buffer || !t->data || t->type != GGML_TYPE_I32 || t->ne[1] != p->n_vocab) { p->tid2eid.clear(); break; }
                 ggml_backend_tensor_get(const_cast<ggml_tensor *>(t),
                         p->tid2eid.data() + (size_t) il * p->n_vocab * p->n_used,
                         0, (size_t) p->n_vocab * p->n_used * sizeof(int32_t));
@@ -229,34 +233,28 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
     return p;
 }
 
-bool llama_moe_prefetch_cb(struct ggml_tensor * t, bool ask, void * user_data) {
-    auto * p = (llama_moe_prefetch *) user_data;
-
-    // token ids at batch entry -> hash-layer prefetch (any batch size)
-    if (strcmp(t->name, "inp_tokens") == 0) {
-        if (ask) return true;
-        const int64_t nt = ggml_nelements(t);
-        p->n_tok += nt;
-        // periodic dedup reset so heat drift re-advises
-        if ((p->n_tok >> 6) != ((p->n_tok - nt) >> 6)) p->clear_advised();
-        if (!p->tid2eid.empty() && nt > 0 && nt <= 4096) {
-            std::vector<int32_t> ids(nt);
-            ggml_backend_tensor_get(t, ids.data(), 0, nt*sizeof(int32_t));
-            for (int il = 0; il < p->n_hash; il++) {
-                layer_info & li = p->layers[il];
-                if (!li.host) continue;
-                const int32_t * tab = p->tid2eid.data() + (size_t) il * p->n_vocab * p->n_used;
-                for (int64_t i = 0; i < nt; i++) {
-                    if (ids[i] < 0 || ids[i] >= p->n_vocab) continue;
-                    const int32_t * ex = tab + (size_t) ids[i] * p->n_used;
-                    for (int j = 0; j < p->n_used; j++) {
-                        if (ex[j] >= 0 && ex[j] < p->n_expert) p->advise(li, ex[j]);
-                    }
-                }
+void llama_moe_prefetch_on_tokens(llama_moe_prefetch * p, const int32_t * tokens, int32_t n_tokens) {
+    if (!p || !tokens || n_tokens <= 0) return;
+    p->n_tok += n_tokens;
+    // periodic dedup reset so heat drift / cache eviction gets re-advised
+    if ((p->n_tok >> 6) != ((p->n_tok - n_tokens) >> 6)) p->clear_advised();
+    if (p->tid2eid.empty()) return;
+    for (int il = 0; il < p->n_hash; il++) {
+        layer_info & li = p->layers[il];
+        if (!li.host) continue;
+        const int32_t * tab = p->tid2eid.data() + (size_t) il * p->n_vocab * p->n_used;
+        for (int32_t i = 0; i < n_tokens; i++) {
+            if (tokens[i] < 0 || tokens[i] >= p->n_vocab) continue;
+            const int32_t * ex = tab + (size_t) tokens[i] * p->n_used;
+            for (int j = 0; j < p->n_used; j++) {
+                if (ex[j] >= 0 && ex[j] < p->n_expert) p->advise(li, ex[j]);
             }
         }
-        return true;
     }
+}
+
+bool llama_moe_prefetch_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto * p = (llama_moe_prefetch *) user_data;
 
     // per-layer lookahead from the FFN-input state (generation-shaped batches only)
     if (strncmp(t->name, "hc_ffn_pre-", 11) == 0) {

@@ -11,6 +11,7 @@
 // Measurement basis: 65.6% top-6 hit @k=6, 84.6% @k=16, 92.0% @k=32 (d=1);
 // see ~/docs/hybrid-moe-fork-design-2026-07-18.md §2.2.
 
+#include <cstdint>
 #include <memory>
 
 struct llama_model;
@@ -29,3 +30,7 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model);
 
 // ggml_backend_sched_eval_callback; user_data = llama_moe_prefetch*.
 bool llama_moe_prefetch_cb(struct ggml_tensor * t, bool ask, void * user_data);
+
+// Called from the decode path with the batch's token ids (graph inputs never
+// reach the eval callback): hash-layer prefetch + dedup-window advance.
+void llama_moe_prefetch_on_tokens(llama_moe_prefetch * p, const int32_t * tokens, int32_t n_tokens);
