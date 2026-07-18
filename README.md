@@ -1,4 +1,10 @@
-# llama.cpp
+# llama.cpp — hybrid MoE streaming fork
+
+> **This is a fork.** It adds heat-driven expert placement across GPU/RAM/NVMe, an online
+> self-tuning repin loop, and a quality-gated router locality bias for sparse-MoE models
+> that don't fit in VRAM. **Start with [FORK.md](FORK.md)** — design, environment
+> variables, measured results, and what to run on your hardware. Everything below is the
+> upstream README ([ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)).
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
