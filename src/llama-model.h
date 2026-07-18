@@ -228,9 +228,9 @@ struct llama_moe_split {
     struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts
     struct ggml_tensor * up_gpu   = nullptr;
     struct ggml_tensor * down_gpu = nullptr; // [n_ff,  n_embd, G_l]
-    struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident — tg-shaped batches only
-    struct ggml_tensor * map_cpu_pp = nullptr; // I32 [1, n_expert]: own id, or 0 (dummy, weight-masked) — pp-shaped batches, where the sched may offload the op and sentinels must never reach CUDA
-    struct ggml_tensor * map_gpu  = nullptr; // I32 [1, n_expert]: packed local id, or 0 (dummy) if CPU-resident
+    struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident — all batch shapes (CPU op and CUDA mm_ids_helper both skip out-of-range)
+    struct ggml_tensor * map_gpu  = nullptr; // I32 [1, n_expert]: packed local id, or 0 (dummy, weight-masked) if CPU-resident — tg-shaped batches (mmvq path, dummy proven there)
+    struct ggml_tensor * map_gpu_pp = nullptr; // I32 [1, n_expert]: packed local id, or G_l (sentinel) if CPU-resident — pp-shaped batches (MMQ helper skips out-of-range; dst zero-fill keeps skipped rows finite). Dummy encoding is FORBIDDEN here: it concentrates >n_tokens rows on expert 0, overflowing MMQ's per-expert row bound (distinct-ids invariant) -> garbage tail rows.
     struct ggml_tensor * mask_cpu = nullptr; // F32 [1, n_expert]: 1.0 where CPU-resident else 0.0
     struct ggml_tensor * mask_gpu = nullptr; // F32 [1, n_expert]: 1.0 where GPU-resident else 0.0
     bool active() const { return gate_gpu != nullptr; }

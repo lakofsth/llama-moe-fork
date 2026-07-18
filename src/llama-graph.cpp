@@ -2003,10 +2003,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
 
     // fork/phase-b milestone 1: split engages for tg-shaped batches ONLY. pp batches
-    // build the stock chain (the sched's expert-upload offload handles them exactly as
-    // today); an offloaded split pp path is milestone-2 work (CUDA illegal-access there,
-    // and pp carries none of the heat-placement win — tg does).
-    if (msplit && msplit->active() && n_tokens <= 4) {
+    // build the stock chain — BUT stock pp touches every expert's ORIGINAL host pages
+    // (incl. the packed hot set), blowing the working set past the page cache; that is
+    // the m1 parity mechanism. LLAMA_MOE_SPLIT_PP=1 engages the split for pp too
+    // (milestone-2 path; CUDA illegal-access being debugged there).
+    static const bool split_pp = [] { const char * e = getenv("LLAMA_MOE_SPLIT_PP"); return e && atoi(e) != 0; }();
+    if (msplit && msplit->active() && (n_tokens <= 4 || split_pp)) {
         // heat-driven expert split — dual-branch chain over the CPU
         // originals (foreign slots -> sentinel, zeroed by the patched CPU op) and the
         // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
@@ -2017,15 +2019,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
 
-        // tg-shaped batches: sentinel encoding (op runs on our patched CPU code, zero waste).
-        // pp-shaped: valid-dummy encoding — the sched may offload the op to CUDA, and neither
-        // its used-expert scan nor the CUDA kernels tolerate out-of-range ids.
-        ggml_tensor * map_cpu_use = n_tokens <= 4 ? msplit->map_cpu : msplit->map_cpu_pp;
+        // CPU branch: sentinel encoding for ALL batch shapes — the patched CPU op skips +
+        // zeroes sentinel slots; when the sched offloads a pp batch to CUDA, mm_ids_helper
+        // and the partial-upload scan both skip out-of-range ids (and the ids-path dst is
+        // zero-filled), so hot slots cost nothing on either backend.
+        // GPU branch: dummy 0 for tg (mmvq path, weight-masked, proven); sentinel G for pp —
+        // dummy encoding there concentrates >n_tokens rows on packed expert 0 and overflows
+        // MMQ's per-expert row bound (the distinct-ids invariant) -> garbage tail rows.
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
-                ggml_get_rows(ctx0, map_cpu_use, sel_flat), n_expert_used, n_tokens);
+                ggml_get_rows(ctx0, msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
         cb(ids_cpu, "ffn_moe_ids_cpu", il);
+        ggml_tensor * map_gpu_use = n_tokens <= 4 ? msplit->map_gpu : msplit->map_gpu_pp;
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0,
-                ggml_get_rows(ctx0, msplit->map_gpu, sel_flat), n_expert_used, n_tokens);
+                ggml_get_rows(ctx0, map_gpu_use, sel_flat), n_expert_used, n_tokens);
         cb(ids_gpu, "ffn_moe_ids_gpu", il);
 
         ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_cpu,

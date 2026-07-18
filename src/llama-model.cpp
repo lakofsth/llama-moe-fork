@@ -25,6 +25,12 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+
+#if defined(__linux__)
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#endif
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1233,7 +1239,41 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 // tensors within LLAMA_MOE_HEAT_VRAM_MB (default 20000), and publishes per-layer
 // split descriptors. Originals stay host/mmap for the CPU branch — GPU-resident
 // experts' pages are simply never faulted in.
-static void llama_moe_heat_split_init(llama_model_base & model) {
+//
+// LLAMA_MOE_HEAT_EVICT=1 additionally releases the GPU-resident experts' original
+// pages after the copy (madvise DONTNEED on the mapping + fadvise DONTNEED on the
+// file range), so the ~budget-sized hot set stops competing with the cold set for
+// page cache. Only pays off when nothing re-touches the originals — i.e. together
+// with LLAMA_MOE_SPLIT_PP (stock-chain pp re-faults them, correct but slow).
+static void llama_moe_heat_evict_slice(llama_model_loader & ml, const void * p, size_t len, size_t & evicted) {
+#if defined(__linux__)
+    const long ps = sysconf(_SC_PAGESIZE);
+    uintptr_t a0 = ((uintptr_t) p + ps - 1) & ~(uintptr_t)(ps - 1);         // inner-align: never
+    uintptr_t a1 = ((uintptr_t) p + len)   & ~(uintptr_t)(ps - 1);          // touch neighbors' pages
+    if (a1 <= a0) {
+        return;
+    }
+    // only ever drop pages that are provably file-backed mmap — MADV_DONTNEED on
+    // anonymous memory (--no-mmap path) would ZERO the weights instead of dropping
+    // a clean file page
+    for (size_t i = 0; i < ml.mappings.size(); i++) {
+        const auto & m = ml.mappings[i];
+        if (!m) continue;
+        const uintptr_t base = (uintptr_t) m->addr();
+        if (a0 >= base && a1 <= base + m->size()) {
+            if (madvise((void *) a0, a1 - a0, MADV_DONTNEED) == 0) {
+                posix_fadvise(ml.files[i]->file_id(), a0 - base, a1 - a0, POSIX_FADV_DONTNEED);
+                evicted += a1 - a0;
+            }
+            break;
+        }
+    }
+#else
+    GGML_UNUSED(ml); GGML_UNUSED(p); GGML_UNUSED(len); GGML_UNUSED(evicted);
+#endif
+}
+
+static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
     const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
     if (!hf || !*hf) {
         return;
@@ -1319,8 +1359,8 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
         ms.up_gpu   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   G);
         ms.down_gpu = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], G);
         ms.map_cpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-        ms.map_cpu_pp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
-        ms.map_gpu  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_gpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_gpu_pp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.mask_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
         ms.mask_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
         ggml_format_name(ms.gate_gpu, "blk.%d.ffn_gate_exps_hot", il);
@@ -1336,31 +1376,40 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
         return;
     }
 
+    const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
+    size_t evicted = 0;
+
     for (int il = 0; il < n_layer; il++) {
         if (sel[il].empty()) continue;
         auto & L = model.layers[il];
         auto & ms = L.moe_split;
         const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
         ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
-        std::vector<int32_t> mc(n_expert), mcpp(n_expert), mg(n_expert, 0);
+        const int32_t G = (int32_t) sel[il].size();
+        std::vector<int32_t> mc(n_expert), mg(n_expert, 0), mgpp(n_expert, G);
         std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
-        for (int e = 0; e < n_expert; e++) { mc[e] = e; mcpp[e] = e; }
+        for (int e = 0; e < n_expert; e++) { mc[e] = e; }
         for (size_t g = 0; g < sel[il].size(); g++) {
             const int e = sel[il][g];
             for (int j = 0; j < 3; j++) {
                 ggml_backend_tensor_set(dsts[j],
                         (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2],
                         (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
+                if (do_evict) {
+                    llama_moe_heat_evict_slice(ml,
+                            (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2],
+                            srcs[j]->nb[2], evicted);
+                }
             }
-            mc[e]   = n_expert; // sentinel: CPU branch skips + zeroes this slot (tg; op stays on our patched CPU code)
-            mcpp[e] = 0;        // pp: valid dummy (weight-masked) — the sched may offload the op to CUDA
-            mg[e] = (int32_t) g;
+            mc[e]   = n_expert;    // sentinel: patched CPU op skips + zeroes; CUDA mm_ids_helper + sched scan skip out-of-range
+            mg[e]   = (int32_t) g; // tg (mmvq): packed id for hot, dummy 0 for cold (weight-masked)
+            mgpp[e] = (int32_t) g; // pp (MMQ):  packed id for hot, sentinel G for cold (skipped; dst zero-filled)
             kc[e] = 0.0f;
             kg[e] = 1.0f;
         }
         ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
-        ggml_backend_tensor_set(ms.map_cpu_pp, mcpp.data(), 0, mcpp.size()*sizeof(int32_t));
-        ggml_backend_tensor_set(ms.map_gpu,  mg.data(), 0, mg.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.mask_cpu, kc.data(), 0, kc.size()*sizeof(float));
         ggml_backend_tensor_set(ms.mask_gpu, kg.data(), 0, kg.size()*sizeof(float));
     }
@@ -1378,8 +1427,8 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
         gmin = std::min(gmin, (int) sel[il].size());
         gmax = std::max(gmax, (int) sel[il].size());
     }
-    LLAMA_LOG_INFO("moe-heat-split: ENABLED — %d experts across %d layers on GPU (%.1f MiB, per-layer %d..%d), heat='%s'\n",
-            n_sel, n_split_layers, bytes/1024.0/1024.0, gmin, gmax, hf);
+    LLAMA_LOG_INFO("moe-heat-split: ENABLED — %d experts across %d layers on GPU (%.1f MiB, per-layer %d..%d), heat='%s', evicted %.1f MiB of originals\n",
+            n_sel, n_split_layers, bytes/1024.0/1024.0, gmin, gmax, hf, evicted/1024.0/1024.0);
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -1787,14 +1836,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // fork/phase-b: heat-driven expert split (no-op unless LLAMA_MOE_HEAT_FILE is set).
+    // Must run while ml still owns the mappings (eviction resolves file offsets there).
+    llama_moe_heat_split_init(*this, ml);
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
-
-    // fork/phase-b: heat-driven expert split (no-op unless LLAMA_MOE_HEAT_FILE is set)
-    llama_moe_heat_split_init(*this);
 
     return true;
 }
