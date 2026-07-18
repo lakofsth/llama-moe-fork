@@ -1771,7 +1771,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const struct llama_moe_split * msplit) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1792,8 +1793,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        msplit
     );
+}
+
+// fork/phase-b: deepseek4-flavour expert chain (separate gate/up, per-layer swiglu
+// clamp, no expert biases/scales/loras) over an explicit tensor triple + id set.
+// Used once per device branch by the heat-split path; numerics mirror the ds4 case
+// of the main chain below (validated by the equal-VRAM identity bench).
+static ggml_tensor * moe_ffn_chain_ds4(
+        ggml_context * ctx0,
+        const llama_hparams & hparams,
+        ggml_tensor * x,     // [n_embd, 1, n_tokens]
+        ggml_tensor * sel,   // I32 [n_expert_used, n_tokens]; out-of-range = sentinel (CPU op zeroes)
+        ggml_tensor * up_exps,
+        ggml_tensor * gate_exps,
+        ggml_tensor * down_exps,
+        int il) {
+    ggml_tensor * up   = ggml_mul_mat_id(ctx0, up_exps,   x, sel);
+    ggml_tensor * gate = ggml_mul_mat_id(ctx0, gate_exps, x, sel);
+    ggml_tensor * act  = nullptr;
+    const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
+    if (limit > 1e-6f) {
+        up   = ggml_clamp(ctx0, up, -limit, limit);
+        gate = ggml_clamp(ctx0, gate, -INFINITY, limit);
+        act  = ggml_swiglu_split(ctx0, gate, up);
+    } else {
+        act  = ggml_swiglu_split(ctx0, gate, up);
+    }
+    return ggml_mul_mat_id(ctx0, down_exps, act, sel);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(
@@ -1820,7 +1849,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         const struct llama_moe_split * msplit) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -1972,6 +2002,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    if (msplit && msplit->active()) {
+        // fork/phase-b: heat-driven expert split — dual-branch chain over the CPU
+        // originals (foreign slots -> sentinel, zeroed by the patched CPU op) and the
+        // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
+        // were computed above from the ORIGINAL ids (normalization over the true 6).
+        GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4);
+        GGML_ASSERT(!gate_up_exps && !weight_before_ffn && type_op == LLM_FFN_SILU);
+
+        ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
+                ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
+
+        ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
+        cb(ids_cpu, "ffn_moe_ids_cpu", il);
+        ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, msplit->map_gpu, sel_flat), n_expert_used, n_tokens);
+        cb(ids_gpu, "ffn_moe_ids_gpu", il);
+
+        ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_cpu,
+                up_exps, gate_exps, down_exps, il);
+        cb(ex_cpu, "ffn_moe_split_cpu", il);
+        ggml_tensor * ex_gpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_gpu,
+                msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, il);
+        cb(ex_gpu, "ffn_moe_split_gpu", il);
+
+        ggml_tensor * m_cpu = ggml_reshape_3d(ctx0,
+                ggml_get_rows(ctx0, msplit->mask_cpu, sel_flat), 1, n_expert_used, n_tokens);
+        ggml_tensor * m_gpu = ggml_reshape_3d(ctx0,
+                ggml_get_rows(ctx0, msplit->mask_gpu, sel_flat), 1, n_expert_used, n_tokens);
+
+        experts = ggml_add(ctx0,
+                ggml_mul(ctx0, ex_cpu, ggml_mul(ctx0, weights, m_cpu)),
+                ggml_mul(ctx0, ex_gpu, ggml_mul(ctx0, weights, m_gpu)));
+        cb(experts, "ffn_moe_weighted_split", il);
+    } else {
+
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
@@ -2111,6 +2177,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
+
+    } // fork/phase-b: end of non-split chain
 
     ggml_build_forward_expand(gf, experts);
 

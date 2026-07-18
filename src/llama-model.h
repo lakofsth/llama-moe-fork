@@ -221,6 +221,20 @@ struct llama_layer_nextn {
     struct ggml_tensor * shared_head_norm      = nullptr;
 };
 
+// fork/phase-b: heat-driven expert split — hot experts duplicated into packed
+// GPU tensors; originals stay mmap'd for the CPU branch (GPU-resident experts'
+// pages are simply never touched). Populated post-load from LLAMA_MOE_HEAT_FILE.
+struct llama_moe_split {
+    struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts
+    struct ggml_tensor * up_gpu   = nullptr;
+    struct ggml_tensor * down_gpu = nullptr; // [n_ff,  n_embd, G_l]
+    struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident
+    struct ggml_tensor * map_gpu  = nullptr; // I32 [1, n_expert]: packed local id, or 0 (dummy) if CPU-resident
+    struct ggml_tensor * mask_cpu = nullptr; // F32 [1, n_expert]: 1.0 where CPU-resident else 0.0
+    struct ggml_tensor * mask_gpu = nullptr; // F32 [1, n_expert]: 1.0 where GPU-resident else 0.0
+    bool active() const { return gate_gpu != nullptr; }
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -336,6 +350,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+
+    // fork/phase-b: heat-driven expert split (empty unless heat file loaded)
+    struct llama_moe_split moe_split;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
