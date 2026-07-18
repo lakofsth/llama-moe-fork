@@ -39,23 +39,34 @@ static __global__ void mm_ids_helper(
     int it_compact = 0; // Running index for the compact slice of this expert.
 
     if constexpr (n_expert_used_template == 0) {
-        // Generic implementation:
+        // Generic implementation.
+        // fork: one compact entry per MATCHING (token, slot) pair rather than per token —
+        // the split-graph dummy encoding can put the same expert id in several slots of one
+        // token (stock topk ids are distinct per token). Counting offsets per slot (nex_prev)
+        // while writing per token left uninitialized gaps in ids_src1 -> garbage gather
+        // indices -> CUDA illegal access. Per-slot entries keep bounds and writes consistent;
+        // duplicate slots are computed redundantly and masked out by the caller.
         for (int it = 0; it < n_tokens; ++it) {
-            int iex_used = -1; // The index at which the expert is used, if any.
-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
-                if (expert_used == expert) {
-                    iex_used = iex;
+            for (int iex0 = 0; iex0 < n_expert_used; iex0 += warp_size) {
+                const int iex = iex0 + threadIdx.x;
+                int match = 0;
+                if (iex < n_expert_used) {
+                    const int expert_used = ids[it*si1 + iex];
+                    nex_prev += expert_used < expert;
+                    match = expert_used == expert;
                 }
-            }
 
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
-            }
-
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
-                it_compact++;
+                int prefix = match; // inclusive prefix sum of matches over the warp
+                for (int offset = 1; offset < warp_size; offset <<= 1) {
+                    const int tmp = __shfl_up_sync(0xFFFFFFFF, prefix, offset, warp_size);
+                    if ((int) threadIdx.x >= offset) {
+                        prefix += tmp;
+                    }
+                }
+                if (match) {
+                    store[it_compact + prefix - 1] = mm_ids_helper_store(it, iex);
+                }
+                it_compact += __shfl_sync(0xFFFFFFFF, prefix, warp_size - 1, warp_size);
             }
         }
     } else {
@@ -68,28 +79,25 @@ static __global__ void mm_ids_helper(
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
-            const int iex_used = expert_used == expert ? iex : -1;
+            const int match = expert_used == expert;
             nex_prev += expert_used < expert;
 
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
-
-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
-            int it_compact_add_lower = 0;
+            // fork: per-(token, slot) compact entries via a plain warp prefix scan of matches —
+            // tolerates duplicate expert ids within a token (see generic path comment). Thread
+            // order is (token, slot) order, so compact entries stay sorted.
+            int prefix = match; // inclusive prefix sum of matches over the warp
 #pragma unroll
-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-                    it_compact_add_lower += tmp;
+            for (int offset = 1; offset < warp_size; offset <<= 1) {
+                const int tmp = __shfl_up_sync(0xFFFFFFFF, prefix, offset, warp_size);
+                if ((int) threadIdx.x >= offset) {
+                    prefix += tmp;
                 }
             }
-
-            if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+            if (match) {
+                store[it_compact + prefix - 1] = mm_ids_helper_store(it, iex);
             }
-
-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            // The thread with the highest index in the warp always has the sum over the whole warp:
+            it_compact += __shfl_sync(0xFFFFFFFF, prefix, warp_size - 1, warp_size);
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);

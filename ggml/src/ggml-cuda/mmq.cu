@@ -174,6 +174,34 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
+    // fork: with sentinel ids (out of [0, ne02), "slot not on this branch") the helper writes
+    // FEWER than ne_get_rows compact entries, but the quantize gather below is launched over
+    // all ne_get_rows rows — zero-init so tail entries index row 0 (in-bounds, and never
+    // consumed by the GEMM: they lie outside every expert's bounds) instead of pool garbage.
+    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
+
+    // fork: LLAMA_DEBUG_IDS=1 — host-side validation that every id is in [0, ne02)
+    // (an out-of-range id makes the kernel read past the weight tensor: garbage f16
+    // scales -> NaN without an illegal access). Slow (sync copy); diagnostic only.
+    static const bool debug_ids = [] { const char * e = getenv("LLAMA_DEBUG_IDS"); return e && atoi(e) != 0; }();
+    if (debug_ids) {
+        std::vector<int32_t> h(ggml_nbytes(ids)/sizeof(int32_t));
+        CUDA_CHECK(cudaMemcpyAsync(h.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        int bad = 0;
+        for (int64_t i1 = 0; i1 < ids->ne[1] && bad < 8; i1++) {
+            for (int64_t i0 = 0; i0 < ids->ne[0] && bad < 8; i0++) {
+                const int32_t v = h[i1*(ids->nb[1]/sizeof(int32_t)) + i0];
+                if (v < 0 || v >= ne02) {
+                    GGML_LOG_ERROR("debug-ids: %s (src0=%s ne02=%ld): ids[%ld,%ld]=%d OUT OF RANGE\n",
+                        dst->name, src0->name, (long) ne02, (long) i0, (long) i1, v);
+                    bad++;
+                }
+            }
+        }
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
@@ -182,6 +210,21 @@ void ggml_cuda_mul_mat_q(
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, stream);
         CUDA_CHECK(cudaGetLastError());
+
+        // fork: LLAMA_DEBUG_IDS=1 — with every id valid, every (token, slot) pair lands on
+        // exactly one expert, so expert_bounds must be monotone and total ne12*n_expert_used;
+        // a shortfall means unwritten (garbage) compact entries feed the gather.
+        if (debug_ids) {
+            std::vector<int32_t> hb(ne02 + 1);
+            CUDA_CHECK(cudaMemcpyAsync(hb.data(), expert_bounds.get(), (ne02 + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            bool mono = true;
+            for (int64_t e = 0; e < ne02; e++) mono &= hb[e] <= hb[e+1];
+            if (!mono || hb[0] != 0 || hb[ne02] != (int32_t) (ne12*n_expert_used)) {
+                GGML_LOG_ERROR("debug-ids: %s (src0=%s): expert_bounds BAD — mono=%d b[0]=%d b[ne02]=%d expect_total=%ld\n",
+                    dst->name, src0->name, (int) mono, hb[0], hb[ne02], (long) (ne12*n_expert_used));
+            }
+        }
     }
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1)/QK8_1 +
@@ -211,6 +254,11 @@ void ggml_cuda_mul_mat_q(
     const int64_t s12 = use_native_fp4 ? ne11 * ne10_padded * sizeof(block_fp4_mmq) / (QK_K * sizeof(int)) :
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
+
+    // fork: rows whose id is a sentinel (out of [0, ne02)) produce no compact entry and are
+    // never written by the GEMM — zero-fill so those (weight-masked) dst rows are finite
+    // instead of pool garbage (0 x NaN = NaN was poisoning the masked combine).
+    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {

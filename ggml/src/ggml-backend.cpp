@@ -1574,8 +1574,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+                // fork: LLAMA_SCHED_NO_PARTIAL_UPLOAD=1 forces the full-tensor copy path (diagnostic knob)
+                static const bool no_partial_upload = [] { const char * e = getenv("LLAMA_SCHED_NO_PARTIAL_UPLOAD"); return e && atoi(e) != 0; }();
                 ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
+                if (!no_partial_upload && split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
@@ -1612,7 +1614,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
-                                GGML_ASSERT(id >= 0 && id < n_expert);
+                                // fork: out-of-range ids are sentinels ("slot not computed on this
+                                // branch") — skip rather than assert; the kernels skip them too
+                                if (id < 0 || id >= n_expert) {
+                                    continue;
+                                }
                                 ggml_bitset_set(used_ids.data(), id);
                             }
                         }
@@ -1635,9 +1641,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             expert_size_copy + padding_end);
                     };
 
+                    // fork: with sentinel ids a batch can use NO expert of this branch at all —
+                    // bound the search (stock ids always have >=1 valid id, so the unbounded
+                    // walk was safe before)
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
+                    }
+                    if (id == n_expert) {
+                        continue; // nothing used: skip the upload entirely
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
