@@ -69,10 +69,19 @@ class LlamaModel(TextModel):
                 target_config = {**target_config, **target_config["text_config"]}
             self.target_vocab_size = target_config["vocab_size"]
 
-            # target_layers: derived from target model layer count (low/mid/high)
+            # target_layers: prefer the drafter's TRAINED tap ids over the low/mid/high
+            # heuristic — a head trained on specific taps produces garbage drafts from any
+            # others. HF eagle_aux_hidden_state_layer_ids are output-of-layer ids; llama.cpp
+            # captures the INPUT of a layer, so shift by +1.
             target_num_layers = target_config["num_hidden_layers"]
-            target_layers = [2, target_num_layers // 2, target_num_layers - 3]
-            logger.info(f"EAGLE-3: target_layers = {target_layers} (target model has {target_num_layers} layers)")
+            aux_ids = (eagle3_raw_config.get("eagle_config") or {}).get("eagle_aux_hidden_state_layer_ids")
+            if aux_ids:
+                target_layers = [i + 1 for i in aux_ids]
+                logger.info(f"EAGLE-3: target_layers = {target_layers} "
+                            f"(from eagle_aux_hidden_state_layer_ids {aux_ids}, +1 to input-of-layer indexing)")
+            else:
+                target_layers = [2, target_num_layers // 2, target_num_layers - 3]
+                logger.info(f"EAGLE-3: target_layers = {target_layers} (heuristic; target model has {target_num_layers} layers)")
             self.gguf_writer.add_target_layers(target_layers)
 
             # target_hidden_size: prefer eagle3 config, fallback to target config

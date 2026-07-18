@@ -1106,6 +1106,18 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(inpL, "hc_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
+        // fork: EAGLE3 aux-hidden capture. Drafters tap the LAYER INPUT (= output of
+        // layer il-1); DSV4's residual is hc-multi-stream and the published V4-Flash
+        // EAGLE3 head is trained on the MEAN over the hc copies. Built only for the
+        // layers a speculative drafter requested.
+        if (il < (int) cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
+            ggml_tensor * t = ggml_cont(ctx0, ggml_permute(ctx0, inpL, 1, 0, 2, 3)); // [hc, n_embd, n_tokens]
+            t = ggml_sum_rows(ctx0, t);                                              // [1,  n_embd, n_tokens]
+            t = ggml_scale(ctx0, t, 1.0f/(float) hc);
+            res->t_layer_inp[il] = ggml_reshape_2d(ctx0, t, n_embd, n_tokens);
+            ggml_build_forward_expand(gf, res->t_layer_inp[il]);
+        }
+
         ggml_tensor * residual = inpL;
         ggml_tensor * post = nullptr;
         ggml_tensor * comb = nullptr;
