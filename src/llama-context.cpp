@@ -2087,6 +2087,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (online && n_outputs > 0) {
             static const double thresh = [] { const char * e = getenv("LLAMA_MOE_REPIN_THRESH");   return e ? atof(e) : 0.45; }();
             static const long   minhit = [] { const char * e = getenv("LLAMA_MOE_REPIN_MIN_HITS"); return e ? atol(e) : 20000; }();
+            // trace: log every check window (WARN so llama-cli shows it); repin events
+            // are always WARN — they are rare and change the placement, silent is worse
+            static const bool trace = [] { const char * e = getenv("LLAMA_MOE_HEAT_TRACE"); return e && atoi(e) != 0; }();
             static int since_check = 0;
             if (++since_check >= 64) {
                 since_check = 0;
@@ -2101,12 +2104,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         synchronize();
                         const int swapped = const_cast<llama_model &>(model).moe_heat_repin();
                         if (swapped >= 0) {
-                            LLAMA_LOG_INFO("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
                                            100.0*hit, 100.0*thresh, swapped);
                         }
                     } else {
+                        if (trace) {
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, reset\n",
+                                           100.0*hit, 100.0*thresh, (long long) tot_all);
+                        }
                         ggml_cpu_moe_online_reset(); // healthy window: restart so drift shows quickly
                     }
+                } else if (trace) {
+                    LLAMA_LOG_WARN("moe-heat-online: window %lld ids < %ld min, accumulating (hit-rate so far %.1f%%)\n",
+                                   (long long) tot_all, minhit, tot_all > 0 ? 100.0*(double)sent_all/(double)tot_all : 0.0);
                 }
             }
         }
