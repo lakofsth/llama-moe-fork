@@ -52,6 +52,32 @@ Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv
 | + bias ε=0.5, gate δ=0.05 | **30** | +0.2 % (noise) |
 | + bias ε=0.5, ungated | 40 | +2.6 % |
 
-Only two deepseek4-specific points exist (the init gate in `llama-model.cpp` and the
-`moe_heat_repin` override); the rest rides the shared MoE graph path — porting to other
-MoE architectures is planned.
+## Architecture support
+
+The machinery is generic — it operates on the standard `ffn_*_exps` expert layout and the
+shared `build_moe_ffn` graph path. Each architecture is enabled by a whitelist entry plus a
+two-line builder change, and ships only after validation on real hardware:
+
+| arch | status |
+|---|---|
+| `deepseek4` | validated (DeepSeek-V4-Flash — all numbers above) |
+| `qwen3moe` | ported; validation in progress (Qwen3-30B-A3B) |
+| `glm4moe`, `qwen3next` | next — same recipe |
+
+Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
+real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
+self-profiling, no logging pipeline needed.
+
+## What to run on what hardware
+
+Guidance, not law — tg depends heavily on RAM bandwidth. "Hybrid regime" means the model
+spans GPU + RAM with at most a modest NVMe tail; that's where this fork pays.
+
+| hardware class | suggestion |
+|---|---|
+| 10–12 GB VRAM + 64 GB RAM (e.g. 3080 desktop) | Once `glm4moe` validates: **GLM-4.7-Flash Q4_K_XL (~18 GB)** — honest 4-bit quality, fits RAM+VRAM easily. Adventurous today: DeepSeek-V4-Flash at a ~2-bit dynamic quant (~65–70 GB, NVMe tail, unmeasured — expect single-digit tg, rough 2-bit quality) |
+| 24–32 GB VRAM + 96–128 GB RAM (e.g. 4090/5090 workstation) | DeepSeek-V4-Flash UD-IQ4_XS (129 GB) — the measured configuration above |
+| CPU-heavy boxes, 192 GB+ RAM, small GPU | Large MoEs at 4-bit (V4-Flash-class and up); the heat split keeps the small card saturated with the hot experts |
+
+Quant-size rule of thumb for the hybrid budget: fit ≈ VRAM + RAM − (OS + KV cache + ~10 %
+headroom); anything past that streams from NVMe, which the placement tolerates but tg pays for.
