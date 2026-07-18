@@ -1679,6 +1679,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return encode(batch_inp);
     }
 
+    // fork/phase-a: hash-layer prefetch + dedup-window advance need token ids;
+    // graph inputs never reach the eval callback, so hook here.
+    if (moe_prefetch && batch_inp.token && batch_inp.n_tokens > 0) {
+        llama_moe_prefetch_on_tokens(moe_prefetch.get(), batch_inp.token, batch_inp.n_tokens);
+    }
+
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
