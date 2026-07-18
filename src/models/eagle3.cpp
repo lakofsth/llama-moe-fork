@@ -53,6 +53,15 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     // Feature fusion layer: projects 3 target layers to draft hidden size
     fc = create_tensor(tn(LLM_TENSOR_FC, "weight"), {n_embd_inp, n_embd}, 0);
 
+    // EAGLE-3.1 variant: optional per-aux-tap RMSNorm weights applied to each of the
+    // three captured target hidden states before the fc fusion (absent in plain EAGLE-3).
+    // Index lives in the suffix ("fc_norm.K.weight") — the loader classifies fc_norm as an
+    // output-layer tensor, which forbids a block id (and n_layer==1 makes one meaningless).
+    for (int k = 0; k < 3; ++k) {
+        const std::string sfx = std::to_string(k) + ".weight";
+        fc_norm[k] = create_tensor(tn(LLM_TENSOR_FC_NORM, sfx.c_str()), {n_embd}, TENSOR_NOT_REQUIRED);
+    }
+
     // Output layer (uses draft vocab size)
     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_draft_vocab}, TENSOR_NOT_REQUIRED);
@@ -129,6 +138,20 @@ llama_model_eagle3::graph<true>::graph(const llama_model & model, const llm_grap
     ggml_tensor * cur = nullptr;
 
     cur = build_inp_embd_enc();
+
+    // EAGLE-3.1: RMSNorm each aux tap's slice (n_embd wide) with its own weight before
+    // the fusion; plain EAGLE-3 checkpoints have no fc_norm tensors and skip this.
+    if (model.fc_norm[0] != nullptr) {
+        const int64_t n_embd_tap = cur->ne[0] / 3;
+        ggml_tensor * slices[3];
+        for (int k = 0; k < 3; ++k) {
+            ggml_tensor * s = ggml_view_2d(ctx0, cur, n_embd_tap, n_tokens, cur->nb[1], (size_t) k*n_embd_tap*ggml_element_size(cur));
+            s = ggml_rms_norm(ctx0, s, hparams.f_norm_rms_eps);
+            slices[k] = ggml_mul(ctx0, s, model.fc_norm[k]);
+        }
+        cur = ggml_concat(ctx0, ggml_concat(ctx0, slices[0], slices[1], 0), slices[2], 0);
+        cb(cur, "fc_norm_out", -1);
+    }
 
     // Feature fusion layer
     cur = build_lora_mm(model.fc, cur);

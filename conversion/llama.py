@@ -231,6 +231,11 @@ class LlamaModel(TextModel):
             if name == "fc.weight":
                 yield (name, data_torch)
                 return
+            if name.startswith("fc_norm."):
+                # EAGLE-3.1: per-aux-tap RMSNorm applied to each captured hidden state
+                # before the fc fusion; keep the checkpoint's own naming (fc_norm.{k}.weight)
+                yield (name, data_torch)
+                return
             if name == "d2t":
                 # store for manual int64 handling in prepare_tensors (avoid F32 conversion)
                 if not hasattr(self, '_eagle3_int_tensors'):

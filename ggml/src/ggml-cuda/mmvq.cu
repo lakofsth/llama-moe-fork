@@ -710,7 +710,7 @@ static __global__ void mul_mat_vec_q_moe(
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+        const uint32_t ncols_dst, const uint32_t ids_stride, const uint32_t nchannels_x) {
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
@@ -738,13 +738,18 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
+    // fork: an out-of-range id is a sentinel ("slot not computed on this branch") —
+    // contribute exact zeros (the caller weight-masks these lanes) instead of reading
+    // past the weight tensor
+    const bool ch_valid = channel_x < nchannels_x;
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset  = ch_valid ? channel_x*stride_channel_x + row0*stride_row_x : 0;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
 
-    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+    for (int kbx = ch_valid ? threadIdx.x / (qi/vdr) : blocks_per_row_x; kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1);
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
@@ -819,7 +824,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, const uint32_t nchannels_x, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
@@ -831,7 +836,7 @@ static void mul_mat_vec_q_moe_launch(
         vx, vy, ids, dst, ncols_x, nchannels_y, nrows_x,
         stride_row_x, stride_col_y, stride_col_dst,
         stride_channel_x, stride_channel_y, stride_channel_dst,
-        ncols_dst, ids_stride);
+        ncols_dst, ids_stride, nchannels_x);
 }
 
 template <ggml_type type>
@@ -906,7 +911,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, (uint32_t) nchannels_x, stream);
         return;
     }
 
