@@ -1306,7 +1306,7 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
     int n_split_layers = 0;
     for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) n_split_layers++;
 
-    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*7 + 8), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*8 + 8), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
 
     for (int il = 0; il < n_layer; il++) {
@@ -1318,7 +1318,8 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
         ms.gate_gpu = ggml_new_tensor_3d(ctx, L.ffn_gate_exps->type, L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], G);
         ms.up_gpu   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   G);
         ms.down_gpu = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], G);
-        ms.map_cpu  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_cpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_cpu_pp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.map_gpu  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.mask_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
         ms.mask_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
@@ -1341,9 +1342,9 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
         auto & ms = L.moe_split;
         const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
         ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
-        std::vector<int32_t> mc(n_expert), mg(n_expert, 0);
+        std::vector<int32_t> mc(n_expert), mcpp(n_expert), mg(n_expert, 0);
         std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
-        for (int e = 0; e < n_expert; e++) mc[e] = e;
+        for (int e = 0; e < n_expert; e++) { mc[e] = e; mcpp[e] = e; }
         for (size_t g = 0; g < sel[il].size(); g++) {
             const int e = sel[il][g];
             for (int j = 0; j < 3; j++) {
@@ -1351,12 +1352,14 @@ static void llama_moe_heat_split_init(llama_model_base & model) {
                         (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2],
                         (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
             }
-            mc[e] = n_expert; // sentinel: CPU branch skips + zeroes this slot
+            mc[e]   = n_expert; // sentinel: CPU branch skips + zeroes this slot (tg; op stays on our patched CPU code)
+            mcpp[e] = 0;        // pp: valid dummy (weight-masked) — the sched may offload the op to CUDA
             mg[e] = (int32_t) g;
             kc[e] = 0.0f;
             kg[e] = 1.0f;
         }
-        ggml_backend_tensor_set(ms.map_cpu,  mc.data(), 0, mc.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_cpu_pp, mcpp.data(), 0, mcpp.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu,  mg.data(), 0, mg.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.mask_cpu, kc.data(), 0, kc.size()*sizeof(float));
         ggml_backend_tensor_set(ms.mask_gpu, kg.data(), 0, kg.size()*sizeof(float));

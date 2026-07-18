@@ -228,7 +228,8 @@ struct llama_moe_split {
     struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts
     struct ggml_tensor * up_gpu   = nullptr;
     struct ggml_tensor * down_gpu = nullptr; // [n_ff,  n_embd, G_l]
-    struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident
+    struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident — tg-shaped batches only
+    struct ggml_tensor * map_cpu_pp = nullptr; // I32 [1, n_expert]: own id, or 0 (dummy, weight-masked) — pp-shaped batches, where the sched may offload the op and sentinels must never reach CUDA
     struct ggml_tensor * map_gpu  = nullptr; // I32 [1, n_expert]: packed local id, or 0 (dummy) if CPU-resident
     struct ggml_tensor * mask_cpu = nullptr; // F32 [1, n_expert]: 1.0 where CPU-resident else 0.0
     struct ggml_tensor * mask_gpu = nullptr; // F32 [1, n_expert]: 1.0 where GPU-resident else 0.0
