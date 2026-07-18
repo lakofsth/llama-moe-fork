@@ -2002,8 +2002,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (msplit && msplit->active()) {
-        // fork/phase-b: heat-driven expert split — dual-branch chain over the CPU
+    // fork/phase-b milestone 1: split engages for tg-shaped batches ONLY. pp batches
+    // build the stock chain (the sched's expert-upload offload handles them exactly as
+    // today); an offloaded split pp path is milestone-2 work (CUDA illegal-access there,
+    // and pp carries none of the heat-placement win — tg does).
+    if (msplit && msplit->active() && n_tokens <= 4) {
+        // heat-driven expert split — dual-branch chain over the CPU
         // originals (foreign slots -> sentinel, zeroed by the patched CPU op) and the
         // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
         // were computed above from the ORIGINAL ids (normalization over the true 6).
