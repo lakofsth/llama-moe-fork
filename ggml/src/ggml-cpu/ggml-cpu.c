@@ -28,6 +28,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <inttypes.h>
 #include <stdio.h>
 #include <float.h>
@@ -1564,6 +1568,32 @@ static void ggml_compute_forward_mul_mat_id(
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
+
+#ifdef __linux__
+    // fork/phase-a: EXACT expert prefetch (env GGML_MOE_PREFETCH_EXACT=1).
+    // The selected ids are already computed; advise their weight slices before the
+    // gather/matmul touches them — experts stream in while earlier ones compute.
+    // Zero prediction error, no graph observation. tg-shaped batches only.
+    if (ith == 0 && ids->ne[1] <= 4) {
+        static int moe_prefetch_exact = -1;
+        if (moe_prefetch_exact < 0) {
+            const char * e = getenv("GGML_MOE_PREFETCH_EXACT");
+            moe_prefetch_exact = (e && *e && *e != '0') ? 1 : 0;
+        }
+        if (moe_prefetch_exact && src0->data && ids->data) {
+            const size_t pg_mask = ~((size_t) sysconf(_SC_PAGESIZE) - 1);
+            for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+                    const int32_t id = *(const int32_t *)((const char *) ids->data + i0*ids->nb[0] + i1*ids->nb[1]);
+                    if (id < 0 || id >= n_as) continue;
+                    const uintptr_t a  = (uintptr_t) src0->data + (size_t) id * nb02;
+                    const uintptr_t al = a & pg_mask;
+                    posix_madvise((void *) al, (size_t) nb02 + (a - al), POSIX_MADV_WILLNEED);
+                }
+            }
+        }
+    }
+#endif
 
     void * wdata_cur = params->wdata;
 
