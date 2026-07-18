@@ -1939,6 +1939,18 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
+    // fork: router locality bias (LLAMA_MOE_ROUTER_BIAS=<eps>) — add eps to GPU-resident
+    // experts' SELECTION scores only, pre-top-k. Mixture weights are gathered from the
+    // unbiased probs below, so quality cost comes only from changed selections, not from
+    // distorted weighting. Group-masked -INF entries are unaffected by the add.
+    static const float router_bias = [] { const char * e = getenv("LLAMA_MOE_ROUTER_BIAS"); return e ? (float) atof(e) : 0.0f; }();
+    if (router_bias != 0.0f && msplit && msplit->active()) {
+        ggml_tensor * hot_bias = ggml_scale(ctx0,
+                ggml_reshape_2d(ctx0, msplit->mask_gpu, n_expert, 1), router_bias);
+        selection_probs = ggml_add(ctx0, selection_probs, hot_bias);
+        cb(selection_probs, "ffn_moe_probs_biased", il);
+    }
+
     // select experts
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
