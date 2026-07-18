@@ -2013,8 +2013,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
 
+        // tg-shaped batches: sentinel encoding (op runs on our patched CPU code, zero waste).
+        // pp-shaped: valid-dummy encoding — the sched may offload the op to CUDA, and neither
+        // its used-expert scan nor the CUDA kernels tolerate out-of-range ids.
+        ggml_tensor * map_cpu_use = n_tokens <= 4 ? msplit->map_cpu : msplit->map_cpu_pp;
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
-                ggml_get_rows(ctx0, msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
+                ggml_get_rows(ctx0, map_cpu_use, sel_flat), n_expert_used, n_tokens);
         cb(ids_cpu, "ffn_moe_ids_cpu", il);
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, msplit->map_gpu, sel_flat), n_expert_used, n_tokens);
