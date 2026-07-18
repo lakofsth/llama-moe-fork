@@ -1228,6 +1228,157 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// fork/phase-b: heat-driven expert split. Reads a raw f32 [n_layer][n_expert] heat
+// map (LLAMA_MOE_HEAT_FILE), greedily packs the globally hottest experts into GPU
+// tensors within LLAMA_MOE_HEAT_VRAM_MB (default 20000), and publishes per-layer
+// split descriptors. Originals stay host/mmap for the CPU branch — GPU-resident
+// experts' pages are simply never faulted in.
+static void llama_moe_heat_split_init(llama_model_base & model) {
+    const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
+    if (!hf || !*hf) {
+        return;
+    }
+    if (model.arch != LLM_ARCH_DEEPSEEK4) {
+        LLAMA_LOG_WARN("moe-heat-split: arch not supported (deepseek4 only) — ignored\n");
+        return;
+    }
+    const int n_layer  = (int) model.layers.size();
+    const int n_expert = (int) model.hparams.n_expert;
+
+    std::vector<float> heat((size_t) n_layer * n_expert);
+    FILE * f = fopen(hf, "rb");
+    if (!f || fread(heat.data(), sizeof(float), heat.size(), f) != heat.size()) {
+        LLAMA_LOG_WARN("moe-heat-split: cannot read %d x %d f32 from '%s' — ignored\n", n_layer, n_expert, hf);
+        if (f) fclose(f);
+        return;
+    }
+    fclose(f);
+
+    size_t budget = 20000ull * 1024 * 1024;
+    if (const char * b = getenv("LLAMA_MOE_HEAT_VRAM_MB")) {
+        budget = (size_t) atoll(b) * 1024 * 1024;
+    }
+
+    struct cand { float h; int il; int e; };
+    std::vector<cand> cands;
+    cands.reserve(heat.size());
+    for (int il = 0; il < n_layer; il++) {
+        const auto & L = model.layers[il];
+        const ggml_tensor * exps[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
+        bool ok = true;
+        for (auto * t : exps) {
+            if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data ||
+                t->ne[2] != n_expert) { ok = false; break; }
+        }
+        if (!ok) continue;
+        for (int e = 0; e < n_expert; e++) {
+            const float h = heat[(size_t) il*n_expert + e];
+            if (h > 0.0f) cands.push_back({h, il, e});
+        }
+    }
+    std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.h > b.h; });
+
+    std::vector<std::vector<int>> sel(n_layer);
+    size_t bytes = 0;
+    int n_sel = 0;
+    for (const auto & c : cands) {
+        const auto & L = model.layers[c.il];
+        const size_t bpe = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
+        if (bytes + bpe > budget) break;
+        bytes += bpe;
+        sel[c.il].push_back(c.e);
+        n_sel++;
+    }
+    if (n_sel == 0) {
+        LLAMA_LOG_WARN("moe-heat-split: no experts selected (budget too small or no host layers) — ignored\n");
+        return;
+    }
+
+    ggml_backend_dev_t gpu = nullptr;
+    for (const auto & d : model.devices) {
+        if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = d.dev; break; }
+    }
+    if (!gpu) {
+        LLAMA_LOG_WARN("moe-heat-split: no GPU device — ignored\n");
+        return;
+    }
+
+    int n_split_layers = 0;
+    for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) n_split_layers++;
+
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*7 + 8), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    for (int il = 0; il < n_layer; il++) {
+        if (sel[il].empty()) continue;
+        std::sort(sel[il].begin(), sel[il].end());
+        auto & L = model.layers[il];
+        const int64_t G = (int64_t) sel[il].size();
+        auto & ms = L.moe_split;
+        ms.gate_gpu = ggml_new_tensor_3d(ctx, L.ffn_gate_exps->type, L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], G);
+        ms.up_gpu   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   G);
+        ms.down_gpu = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], G);
+        ms.map_cpu  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_gpu  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.mask_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
+        ms.mask_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
+        ggml_format_name(ms.gate_gpu, "blk.%d.ffn_gate_exps_hot", il);
+        ggml_format_name(ms.up_gpu,   "blk.%d.ffn_up_exps_hot",   il);
+        ggml_format_name(ms.down_gpu, "blk.%d.ffn_down_exps_hot", il);
+    }
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(gpu));
+    if (!buf) {
+        LLAMA_LOG_WARN("moe-heat-split: GPU buffer alloc failed (%.1f MiB) — ignored\n", bytes/1024.0/1024.0);
+        for (int il = 0; il < n_layer; il++) model.layers[il].moe_split = {};
+        ggml_free(ctx);
+        return;
+    }
+
+    for (int il = 0; il < n_layer; il++) {
+        if (sel[il].empty()) continue;
+        auto & L = model.layers[il];
+        auto & ms = L.moe_split;
+        const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
+        ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        std::vector<int32_t> mc(n_expert), mg(n_expert, 0);
+        std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
+        for (int e = 0; e < n_expert; e++) mc[e] = e;
+        for (size_t g = 0; g < sel[il].size(); g++) {
+            const int e = sel[il][g];
+            for (int j = 0; j < 3; j++) {
+                ggml_backend_tensor_set(dsts[j],
+                        (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2],
+                        (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
+            }
+            mc[e] = n_expert; // sentinel: CPU branch skips + zeroes this slot
+            mg[e] = (int32_t) g;
+            kc[e] = 0.0f;
+            kg[e] = 1.0f;
+        }
+        ggml_backend_tensor_set(ms.map_cpu,  mc.data(), 0, mc.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.map_gpu,  mg.data(), 0, mg.size()*sizeof(int32_t));
+        ggml_backend_tensor_set(ms.mask_cpu, kc.data(), 0, kc.size()*sizeof(float));
+        ggml_backend_tensor_set(ms.mask_gpu, kg.data(), 0, kg.size()*sizeof(float));
+    }
+
+    // process-lifetime ownership (milestone 1: never freed before exit)
+    static ggml_context * s_ctx = nullptr;
+    static ggml_backend_buffer_t s_buf = nullptr;
+    s_ctx = ctx;
+    s_buf = buf;
+    (void) s_ctx; (void) s_buf;
+
+    int gmin = n_expert, gmax = 0;
+    for (int il = 0; il < n_layer; il++) {
+        if (sel[il].empty()) continue;
+        gmin = std::min(gmin, (int) sel[il].size());
+        gmax = std::max(gmax, (int) sel[il].size());
+    }
+    LLAMA_LOG_INFO("moe-heat-split: ENABLED — %d experts across %d layers on GPU (%.1f MiB, per-layer %d..%d), heat='%s'\n",
+            n_sel, n_split_layers, bytes/1024.0/1024.0, gmin, gmax, hf);
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -1638,6 +1789,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             pimpl->mappings.emplace_back(std::move(mapping));
         }
     }
+
+    // fork/phase-b: heat-driven expert split (no-op unless LLAMA_MOE_HEAT_FILE is set)
+    llama_moe_heat_split_init(*this);
 
     return true;
 }
