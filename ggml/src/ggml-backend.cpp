@@ -1552,10 +1552,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
         // copy the input tensors to the split backend
+        // fork: device<->host crossings batch into async copies with at most ONE source-stream
+        // sync per split (pending_get_sync), instead of 2-3 blocking synchronizes per input —
+        // measured 605 cudaStreamSynchronize/token (26.8ms) on the split-graph tg path.
+        // LLAMA_SCHED_SYNC_COPIES=1 restores the stock per-input sync path.
+        static const bool no_async_cross = [] { const char * e = getenv("LLAMA_SCHED_SYNC_COPIES"); return e && atoi(e) != 0; }();
+        ggml_backend_t pending_get_sync = NULL;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+
+            // fork: async-crossing eligibility (raw byte copy needs identical contiguous layout;
+            // events non-NULL = pipeline-parallel mode, keep stock semantics there)
+            const bool no_events   = sched->events[split_backend_id][sched->cur_copy] == NULL;
+            const bool same_layout = ggml_are_same_layout(input, input_cpy) &&
+                                     ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy);
+            const bool src_host    = ggml_backend_buffer_is_host(input->buffer);
+            const bool dst_host    = ggml_backend_buffer_is_host(input_cpy->buffer);
+            const bool async_d2h   = !no_async_cross && no_events && same_layout && !src_host && dst_host;
+            const bool async_h2d   = !no_async_cross && no_events && same_layout && src_host && !dst_host;
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -1566,10 +1582,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
-                // wait for the split backend to finish using the input before overwriting it
+                // wait for the split backend to finish using the input before overwriting it.
+                // fork: skipped for async_h2d — the copy goes onto the split backend's stream,
+                // so it is ordered after all prior reads of input_cpy and before the upcoming
+                // compute; a host-blocking drain adds nothing.
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
+                } else if (!async_h2d) {
                     ggml_backend_synchronize(split_backend);
                 }
 
@@ -1670,6 +1689,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                } else if (async_d2h) {
+                    // fork: device -> host-consumer crossing. Async copy on the SOURCE stream
+                    // (ordered after the producing compute); one synchronize on that backend
+                    // before this split computes, batched across all such inputs.
+                    if (pending_get_sync != NULL && pending_get_sync != input_backend) {
+                        ggml_backend_synchronize(pending_get_sync);
+                    }
+                    ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
+                    pending_get_sync = input_backend;
+                } else if (async_h2d) {
+                    // fork: host -> device crossing. Stream-ordered on the split backend:
+                    // runs after prior reads of input_cpy and before the upcoming compute —
+                    // no host-blocking sync at all. (Host source is stable: the producing CPU
+                    // split completed synchronously before dispatch reached this split.)
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1684,6 +1718,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        // fork: complete any batched async device->host input copies before this split computes
+        if (pending_get_sync != NULL) {
+            ggml_backend_synchronize(pending_get_sync);
         }
 
         if (!sched->callback_eval) {
