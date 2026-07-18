@@ -1944,6 +1944,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // unbiased probs below, so quality cost comes only from changed selections, not from
     // distorted weighting. Group-masked -INF entries are unaffected by the add.
     static const float router_bias = [] { const char * e = getenv("LLAMA_MOE_ROUTER_BIAS"); return e ? (float) atof(e) : 0.0f; }();
+    // LLAMA_MOE_BIAS_GATE=<delta>: per-token-per-layer preventive gate on the bias. The biased
+    // selection may displace at most delta (relative) of the unbiased-top-k probability mass —
+    // the router's own valuation of what it wanted; tokens where the bias would cost more fall
+    // back to unbiased selection BEFORE any expert runs. 0/unset = ungated.
+    static const float bias_gate = [] { const char * e = getenv("LLAMA_MOE_BIAS_GATE"); return e ? (float) atof(e) : 0.0f; }();
+    ggml_tensor * selection_probs_unbiased = selection_probs;
     if (router_bias != 0.0f && msplit && msplit->active()) {
         ggml_tensor * hot_bias = ggml_scale(ctx0,
                 ggml_reshape_2d(ctx0, msplit->mask_gpu, n_expert, 1), router_bias);
@@ -1958,6 +1964,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);
+
+    if (router_bias != 0.0f && bias_gate > 0.0f && msplit && msplit->active() && selected_experts_in == nullptr) {
+        // counterfactual: what would the router have taken unbiased, and how much of that
+        // mass does the biased pick keep? masses are gathered from the unbiased probs (the
+        // same tensor mixture weights come from), group masking already respected by both sorts.
+        ggml_tensor * ids_u   = ggml_argsort_top_k(ctx0, selection_probs_unbiased, n_expert_used); // [n_expert_used, n_tokens]
+        ggml_tensor * probs3  = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
+        ggml_tensor * m_u = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, probs3, ids_u), n_expert_used, n_tokens));            // [1, n_tokens]
+        ggml_tensor * m_b = ggml_sum_rows(ctx0, ggml_reshape_2d(ctx0,
+                ggml_get_rows(ctx0, probs3, selected_experts), n_expert_used, n_tokens)); // [1, n_tokens]
+        // keep the biased pick iff m_b >= (1 - delta) * m_u; step() -> {0,1} per token
+        ggml_tensor * keep = ggml_step(ctx0, ggml_sub(ctx0, m_b, ggml_scale(ctx0, m_u, 1.0f - bias_gate)));
+        // blend id sets: ids_u + keep * (ids_b - ids_u); exact in f32 for expert ids
+        ggml_tensor * ids_b_f = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        ggml_tensor * ids_u_f = ggml_cast(ctx0, ids_u, GGML_TYPE_F32);
+        ggml_tensor * blended = ggml_add(ctx0, ids_u_f,
+                ggml_mul(ctx0, ggml_sub(ctx0, ids_b_f, ids_u_f), keep)); // keep broadcasts over n_expert_used
+        selected_experts = ggml_cast(ctx0, blended, GGML_TYPE_I32);
+        cb(selected_experts, "ffn_moe_topk_gated", il);
+    }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
         // TODO: Use scalar div instead when/if implemented
