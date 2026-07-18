@@ -2085,7 +2085,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
     {
         static const bool online = [] { const char * e = getenv("LLAMA_MOE_HEAT_ONLINE"); return e && atoi(e) != 0; }();
         if (online && n_outputs > 0) {
-            static const double thresh = [] { const char * e = getenv("LLAMA_MOE_REPIN_THRESH");   return e ? atof(e) : 0.45; }();
+            static const double thresh = [] {
+                // the counters see POST-bias selections, so LLAMA_MOE_ROUTER_BIAS inflates the
+                // measured hit-rate by a roughly register-independent boost (~+18pts at eps=0.2,
+                // ~+37 at eps=0.5, both maps). A static threshold then under-triggers on a wrong
+                // map (measured: eps=0.5 held a mismatched map at 45-52% for a whole run).
+                // Compensate: raise the threshold by REPIN_BIAS_K * eps, capped below the
+                // matched-map steady band.
+                const char * e = getenv("LLAMA_MOE_REPIN_THRESH");
+                double t = e ? atof(e) : 0.45;
+                const char * b = getenv("LLAMA_MOE_ROUTER_BIAS");
+                if (b) {
+                    const char * k = getenv("LLAMA_MOE_REPIN_BIAS_K");
+                    // k=0.4 centers the threshold between the measured bands at eps 0.2 and 0.5
+                    // (frozen-wrong tops out ~52% at eps=0.5; post-repin settles 76-82% and
+                    // drifts ~-6pts within a document)
+                    t = std::min(0.80, t + (k ? atof(k) : 0.4) * fabs(atof(b)));
+                }
+                return t;
+            }();
             static const long   minhit = [] { const char * e = getenv("LLAMA_MOE_REPIN_MIN_HITS"); return e ? atol(e) : 20000; }();
             // trace: log every check window (WARN so llama-cli shows it); repin events
             // are always WARN — they are rare and change the placement, silent is worse
