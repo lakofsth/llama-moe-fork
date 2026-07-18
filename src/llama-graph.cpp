@@ -1947,10 +1947,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // LLAMA_MOE_BIAS_GATE=<delta>: per-token-per-layer preventive gate on the bias. The biased
     // selection may displace at most delta (relative) of the unbiased-top-k probability mass —
     // the router's own valuation of what it wanted; tokens where the bias would cost more fall
-    // back to unbiased selection BEFORE any expert runs. 0/unset = ungated.
-    static const float bias_gate = [] { const char * e = getenv("LLAMA_MOE_BIAS_GATE"); return e ? (float) atof(e) : 0.0f; }();
+    // back to unbiased selection BEFORE any expert runs. Default 0.05 (measured: erases the
+    // dial's PPL cost on both tested registers while keeping most of its speed); =0 opts out.
+    static const float bias_gate = [] { const char * e = getenv("LLAMA_MOE_BIAS_GATE"); float g = e ? (float) atof(e) : 0.05f; return g > 0.0f ? g : 0.0f; }();
     ggml_tensor * selection_probs_unbiased = selection_probs;
     if (router_bias != 0.0f && msplit && msplit->active()) {
+        if (bias_gate == 0.0f) {
+            static const bool warned = [] {
+                LLAMA_LOG_WARN("moe router bias is UNGATED (LLAMA_MOE_BIAS_GATE=0): measured quality cost at eps=0.5 "
+                               "is +2.6%% PPL (narrow register) to +5.2%% (wide); unset or =0.05 restores the gate\n");
+                return true;
+            }();
+            (void) warned;
+        }
         ggml_tensor * hot_bias = ggml_scale(ctx0,
                 ggml_reshape_2d(ctx0, msplit->mask_gpu, n_expert, 1), router_bias);
         selection_probs = ggml_add(ctx0, selection_probs, hot_bias);
