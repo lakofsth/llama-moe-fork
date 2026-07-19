@@ -68,7 +68,8 @@ two-line builder change, and ships only after validation on real hardware:
 | `hy-v3` | validated (Tencent Hy3 295B IQ1_M, 89 G, hybrid regime: 8.4 → 12.7 t/s (+51 %) at a 14 GB expert budget, 85.6 % hit-rate. Budget lesson: leave the GPU headroom for compute buffers — 22 GB starved context allocation) |
 | `kimi-linear` | validated (Kimi-Linear-48B-A3B, self-quantized Q4_K_M — no community GGUFs exist: +20 % tg, flat-map bootstrap) |
 | `glm4-moe` | validated (GLM-4.5-Air Q4 64 G, genuine glm4moe GGUF, hybrid regime: +14 % tg at default budget) |
-| `bailingmoe2` (Ling-2.6-flash), `qwen3next`, `step35` | next — two-line recipe; merged gate_up supported |
+| `bailingmoe2` | plumbed; NOTE: Ling-2.6-flash itself is BailingMoeV2_5 (MLA + linear-attn hybrid) — needs new upstream converter+runtime support, not just this fork's plumbing |
+| `qwen3next`, `step35` | next — two-line recipe; merged gate_up supported |
 
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
 real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
@@ -81,7 +82,7 @@ spans GPU + RAM with at most a modest NVMe tail; that's where this fork pays.
 
 | hardware class | suggestion |
 |---|---|
-| 10–12 GB VRAM + 64 GB RAM (e.g. 3080 desktop) | Once `glm4moe` validates: **GLM-4.7-Flash Q4_K_XL (~18 GB)** — honest 4-bit quality, fits RAM+VRAM easily. Adventurous today: DeepSeek-V4-Flash at a ~2-bit dynamic quant (~65–70 GB, NVMe tail, unmeasured — expect single-digit tg, rough 2-bit quality) |
+| 10–12 GB VRAM + 64 GB RAM (e.g. 3080 desktop) | **GLM-4.7-Flash Q4_K_XL (~18 GB, validated +39 %)** or Kimi-Linear-48B Q4 (~30 GB, validated +20 %) — honest 4-bit quality, fits RAM+VRAM easily. Adventurous today: DeepSeek-V4-Flash at a ~2-bit dynamic quant (~65–70 GB, NVMe tail, unmeasured — expect single-digit tg, rough 2-bit quality) |
 | 24–32 GB VRAM + 96–128 GB RAM (e.g. 4090/5090 workstation) | DeepSeek-V4-Flash UD-IQ4_XS (129 GB) — the measured configuration above |
 | CPU-heavy boxes, 192 GB+ RAM, small GPU | Large MoEs at 4-bit (V4-Flash-class and up); the heat split keeps the small card saturated with the hot experts |
 
