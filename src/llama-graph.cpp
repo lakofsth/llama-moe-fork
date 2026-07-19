@@ -1810,9 +1810,21 @@ static ggml_tensor * moe_ffn_chain_ds4(
         ggml_tensor * up_exps,
         ggml_tensor * gate_exps,
         ggml_tensor * down_exps,
+        ggml_tensor * gate_up_exps, // merged form: non-null, up/gate null
         int il) {
-    ggml_tensor * up   = ggml_mul_mat_id(ctx0, up_exps,   x, sel);
-    ggml_tensor * gate = ggml_mul_mat_id(ctx0, gate_exps, x, sel);
+    ggml_tensor * up   = nullptr;
+    ggml_tensor * gate = nullptr;
+    if (gate_up_exps) {
+        // one matmul over the merged tensor, then gate/up views (same layout as the
+        // stock merged path: gate = first n_ff rows, up = second)
+        ggml_tensor * gu = ggml_mul_mat_id(ctx0, gate_up_exps, x, sel);
+        const int64_t n_ff = gu->ne[0] / 2;
+        gate = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], 0);
+        up   = ggml_view_3d(ctx0, gu, n_ff, gu->ne[1], gu->ne[2], gu->nb[1], gu->nb[2], n_ff * gu->nb[0]);
+    } else {
+        up   = ggml_mul_mat_id(ctx0, up_exps,   x, sel);
+        gate = ggml_mul_mat_id(ctx0, gate_exps, x, sel);
+    }
     ggml_tensor * act  = nullptr;
     const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
     if (limit > 1e-6f) {
@@ -2063,8 +2075,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
         // were computed above from the ORIGINAL ids (normalization over the true 6).
         GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN3MOE ||
-                    arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_MINIMAX_M2); // heat-split whitelist (see llama_moe_heat_split_init)
-        GGML_ASSERT(!gate_up_exps && !weight_before_ffn && type_op == LLM_FFN_SILU);
+                    arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_MINIMAX_M2 ||
+                    arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_DEEPSEEK2); // heat-split whitelist (see llama_moe_heat_split_init)
+        GGML_ASSERT(!weight_before_ffn && type_op == LLM_FFN_SILU);
+        GGML_ASSERT((gate_up_exps != nullptr) == (msplit->gate_up_gpu != nullptr)); // graph form must match packed form
 
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
                 ggml_cont(ctx0, selected_experts), n_expert_used*n_tokens);
@@ -2084,11 +2098,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 ggml_get_rows(ctx0, map_gpu_use, sel_flat), n_expert_used, n_tokens);
         cb(ids_gpu, "ffn_moe_ids_gpu", il);
 
+        // the chain applies no *_s quant-scale tensors — refuse loudly rather than
+        // silently mis-scale on models that carry them
+        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
         ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_cpu,
-                up_exps, gate_exps, down_exps, il);
+                up_exps, gate_exps, down_exps, gate_up_exps, il);
         cb(ex_cpu, "ffn_moe_split_cpu", il);
         ggml_tensor * ex_gpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_gpu,
-                msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, il);
+                msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, msplit->gate_up_gpu, il);
         cb(ex_gpu, "ffn_moe_split_gpu", il);
 
         ggml_tensor * m_cpu = ggml_reshape_3d(ctx0,
