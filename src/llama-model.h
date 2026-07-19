@@ -225,8 +225,9 @@ struct llama_layer_nextn {
 // GPU tensors; originals stay mmap'd for the CPU branch (GPU-resident experts'
 // pages are simply never touched). Populated post-load from LLAMA_MOE_HEAT_FILE.
 struct llama_moe_split {
-    struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts
+    struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts (separate-gate/up form)
     struct ggml_tensor * up_gpu   = nullptr;
+    struct ggml_tensor * gate_up_gpu = nullptr; // [n_embd, n_ff*2, G_l] packed hot experts (merged gate_up form; gate_gpu/up_gpu null then)
     struct ggml_tensor * down_gpu = nullptr; // [n_ff,  n_embd, G_l]
     struct ggml_tensor * map_cpu  = nullptr; // I32 [1, n_expert]: own id, or n_expert (sentinel) if GPU-resident — all batch shapes (CPU op and CUDA mm_ids_helper both skip out-of-range)
     struct ggml_tensor * map_gpu  = nullptr; // I32 [1, n_expert]: packed local id, or 0 (dummy, weight-masked) if CPU-resident — tg-shaped batches (mmvq path, dummy proven there)
@@ -239,7 +240,7 @@ struct llama_moe_split {
     std::vector<int32_t> cur_experts;
     std::vector<float>   cur_heat;
 
-    bool active() const { return gate_gpu != nullptr; }
+    bool active() const { return gate_gpu != nullptr || gate_up_gpu != nullptr; }
 };
 
 struct llama_layer {

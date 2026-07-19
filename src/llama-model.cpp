@@ -1283,10 +1283,13 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     // arch whitelist: the machinery is generic (standard ffn_*_exps layout + the shared
     // build_moe_ffn path), but each arch ships only after validation — flat-map + online
     // repin is the bootstrap for archs with no profiled heat map.
-    if (model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_QWEN3MOE &&
-        model.arch != LLM_ARCH_GLM4_MOE && model.arch != LLM_ARCH_MINIMAX_M2) {
-        LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2) — ignored\n");
-        return;
+    switch (model.arch) {
+        case LLM_ARCH_DEEPSEEK4: case LLM_ARCH_QWEN3MOE: case LLM_ARCH_GLM4_MOE:
+        case LLM_ARCH_MINIMAX_M2: case LLM_ARCH_QWEN35MOE: case LLM_ARCH_DEEPSEEK2:
+            break;
+        default:
+            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2) — ignored\n");
+            return;
     }
     const int n_layer  = (int) model.layers.size();
     const int n_expert = (int) model.hparams.n_expert;
@@ -1308,11 +1311,17 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     struct cand { float h; int il; int e; };
     std::vector<cand> cands;
     cands.reserve(heat.size());
+    // per-layer expert tensor set: merged (gate_up + down) or separate (gate + up + down)
+    auto layer_exps = [](const llama_layer & L) {
+        std::vector<const ggml_tensor *> v;
+        if (L.ffn_gate_up_exps) { v = { L.ffn_gate_up_exps, L.ffn_down_exps }; }
+        else                    { v = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }; }
+        return v;
+    };
     for (int il = 0; il < n_layer; il++) {
         const auto & L = model.layers[il];
-        const ggml_tensor * exps[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
         bool ok = true;
-        for (auto * t : exps) {
+        for (auto * t : layer_exps(L)) {
             if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data ||
                 t->ne[2] != n_expert) { ok = false; break; }
         }
@@ -1329,7 +1338,8 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     int n_sel = 0;
     for (const auto & c : cands) {
         const auto & L = model.layers[c.il];
-        const size_t bpe = L.ffn_gate_exps->nb[2] + L.ffn_up_exps->nb[2] + L.ffn_down_exps->nb[2];
+        size_t bpe = 0;
+        for (auto * t : layer_exps(L)) bpe += t->nb[2];
         if (bytes + bpe > budget) break;
         bytes += bpe;
         sel[c.il].push_back(c.e);
@@ -1361,16 +1371,23 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         auto & L = model.layers[il];
         const int64_t G = (int64_t) sel[il].size();
         auto & ms = L.moe_split;
-        ms.gate_gpu = ggml_new_tensor_3d(ctx, L.ffn_gate_exps->type, L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], G);
-        ms.up_gpu   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   G);
+        if (L.ffn_gate_up_exps) {
+            ms.gate_up_gpu = ggml_new_tensor_3d(ctx, L.ffn_gate_up_exps->type, L.ffn_gate_up_exps->ne[0], L.ffn_gate_up_exps->ne[1], G);
+            ggml_format_name(ms.gate_up_gpu, "blk.%d.ffn_gate_up_exps_hot", il);
+        } else {
+            ms.gate_gpu = ggml_new_tensor_3d(ctx, L.ffn_gate_exps->type, L.ffn_gate_exps->ne[0], L.ffn_gate_exps->ne[1], G);
+            ms.up_gpu   = ggml_new_tensor_3d(ctx, L.ffn_up_exps->type,   L.ffn_up_exps->ne[0],   L.ffn_up_exps->ne[1],   G);
+        }
         ms.down_gpu = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], G);
         ms.map_cpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.map_gpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.map_gpu_pp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.mask_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
         ms.mask_gpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
-        ggml_format_name(ms.gate_gpu, "blk.%d.ffn_gate_exps_hot", il);
-        ggml_format_name(ms.up_gpu,   "blk.%d.ffn_up_exps_hot",   il);
+        if (ms.gate_gpu) {
+            ggml_format_name(ms.gate_gpu, "blk.%d.ffn_gate_exps_hot", il);
+            ggml_format_name(ms.up_gpu,   "blk.%d.ffn_up_exps_hot",   il);
+        }
         ggml_format_name(ms.down_gpu, "blk.%d.ffn_down_exps_hot", il);
     }
 
@@ -1389,15 +1406,18 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         if (sel[il].empty()) continue;
         auto & L = model.layers[il];
         auto & ms = L.moe_split;
-        const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
-        ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        std::vector<const ggml_tensor *> srcs = layer_exps(L);
+        std::vector<ggml_tensor *> dsts = L.ffn_gate_up_exps
+            ? std::vector<ggml_tensor *>{ ms.gate_up_gpu, ms.down_gpu }
+            : std::vector<ggml_tensor *>{ ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        const int nj = (int) srcs.size();
         const int32_t G = (int32_t) sel[il].size();
         std::vector<int32_t> mc(n_expert), mg(n_expert, 0), mgpp(n_expert, G);
         std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
         for (int e = 0; e < n_expert; e++) { mc[e] = e; }
         for (size_t g = 0; g < sel[il].size(); g++) {
             const int e = sel[il][g];
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < nj; j++) {
                 ggml_backend_tensor_set(dsts[j],
                         (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2],
                         (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
@@ -1500,12 +1520,20 @@ int llama_model_base::moe_heat_repin() {
         }
         GGML_ASSERT(incoming.size() == free_slots.size());
 
-        const ggml_tensor * srcs[3] = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
-        ggml_tensor * dsts[3]       = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *> dsts;
+        if (L.ffn_gate_up_exps) {
+            srcs = { L.ffn_gate_up_exps, L.ffn_down_exps };
+            dsts = { ms.gate_up_gpu, ms.down_gpu };
+        } else {
+            srcs = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps };
+            dsts = { ms.gate_gpu, ms.up_gpu, ms.down_gpu };
+        }
+        const int nj = (int) srcs.size();
         for (size_t k = 0; k < incoming.size(); k++) {
             const int    e = incoming[k];
             const size_t g = free_slots[k];
-            for (int j = 0; j < 3; j++) {
+            for (int j = 0; j < nj; j++) {
                 const char * src = (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2];
                 ggml_backend_tensor_set(dsts[j], src, (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
 #if defined(__linux__)
