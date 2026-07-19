@@ -1476,6 +1476,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
 // the main thread. Sources may have been evicted: tensor_set refaults them from NVMe.
 int llama_model_base::moe_heat_repin() {
     static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
+    static const int max_swaps = [] { const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS"); return e ? atoi(e) : 0; }(); // default OFF: measured 9x384-swap thrash vs one 1403-swap pass (-13% tg) — partial maps make the desired set drift
     const int n_expert = (int) hparams.n_expert;
     int swapped_total = 0;
     bool any_active = false;
@@ -1513,6 +1514,13 @@ int llama_model_base::moe_heat_repin() {
         // slots to replace and experts to bring in
         std::vector<size_t> free_slots;
         for (size_t g = 0; g < G; g++) if (!want[ms.cur_experts[g]]) free_slots.push_back(g);
+        // amortization (LLAMA_MOE_REPIN_MAX_SWAPS, 0 = unlimited): pair the highest-value
+        // incoming experts (incoming is already score-descending via `order`) with the
+        // LOWEST-scoring current occupants, so a truncated pass does the most valuable
+        // swaps first. A capped repin leaves the hit-rate below threshold, so the next
+        // check window naturally continues the migration — incremental, no extra state.
+        std::sort(free_slots.begin(), free_slots.end(),
+                  [&](size_t a, size_t b) { return score[ms.cur_experts[a]] < score[ms.cur_experts[b]]; });
         std::vector<int> incoming;
         {
             std::vector<char> have(n_expert, 0);
@@ -1520,6 +1528,12 @@ int llama_model_base::moe_heat_repin() {
             for (size_t g = 0; g < G; g++) if (!have[order[g]]) incoming.push_back(order[g]);
         }
         GGML_ASSERT(incoming.size() == free_slots.size());
+        if (max_swaps > 0 && swapped_total + (int) incoming.size() > max_swaps) {
+            const size_t room = (size_t) std::max(0, max_swaps - swapped_total);
+            incoming.resize(room);
+            free_slots.resize(room);
+            if (room == 0) continue; // budget exhausted; later windows continue the migration
+        }
 
         std::vector<const ggml_tensor *> srcs;
         std::vector<ggml_tensor *> dsts;
