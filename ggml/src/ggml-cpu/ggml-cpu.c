@@ -1502,6 +1502,22 @@ void ggml_cpu_moe_online_reset(void) {
     memset(g_moe_online_total,    0, sizeof(g_moe_online_total));
 }
 
+// fork: EMA decay — retain `keep` of every counter instead of a hard reset, so the
+// hit-rate and the repin re-rank see a geometrically-blended history (~1/(1-keep)
+// windows) rather than each window's snapshot. keep<=0 degenerates to reset.
+void ggml_cpu_moe_online_decay(float keep) {
+    if (keep <= 0.0f) { ggml_cpu_moe_online_reset(); return; }
+    if (keep >= 1.0f) { return; }
+    for (int il = 0; il < GGML_MOE_ONLINE_MAX_LAYERS; il++) {
+        if (g_moe_online_total[il] == 0 && g_moe_online_sentinel[il] == 0) continue;
+        for (int e = 0; e < GGML_MOE_ONLINE_MAX_EXPERTS; e++) {
+            g_moe_online_counts[il][e] = (int64_t) (g_moe_online_counts[il][e] * keep);
+        }
+        g_moe_online_sentinel[il] = (int64_t) (g_moe_online_sentinel[il] * keep);
+        g_moe_online_total[il]    = (int64_t) (g_moe_online_total[il]    * keep);
+    }
+}
+
 // ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]

@@ -2116,6 +2116,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     int64_t s = 0, t = 0;
                     if (ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
                 }
+                // EMA: fraction of counter history retained per healthy window (and once
+                // after each repin, to fade placement-stale history). Blended history
+                // stabilizes hit-rate and re-rank on non-stationary registers (measured:
+                // translate/mixed repinned 7x under window-reset). 0 = old reset behavior.
+                static const float keep = [] {
+                    const char * e = getenv("LLAMA_MOE_COUNT_DECAY");
+                    float k = e ? (float) atof(e) : 0.5f;
+                    return k < 0.0f ? 0.0f : (k > 0.95f ? 0.95f : k);
+                }();
                 if (tot_all >= minhit) {
                     const double hit = (double) sent_all / (double) tot_all;
                     if (hit < thresh) {
@@ -2125,12 +2134,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
                                            100.0*hit, 100.0*thresh, swapped);
                         }
+                        ggml_cpu_moe_online_decay(keep); // fade pre-repin (placement-stale) history
                     } else {
                         if (trace) {
-                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, reset\n",
-                                           100.0*hit, 100.0*thresh, (long long) tot_all);
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f\n",
+                                           100.0*hit, 100.0*thresh, (long long) tot_all, keep);
                         }
-                        ggml_cpu_moe_online_reset(); // healthy window: restart so drift shows quickly
+                        ggml_cpu_moe_online_decay(keep);
                     }
                 } else if (trace) {
                     LLAMA_LOG_WARN("moe-heat-online: window %lld ids < %ld min, accumulating (hit-rate so far %.1f%%)\n",
