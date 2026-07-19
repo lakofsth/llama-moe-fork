@@ -65,8 +65,10 @@ two-line builder change, and ships only after validation on real hardware:
 | `minimax-m2` | validated (MiniMax-M2.7 IQ3, 75 G true hybrid regime: a 6 GB expert budget captures 76 % of routing on 256-expert layers, +9 % tg at that deliberately small budget) |
 | `qwen35moe` | validated (Qwen3.6-35B-A3B Q5, merged gate_up: +21 % tg, flat-map bootstrap) |
 | `deepseek2` | validated (GLM-4.7-Flash Q4 — converts of GLM-4.7 declare this arch — MLA + merged gate_up: **+39 % tg**, flat-map bootstrap) |
+| `hy-v3` | validated (Tencent Hy3 295B IQ1_M, 89 G, hybrid regime: 8.4 → 12.7 t/s (+51 %) at a 14 GB expert budget, 85.6 % hit-rate. Budget lesson: leave the GPU headroom for compute buffers — 22 GB starved context allocation) |
+| `kimi-linear` | validated (Kimi-Linear-48B-A3B, self-quantized Q4_K_M — no community GGUFs exist: +20 % tg, flat-map bootstrap) |
 | `glm4-moe` | plumbing in place; awaiting a genuine glm4moe GGUF for validation |
-| `bailingmoe2` (Ling-2.6-flash), `kimi-linear`, `hy-v3` (Hy3), `qwen3next`, `step35` | next — two-line recipe; merged gate_up now supported |
+| `bailingmoe2` (Ling-2.6-flash), `qwen3next`, `step35` | next — two-line recipe; merged gate_up supported |
 
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
 real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
