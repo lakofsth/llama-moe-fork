@@ -508,7 +508,9 @@ llama_model_kimi_linear::graph::graph(const llama_model & model, const llm_graph
                 LLM_FFN_SILU, true,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il);
+                il,
+                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                model.layers[il].moe_split.active() ? &model.layers[il].moe_split : nullptr);
             cb(moe_out, "ffn_moe_out", il);
 
             // Shared expert

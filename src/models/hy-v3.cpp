@@ -185,7 +185,9 @@ llama_model_hy_v3::graph::graph(const llama_model & model, const llm_graph_param
                     nullptr, model.layers[il].ffn_gate_up_exps,
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
-                    model.layers[il].ffn_down_exps_s);
+                    model.layers[il].ffn_down_exps_s,
+                    nullptr,
+                    model.layers[il].moe_split.active() ? &model.layers[il].moe_split : nullptr);
             cb(moe_out, "ffn_moe_out", il);
 
             // shared expert (always active, no gate)
