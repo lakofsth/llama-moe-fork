@@ -2062,7 +2062,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // originals (foreign slots -> sentinel, zeroed by the patched CPU op) and the
         // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
         // were computed above from the ORIGINAL ids (normalization over the true 6).
-        GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN3MOE); // heat-split whitelist (see llama_moe_heat_split_init)
+        GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN3MOE ||
+                    arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_MINIMAX_M2); // heat-split whitelist (see llama_moe_heat_split_init)
         GGML_ASSERT(!gate_up_exps && !weight_before_ffn && type_op == LLM_FFN_SILU);
 
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,

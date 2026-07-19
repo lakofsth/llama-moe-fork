@@ -1283,8 +1283,9 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     // arch whitelist: the machinery is generic (standard ffn_*_exps layout + the shared
     // build_moe_ffn path), but each arch ships only after validation — flat-map + online
     // repin is the bootstrap for archs with no profiled heat map.
-    if (model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_QWEN3MOE) {
-        LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe) — ignored\n");
+    if (model.arch != LLM_ARCH_DEEPSEEK4 && model.arch != LLM_ARCH_QWEN3MOE &&
+        model.arch != LLM_ARCH_GLM4_MOE && model.arch != LLM_ARCH_MINIMAX_M2) {
+        LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2) — ignored\n");
         return;
     }
     const int n_layer  = (int) model.layers.size();
