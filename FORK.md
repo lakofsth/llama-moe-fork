@@ -34,7 +34,7 @@ Developed and measured on DeepSeek-V4-Flash UD-IQ4_XS on a single RTX 5090 (32 G
 | `LLAMA_MOE_REPIN_MIN_HITS` | 20000 | min window sample before judging |
 | `LLAMA_MOE_REPIN_BIAS_K` | 0.4 | threshold compensation per unit of router bias |
 | `LLAMA_MOE_ROUTER_BIAS` | 0 | ε added to resident experts' selection scores |
-| `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning: measured +2.6–5.2 % PPL) |
+| `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning — measured cost at ε=0.5: +2.6 % PPL on a narrow register but **+22 % on a wide one, +29 % on a mismatched map**; the gate holds all of these at noise level) |
 | `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`) |
 | `LLAMA_MOE_SPLIT_PP` | — | split path for prompt-processing batches |
 | `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A) |
@@ -61,7 +61,7 @@ two-line builder change, and ships only after validation on real hardware:
 | arch | status |
 |---|---|
 | `deepseek4` | validated (DeepSeek-V4-Flash — all numbers above) |
-| `qwen3moe` | ported; validation in progress (Qwen3-30B-A3B) |
+| `qwen3moe` | validated (Qwen3-30B-A3B Q6, flat-map bootstrap: +32 % tg over `-ncmoe` baseline, 84 % hit-rate with no profiled map) |
 | `glm4moe`, `qwen3next` | next — same recipe |
 
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the

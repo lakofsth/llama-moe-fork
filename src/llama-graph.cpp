@@ -1955,7 +1955,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (bias_gate == 0.0f) {
             static const bool warned = [] {
                 LLAMA_LOG_WARN("moe router bias is UNGATED (LLAMA_MOE_BIAS_GATE=0): measured quality cost at eps=0.5 "
-                               "is +2.6%% PPL (narrow register) to +5.2%% (wide); unset or =0.05 restores the gate\n");
+                               "ranges +2.6%% PPL (narrow register, matched map) to +22%% (wide register, matched map) "
+                               "and +29%% on a mismatched map; unset or =0.05 restores the gate\n");
                 return true;
             }();
             (void) warned;
@@ -2061,7 +2062,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // originals (foreign slots -> sentinel, zeroed by the patched CPU op) and the
         // packed GPU hot subset (foreign slots -> dummy 0, masked out below). Weights
         // were computed above from the ORIGINAL ids (normalization over the true 6).
-        GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4);
+        GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN3MOE); // heat-split whitelist (see llama_moe_heat_split_init)
         GGML_ASSERT(!gate_up_exps && !weight_before_ffn && type_op == LLM_FFN_SILU);
 
         ggml_tensor * sel_flat = ggml_reshape_1d(ctx0,
