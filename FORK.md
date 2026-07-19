@@ -37,7 +37,7 @@ Developed and measured on DeepSeek-V4-Flash UD-IQ4_XS on a single RTX 5090 (32 G
 | `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning — measured cost at ε=0.5: +2.6 % PPL on a narrow register but **+22 % on a wide one, +29 % on a mismatched map**; the gate holds all of these at noise level) |
 | `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`) |
 | `LLAMA_MOE_SPLIT_PP` | — | split path for prompt-processing batches |
-| `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A) |
+| `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A). Measured no-op when weights are fully RAM/page-cache resident (Qwen3-235B warm-cache test); intended for genuinely NVMe-tail-streaming configs |
 | `LLAMA_MMAP_NO_PREFETCH` | 0 | skip whole-file MADV_WILLNEED at load |
 
 Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv 2`.
@@ -74,6 +74,24 @@ two-line builder change, and ships only after validation on real hardware:
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
 real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
 self-profiling, no logging pipeline needed.
+
+## Measured models (single 5090 + 128 GB DDR5; flat-map bootstrap, ε=0.5 gated, tg tokens/s)
+
+| model | quant / size | baseline → fork | note |
+|---|---|---|---|
+| DeepSeek-V4-Flash | IQ4_XS 129 G | ~11 → 30 | flagship config; profiled maps + full dial (see tables above) |
+| Tencent Hy3 295B | IQ1_M 89 G | 8.4 → 12.7 (+51 %) | 14 GB expert budget, 85.6 % hit |
+| GLM-4.7-Flash | Q4_K_XL 17.5 G | 41.3 → 57.6 (+39 %) | ships as `deepseek2` arch |
+| Qwen3-30B-A3B | Q6_K_XL 26 G | 34.5 → 45.5 (+32 %) | |
+| Qwen3.6-35B-A3B | Q5_K_XL 25 G | 51.5 → 62.1 (+21 %) | merged gate_up |
+| Kimi-Linear-48B | Q4_K_M 29.7 G (self-quant) | 47.2 → 56.6 (+20 %) | no community GGUFs exist |
+| Qwen3-235B-A22B | Q3_K_XL 97 G | 7.7 → 8.8 (+14 %) | prefetch arm no-op (warm cache) |
+| GLM-4.5-Air | Q4_K_XL 64 G | 11.5 → 13.1 (+14 %) | genuine `glm4moe` |
+| MiniMax-M2.7 | IQ3_XXS 75 G | 16.5 → 18.0 (+9 %) | 6 GB budget catches 76 % of 256-expert routing |
+| Qwen3.5-122B-A10B | Q4_K_XL 72 G | 19.1 → 20.6 (+8 %) | 6 GB budget |
+
+All non-flagship rows are flat-map bootstrap at mostly-default budgets — the *floor* of what
+tuned maps and budgets give, not the ceiling.
 
 ## What to run on what hardware
 
