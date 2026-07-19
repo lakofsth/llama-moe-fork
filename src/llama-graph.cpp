@@ -2077,7 +2077,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_QWEN3MOE ||
                     arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_MINIMAX_M2 ||
                     arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_DEEPSEEK2 ||
-                    arch == LLM_ARCH_HY_V3    || arch == LLM_ARCH_KIMI_LINEAR); // heat-split whitelist (see llama_moe_heat_split_init)
+                    arch == LLM_ARCH_HY_V3    || arch == LLM_ARCH_KIMI_LINEAR ||
+                    arch == LLM_ARCH_BAILINGMOE2); // heat-split whitelist (see llama_moe_heat_split_init)
         GGML_ASSERT(!weight_before_ffn && type_op == LLM_FFN_SILU);
         GGML_ASSERT((gate_up_exps != nullptr) == (msplit->gate_up_gpu != nullptr)); // graph form must match packed form
 
