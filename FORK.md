@@ -62,7 +62,10 @@ two-line builder change, and ships only after validation on real hardware:
 |---|---|
 | `deepseek4` | validated (DeepSeek-V4-Flash — all numbers above) |
 | `qwen3moe` | validated (Qwen3-30B-A3B Q6, flat-map bootstrap: +32 % tg over `-ncmoe` baseline, 84 % hit-rate with no profiled map) |
-| `glm4moe`, `qwen3next` | next — same recipe |
+| `minimax-m2` | validated (MiniMax-M2.7 IQ3, 75 G true hybrid regime: a 6 GB expert budget captures 76 % of routing on 256-expert layers, +9 % tg at that deliberately small budget) |
+| `glm4-moe` | plumbing in place; awaiting a genuine glm4moe GGUF — beware: some GLM-4.7-Flash conversions declare `general.architecture = deepseek2` (merged gate_up, not yet supported) |
+| `bailingmoe2` (Ling-2.6-flash), `kimi-linear` | next — same two-line recipe |
+| merged-`gate_up` arches (`deepseek2`, `qwen35moe`, `hy-v3`, `qwen3next`, `step35`, …) | blocked on one planned extension: split packing for merged gate_up tensors |
 
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
 real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
