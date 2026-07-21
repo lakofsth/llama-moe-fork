@@ -2067,7 +2067,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // build the stock chain — BUT stock pp touches every expert's ORIGINAL host pages
     // (incl. the packed hot set), blowing the working set past the page cache; that is
     // the m1 parity mechanism. LLAMA_MOE_SPLIT_PP=1 engages the split for pp too
-    // (milestone-2 path; CUDA illegal-access being debugged there).
+    // (milestone-2 path; the CUDA illegal-access it once hit was fixed in 48cea759b —
+    // sentinel/duplicate-id tolerance in mul_mat_id). Measured ~2.6-2.8x pp on V4-Flash
+    // at -ub 2048; opt-in by default pending a per-arch validation sweep.
     static const bool split_pp = [] { const char * e = getenv("LLAMA_MOE_SPLIT_PP"); return e && atoi(e) != 0; }();
     if (msplit && msplit->active() && (n_tokens <= 4 || split_pp)) {
         // heat-driven expert split — dual-branch chain over the CPU
