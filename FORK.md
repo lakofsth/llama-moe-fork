@@ -36,7 +36,7 @@ Developed and measured on DeepSeek-V4-Flash UD-IQ4_XS on a single RTX 5090 (32 G
 | `LLAMA_MOE_ROUTER_BIAS` | 0 | ε added to resident experts' selection scores |
 | `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning — measured cost at ε=0.5: +2.6 % PPL on a narrow register but **+22 % on a wide one, +29 % on a mismatched map**; the gate holds all of these at noise level) |
 | `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`) |
-| `LLAMA_MOE_SPLIT_PP` | — | split path for prompt-processing batches |
+| `LLAMA_MOE_SPLIT_PP` | unset (off) | engage the heat-split on prompt-processing batches too (default: split runs for tg-shaped batches only, pp uses the stock chain). **Opt-in, and the dominant pp lever: ~2.6–2.8× prompt throughput** — measured on V4-Flash at `-ub 2048`, ~200 t/s with it on vs ~75 off (`pb-splitpp-disc`, 2026-07-21). Numerically parity-safe (~3–4 dp; the earlier m2 CUDA illegal-access was fixed in `48cea759b`). Set `LLAMA_MOE_SPLIT_PP=1` for prompt-heavy workloads |
 | `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A). Measured no-op when weights are fully RAM/page-cache resident (Qwen3-235B warm-cache test); intended for genuinely NVMe-tail-streaming configs |
 | `LLAMA_MMAP_NO_PREFETCH` | 0 | skip whole-file MADV_WILLNEED at load |
 
@@ -51,6 +51,22 @@ Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv
 | + online, starting from a *wrong* map | 19–25 avg | 0 after repin |
 | + bias ε=0.5, gate δ=0.05 | **30** | +0.2 % (noise) |
 | + bias ε=0.5, ungated | 40 | +2.6 % |
+
+## Prompt processing (V4-Flash IQ4_XS, 5090 + DDR5, pp tokens/s)
+
+Two levers, both on the flagship. `-ub`/`-b` are stock flags; `LLAMA_MOE_SPLIT_PP` is the
+fork's, and it does the heavy lifting.
+
+| config | pp (t/s, warm) | source |
+|---|---|---|
+| `-ub 512`, split-pp on | ~64 | `pb-rocks3` |
+| `-ub 2048 -b 2048`, split-pp on | **~200** (209–214) | `pb-rocks3` |
+| `-ub 2048 -b 2048`, **split-pp off** | ~75 | `pb-splitpp-disc` |
+
+So raising the micro-batch is a stock 3.3× (64 → ~200), but the isolation A/B shows that gain
+is the fork's: with `LLAMA_MOE_SPLIT_PP` off, `-ub 2048` reaches only ~75 t/s — **split-pp is a
+~2.6–2.8× multiplier and the dominant pp contributor.** For prompt-heavy work, run `-ub 2048 -b
+2048 LLAMA_MOE_SPLIT_PP=1`. tg is unaffected by split-pp (it engages only for pp-shaped batches).
 
 ## Architecture support
 
