@@ -235,6 +235,19 @@ struct llama_moe_split {
     struct ggml_tensor * mask_cpu = nullptr; // F32 [1, n_expert]: 1.0 where CPU-resident else 0.0
     struct ggml_tensor * mask_gpu = nullptr; // F32 [1, n_expert]: 1.0 where GPU-resident else 0.0
 
+    // fork: expert biases (openai-moe / gpt-oss). Same split as the weights, plus one
+    // zero pad row at each branch's sentinel index so ggml_add_id never reads out of
+    // range: GPU copies are packed order [ne0, G_l+1] (pad row G_l = the pp sentinel;
+    // tg's dummy-0 rows read slot 0's bias and are weight-masked like the weights);
+    // CPU copies are full order [ne0, n_expert+1] (pad row n_expert = the CPU sentinel,
+    // whose mul_mat_id rows the patched op zeroes — adding the zero row keeps them zero).
+    struct ggml_tensor * up_b_gpu   = nullptr;
+    struct ggml_tensor * gate_b_gpu = nullptr;
+    struct ggml_tensor * down_b_gpu = nullptr;
+    struct ggml_tensor * up_b_cpu   = nullptr;
+    struct ggml_tensor * gate_b_cpu = nullptr;
+    struct ggml_tensor * down_b_cpu = nullptr;
+
     // fork: online-repin bookkeeping — which experts currently occupy the packed slots
     // (index = packed slot g) and the heat estimate that put them there
     std::vector<int32_t> cur_experts;
