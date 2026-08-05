@@ -1287,9 +1287,10 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         case LLM_ARCH_DEEPSEEK4: case LLM_ARCH_QWEN3MOE: case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_MINIMAX_M2: case LLM_ARCH_QWEN35MOE: case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_HY_V3: case LLM_ARCH_KIMI_LINEAR: case LLM_ARCH_BAILINGMOE2:
+        case LLM_ARCH_OPENAI_MOE:
             break;
         default:
-            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear) — ignored\n");
+            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear, openai-moe) — ignored\n");
             return;
     }
     const int n_layer  = (int) model.layers.size();
@@ -1363,8 +1364,13 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     int n_split_layers = 0;
     for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) n_split_layers++;
 
-    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*8 + 8), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*11 + 8), nullptr, true };
     ggml_context * ctx = ggml_init(ip);
+    // openai-moe: expert biases ride along on both branches; PADDED copies (see
+    // llama_moe_split header comment). CPU padded copies live in their own host-buffer
+    // context; GPU packed copies share the GPU context above.
+    ggml_init_params iph = { ggml_tensor_overhead() * (size_t)(n_split_layers*3 + 8), nullptr, true };
+    ggml_context * ctx_host = ggml_init(iph);
 
     for (int il = 0; il < n_layer; il++) {
         if (sel[il].empty()) continue;
@@ -1390,6 +1396,24 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
             ggml_format_name(ms.up_gpu,   "blk.%d.ffn_up_exps_hot",   il);
         }
         ggml_format_name(ms.down_gpu, "blk.%d.ffn_down_exps_hot", il);
+
+        // openai-moe expert biases: packed GPU copies padded with a zero row at G
+        // (the pp sentinel), full CPU copies padded with a zero row at n_expert (the
+        // CPU sentinel). All three present or none (asserted in the graph).
+        if (L.ffn_up_exps_b && L.ffn_gate_exps_b && L.ffn_down_exps_b) {
+            ms.up_b_gpu   = ggml_new_tensor_2d(ctx, L.ffn_up_exps_b->type,   L.ffn_up_exps_b->ne[0],   G + 1);
+            ms.gate_b_gpu = ggml_new_tensor_2d(ctx, L.ffn_gate_exps_b->type, L.ffn_gate_exps_b->ne[0], G + 1);
+            ms.down_b_gpu = ggml_new_tensor_2d(ctx, L.ffn_down_exps_b->type, L.ffn_down_exps_b->ne[0], G + 1);
+            ggml_format_name(ms.up_b_gpu,   "blk.%d.ffn_up_exps_b_hot",   il);
+            ggml_format_name(ms.gate_b_gpu, "blk.%d.ffn_gate_exps_b_hot", il);
+            ggml_format_name(ms.down_b_gpu, "blk.%d.ffn_down_exps_b_hot", il);
+            ms.up_b_cpu   = ggml_new_tensor_2d(ctx_host, L.ffn_up_exps_b->type,   L.ffn_up_exps_b->ne[0],   n_expert + 1);
+            ms.gate_b_cpu = ggml_new_tensor_2d(ctx_host, L.ffn_gate_exps_b->type, L.ffn_gate_exps_b->ne[0], n_expert + 1);
+            ms.down_b_cpu = ggml_new_tensor_2d(ctx_host, L.ffn_down_exps_b->type, L.ffn_down_exps_b->ne[0], n_expert + 1);
+            ggml_format_name(ms.up_b_cpu,   "blk.%d.ffn_up_exps_b_pad",   il);
+            ggml_format_name(ms.gate_b_cpu, "blk.%d.ffn_gate_exps_b_pad", il);
+            ggml_format_name(ms.down_b_cpu, "blk.%d.ffn_down_exps_b_pad", il);
+        }
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(gpu));
@@ -1397,6 +1421,17 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         LLAMA_LOG_WARN("moe-heat-split: GPU buffer alloc failed (%.1f MiB) — ignored\n", bytes/1024.0/1024.0);
         for (int il = 0; il < n_layer; il++) model.layers[il].moe_split = {};
         ggml_free(ctx);
+        ggml_free(ctx_host);
+        return;
+    }
+    // host buffer for the padded CPU bias copies (no-op sized when no arch biases exist)
+    ggml_backend_buffer_t buf_host = ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, ggml_backend_cpu_buffer_type());
+    if (!buf_host && ggml_get_first_tensor(ctx_host) != nullptr) {
+        LLAMA_LOG_WARN("moe-heat-split: host bias buffer alloc failed — ignored\n");
+        for (int il = 0; il < n_layer; il++) model.layers[il].moe_split = {};
+        ggml_backend_buffer_free(buf);
+        ggml_free(ctx);
+        ggml_free(ctx_host);
         return;
     }
 
@@ -1438,6 +1473,31 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
 
+        // openai-moe expert biases: pack selected rows to GPU (+ zero pad row at G),
+        // copy the full set to the padded host tensors (+ zero pad row at n_expert)
+        if (ms.up_b_gpu) {
+            const ggml_tensor * bsrcs[3] = { L.ffn_up_exps_b, L.ffn_gate_exps_b, L.ffn_down_exps_b };
+            ggml_tensor * bgpu[3]  = { ms.up_b_gpu, ms.gate_b_gpu, ms.down_b_gpu };
+            ggml_tensor * bhost[3] = { ms.up_b_cpu, ms.gate_b_cpu, ms.down_b_cpu };
+            for (int j = 0; j < 3; j++) {
+                GGML_ASSERT(bsrcs[j] && bsrcs[j]->data && ggml_backend_buffer_is_host(bsrcs[j]->buffer));
+                const size_t row = bsrcs[j]->nb[1];
+                for (size_t g = 0; g < sel[il].size(); g++) {
+                    ggml_backend_tensor_set(bgpu[j],
+                            (const char *) bsrcs[j]->data + (size_t) sel[il][g] * row,
+                            g * bgpu[j]->nb[1], row);
+                }
+                std::vector<char> zero(row, 0);
+                ggml_backend_tensor_set(bgpu[j], zero.data(), (size_t) G * bgpu[j]->nb[1], row);
+                for (int e = 0; e < n_expert; e++) {
+                    ggml_backend_tensor_set(bhost[j],
+                            (const char *) bsrcs[j]->data + (size_t) e * row,
+                            (size_t) e * bhost[j]->nb[1], row);
+                }
+                ggml_backend_tensor_set(bhost[j], zero.data(), (size_t) n_expert * bhost[j]->nb[1], row);
+            }
+        }
+
         // fork: online-repin bookkeeping (slot -> expert + normalized heat share)
         ms.cur_experts.assign(sel[il].begin(), sel[il].end());
         ms.cur_heat.resize(sel[il].size());
@@ -1455,9 +1515,13 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     // process-lifetime ownership (milestone 1: never freed before exit)
     static ggml_context * s_ctx = nullptr;
     static ggml_backend_buffer_t s_buf = nullptr;
+    static ggml_context * s_ctx_host = nullptr;
+    static ggml_backend_buffer_t s_buf_host = nullptr;
     s_ctx = ctx;
     s_buf = buf;
-    (void) s_ctx; (void) s_buf;
+    s_ctx_host = ctx_host;
+    s_buf_host = buf_host;
+    (void) s_ctx; (void) s_buf; (void) s_ctx_host; (void) s_buf_host;
 
     int gmin = n_expert, gmax = 0;
     for (int il = 0; il < n_layer; il++) {
@@ -1568,6 +1632,17 @@ int llama_model_base::moe_heat_repin() {
                     }
                 }
 #endif
+            }
+            // openai-moe: bias rows swap with their expert's weights (packed copies
+            // must never desync from cur_experts; pad row G is never touched)
+            if (ms.up_b_gpu) {
+                const ggml_tensor * bsrcs[3] = { L.ffn_up_exps_b, L.ffn_gate_exps_b, L.ffn_down_exps_b };
+                ggml_tensor * bgpu[3] = { ms.up_b_gpu, ms.gate_b_gpu, ms.down_b_gpu };
+                for (int j = 0; j < 3; j++) {
+                    ggml_backend_tensor_set(bgpu[j],
+                            (const char *) bsrcs[j]->data + (size_t) e * bsrcs[j]->nb[1],
+                            g * bgpu[j]->nb[1], bsrcs[j]->nb[1]);
+                }
             }
             ms.cur_experts[g] = e;
         }
