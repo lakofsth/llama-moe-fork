@@ -71,10 +71,14 @@ class LlamaModel(TextModel):
 
             # target_layers: prefer the drafter's TRAINED tap ids over the low/mid/high
             # heuristic — a head trained on specific taps produces garbage drafts from any
-            # others. HF eagle_aux_hidden_state_layer_ids are output-of-layer ids; llama.cpp
-            # captures the INPUT of a layer, so shift by +1.
+            # others. HF eagle_aux_hidden_state_layer_ids are output-of-layer ids; THIS
+            # fork's runtime captures the INPUT of a layer, so shift by +1 (upstream
+            # b10286 reads the ids unshifted — its capture semantics, not ours). The key
+            # lives nested under eagle_config in some checkpoints and flat in others
+            # (upstream reads flat) — try both.
             target_num_layers = target_config["num_hidden_layers"]
-            aux_ids = (eagle3_raw_config.get("eagle_config") or {}).get("eagle_aux_hidden_state_layer_ids")
+            aux_ids = (eagle3_raw_config.get("eagle_config") or {}).get("eagle_aux_hidden_state_layer_ids") \
+                or eagle3_raw_config.get("eagle_aux_hidden_state_layer_ids")
             if aux_ids:
                 target_layers = [i + 1 for i in aux_ids]
                 logger.info(f"EAGLE-3: target_layers = {target_layers} "
@@ -99,6 +103,12 @@ class LlamaModel(TextModel):
             logger.info(f"EAGLE-3: norm_before_residual = {norm_before_residual}")
             self.gguf_writer.add_norm_before_residual(norm_before_residual)
 
+            # norm_before_fc: RMSNorm applied to the fused target features before the
+            # fc projection (e.g. nvidia/gpt-oss-120b-Eagle3-v3)
+            norm_before_fc = eagle3_raw_config.get("norm_before_fc", False)
+            logger.info(f"EAGLE-3: norm_before_fc = {norm_before_fc}")
+            self.gguf_writer.add_norm_before_fc(norm_before_fc)
+
     def set_vocab(self):
         # eagle3: use tokenizer from target model if provided
         original_dir_model = None
@@ -117,7 +127,7 @@ class LlamaModel(TextModel):
         path_tekken_json = self.dir_model / "tekken.json"
         path_tokenizer_json = self.dir_model / "tokenizer.json"
         if path_tekken_json.is_file() and not path_tokenizer_json.is_file():
-            self._set_vocab_mistral()
+            return self._set_vocab_mistral()
 
         tokenizer_config_file = self.dir_model / 'tokenizer_config.json'
         if tokenizer_config_file.is_file():
@@ -235,6 +245,11 @@ class LlamaModel(TextModel):
                 # EAGLE-3.1: per-aux-tap RMSNorm applied to each captured hidden state
                 # before the fc fusion; keep the checkpoint's own naming (fc_norm.{k}.weight)
                 yield (name, data_torch)
+                return
+            if name == "input_norm.weight":
+                # upstream b10286 eagle3 checkpoints: single input norm mapped to
+                # ENC_OUTPUT_NORM (disjoint from fc_norm.* above — keep both handlers)
+                yield (self.format_tensor_name(gguf.MODEL_TENSOR.ENC_OUTPUT_NORM), data_torch)
                 return
             if name == "d2t":
                 # store for manual int64 handling in prepare_tensors (avoid F32 conversion)
