@@ -82,6 +82,16 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
+// fork: fill an i32 buffer with an arbitrary constant. cudaMemsetAsync is byte-wise and so
+// cannot express a row index; used below to seed the inverse id map's sentinel-skipped slots.
+#define CUDA_MMQ_FILL_BLOCK_SIZE 256
+static __global__ void mmq_fill_i32(int32_t * __restrict__ dst, const int64_t k, const int32_t value) {
+    const int64_t i = (int64_t) blockDim.x * blockIdx.x + threadIdx.x;
+    if (i < k) {
+        dst[i] = value;
+    }
+}
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -188,20 +198,39 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
-    // fork: with sentinel ids (out of [0, ne02), "slot not on this branch") the helper writes
-    // FEWER than ne_get_rows compact entries, but the quantize gather below is launched over
-    // all ne_get_rows rows — zero-init so tail entries index row 0 (in-bounds, and never
-    // consumed by the GEMM: they lie outside every expert's bounds) instead of pool garbage.
-    // NOTE (b10286 merge): with upstream's dedup_bcast/write_inverse mode ids_src1 becomes an
-    // inverse map; zero-init stays the safe default for sentinel-skipped slots, but the
-    // sentinel×inverse interaction is on the merge validation sweep, not yet proven.
-    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
-    CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
-
     // upstream b10286: gate/up activations are broadcast across experts (ne11 == 1):
     // quantize each token once and scatter to its slots. ids_src1 then holds the inverse
     // map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+
+    // fork: sentinel ids (out of [0, ne02), "slot not on this branch") match no expert, so
+    // mm_ids_helper writes no entry for them and they keep whatever this init leaves. What is
+    // SAFE depends on which direction the map runs — the two modes index ids_src1 differently:
+    //
+    //  - gather mode (write_inverse=false): indexed by COMPACT ROW, holds a source column.
+    //    Untouched entries are tail rows past expert_bounds[ne02], which the GEMM never reads,
+    //    so 0 ("read row 0") is harmless. This is what the fork relied on before the merge.
+    //  - inverse mode (write_inverse=true, b10286 dedup_bcast): indexed by SLOT, and the value
+    //    is a DESTINATION row that quantize_mmq_q8_1<scatter=true> WRITES to. A 0 there sends
+    //    every sentinel slot's token into compact row 0 — which IS inside expert bounds and IS
+    //    consumed by the GEMM. Many slots writing one row is a race; measured on qwen35moe
+    //    under LLAMA_MOE_SPLIT_PP: 4 distinct outputs in 6 identical temp-0 runs, wrong 5/6.
+    //
+    // So in inverse mode seed the unwritten slots with a scratch row no expert can reach.
+    // ne_get_rows-1 is always such a row when a sentinel exists: every in-range slot yields
+    // exactly one compact entry, so expert_bounds[ne02] = #in-range <= ne_get_rows-1. With no
+    // sentinel present every slot is written and this seed is never read. Sentinel slots then
+    // collide on the scratch row harmlessly, because nothing reads it.
+    if (dedup_bcast) {
+        const int64_t nblocks = (ne_get_rows + CUDA_MMQ_FILL_BLOCK_SIZE - 1) / CUDA_MMQ_FILL_BLOCK_SIZE;
+        mmq_fill_i32<<<nblocks, CUDA_MMQ_FILL_BLOCK_SIZE, 0, stream>>>(
+            ids_src1.get(), ne_get_rows, (int32_t) (ne_get_rows - 1));
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+    }
+    // ids_dst is indexed by compact row in BOTH modes, so its untouched tail is never read.
+    CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
 
     // fork: LLAMA_DEBUG_IDS=1 — host-side validation that every id is in [0, ne02)
     // (an out-of-range id makes the kernel read past the weight tensor: garbage f16
