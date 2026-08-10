@@ -3398,7 +3398,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
         GGML_ASSERT(op_bias == GGML_OP_ADD_ID);
         GGML_ASSERT(bias_node->src[0] == mul_node);
-        return bias_node->src[1];
+        const ggml_tensor * bias = bias_node->src[1];
+        // fork: the fused mul_mat_id+bias kernels REQUIRE bias->ne[1] == weights->ne[2] and
+        // ASSERT it (mmvq.cu, mmvf.cu, for both x_bias and gate_bias) rather than testing it,
+        // so a caller whose bias carries extra rows aborts the process instead of falling back.
+        // The heat split packs a zero pad row at the sentinel index precisely so ggml_add_id
+        // stays in range, which makes ne[1] one larger than the packed expert count. Decline
+        // the fusion here; unfused, add_id reads that pad row exactly as intended.
+        if (bias && mul_node->src[2] && bias->ne[1] != mul_node->src[0]->ne[2]) {
+            return nullptr;
+        }
+        return bias;
     };
 
     // gate + glu + up, with optional scale/bias on both lanes.
@@ -3460,6 +3470,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
+                if (with_bias && (!up_bias || !gate_bias)) {
+                    continue;
+                }
                 if (with_bias && (!ggml_are_same_shape(gate_out_n->src[0], gate_out_n->src[1]) ||
                         !ggml_are_same_shape(up_out_n->src[0], up_out_n->src[1]))) {
                     continue;
@@ -3557,6 +3570,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 const ggml_tensor * up_bias   = with_bias ? get_bias_tensor(up_out_n, up_scale_n, bias_op) : nullptr;
                 const ggml_tensor * gate_bias = with_bias ? get_bias_tensor(gate_out_n, gate_scale_n, bias_op) : nullptr;
+                if (with_bias && (!up_bias || !gate_bias)) {
+                    continue;
+                }
 
                 const ggml_tensor * src0 = up_n->src[0];
                 const ggml_tensor * src1 = up_n->src[1];
@@ -3804,6 +3820,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 continue;
             }
             bias_tensor = bias_node->src[1];
+        }
+        // fork: SAME shape rule as get_bias_tensor above -- this site hand-rolls that helper's
+        // logic instead of calling it, so a guard placed only in the helper misses this path
+        // entirely (measured: gpt-oss still aborted at mmvq.cu x_bias assert with the helper
+        // guarded). The fused kernels REQUIRE bias->ne[1] == weights->ne[2] and ASSERT it
+        // rather than testing it; the heat split's padded bias carries a zero pad row at the
+        // sentinel index, making ne[1] one larger. Decline the fusion; unfused, add_id reads
+        // that pad row as intended.
+        if (bias_tensor && mm_node->src[2] && bias_tensor->ne[1] != mm_node->src[0]->ne[2]) {
+            continue;
         }
 
         const ggml_tensor * src0 = mm_node->src[0];
