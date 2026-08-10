@@ -1,10 +1,12 @@
 # llama.cpp fork — hybrid MoE streaming (GPU + RAM + NVMe tail)
 
-Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at `14d3ba4` (b9994),
+Fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) at `cd0fa60` (b10286),
 branch `fork/phase-a`. Targets the *hybrid* MoE regime: the model nearly fits across
 GPU + system RAM with a small NVMe tail — between the all-VRAM and all-disk cases.
 Developed and measured on DeepSeek-V4-Flash UD-IQ4_XS on a single RTX 5090 (32 GB) +
-128 GB RAM. Four upstream commits are cherry-picked with original authorship preserved.
+128 GB RAM. Four upstream commits were cherry-picked when the fork was based on b9994;
+the b10286 merge brings upstream's own copies of the same changes, so those four are now
+redundant duplicates kept for history. Original authorship is preserved on both copies.
 
 ## What it adds
 
@@ -81,9 +83,10 @@ two-line builder change, and ships only after validation on real hardware:
 | `minimax-m2` | validated (MiniMax-M2.7 IQ3, 75 G true hybrid regime: a 6 GB expert budget captures 76 % of routing on 256-expert layers, +9 % tg at that deliberately small budget) |
 | `qwen35moe` | validated (Qwen3.6-35B-A3B Q5, merged gate_up: +21 % tg, flat-map bootstrap) |
 | `deepseek2` | validated (GLM-4.7-Flash Q4 — converts of GLM-4.7 declare this arch — MLA + merged gate_up: **+39 % tg**, flat-map bootstrap) |
-| `hy-v3` | validated (Tencent Hy3 295B IQ1_M, 89 G, hybrid regime: 8.4 → 12.7 t/s (+51 %) at a 14 GB expert budget, 85.6 % hit-rate. Budget lesson: leave the GPU headroom for compute buffers — 22 GB starved context allocation) |
-| `kimi-linear` | validated (Kimi-Linear-48B-A3B, self-quantized Q4_K_M — no community GGUFs exist: +20 % tg, flat-map bootstrap) |
-| `glm4-moe` | validated (GLM-4.5-Air Q4 64 G, genuine glm4moe GGUF, hybrid regime: +14 % tg at default budget) |
+| `hy-v3` | validated (Tencent Hy3 295B IQ1_M, 89 G, hybrid regime: 8.4 → 12.7 t/s (+51 %) at a 14 GB expert budget, 85.6 % hit-rate. Budget lesson: leave the GPU headroom for compute buffers — 22 GB starved context allocation) — **not re-verified since the b10286 merge**: no Tencent Hy3 295B weights on this box |
+| `kimi-linear` | validated (Kimi-Linear-48B-A3B, self-quantized Q4_K_M — no community GGUFs exist: +20 % tg, flat-map bootstrap) — **not re-verified since the b10286 merge**: no Kimi-Linear-48B-A3B weights on this box |
+| `glm4-moe` | validated (GLM-4.5-Air Q4 64 G, genuine glm4moe GGUF, hybrid regime: +14 % tg at default budget) — **not re-verified since the b10286 merge**: no GLM-4.5-Air weights on this box |
+| `openai-moe` | ported (gpt-oss-120b MXFP4; whitelist + expert-bias split support). Runs with the split engaged and generates cleanly, but on a 16-token smoke run only — **throughput never measured, so not validated** |
 | `bailingmoe2` | plumbed; NOTE: Ling-2.6-flash itself is BailingMoeV2_5 (MLA + linear-attn hybrid) — needs new upstream converter+runtime support, not just this fork's plumbing |
 | `qwen3next`, `step35` | next — two-line recipe; merged gate_up supported |
 
@@ -108,6 +111,13 @@ self-profiling, no logging pipeline needed.
 
 All non-flagship rows are flat-map bootstrap at mostly-default budgets — the *floor* of what
 tuned maps and budgets give, not the ceiling.
+
+**Each row is a single measurement, not a repeated one.** Run-to-run spread on this box,
+measured over 20 reps at fixed seed and prompt (2026-08-10): 0.9 % sd for Qwen3-30B-A3B,
+6.0 % sd for MiniMax-M2.7 — so a single-vs-single comparison carries roughly 1–8 % uncertainty
+depending on the model. The large deltas are safe; the **+8 % and +9 % rows sit within about one
+standard deviation of their own measurement** and should be read as "no regression, probably a
+small gain" rather than as established figures.
 
 ## What to run on what hardware
 
