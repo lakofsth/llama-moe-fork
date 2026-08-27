@@ -2083,6 +2083,23 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     int64_t s = 0, t = 0;
                     if (ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
                 }
+                // LAB (2026-08-26, not for upstream): dump per-expert routing counts so the
+                // ROUTING SKEW can be measured. The split can only beat whole-layer -ncmoe if
+                // usage is skewed enough that the hot experts of many layers beat all experts
+                // of a few; with a flat map the packer fills whole layers and the two coincide.
+                if (const char * dp = getenv("LLAMA_MOE_HEAT_DUMP")) {
+                    if (FILE * df = fopen(dp, "w")) {
+                        for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+                            int64_t s = 0, t = 0;
+                            const int64_t * c = ggml_cpu_moe_online_counts((int32_t) il, &s, &t);
+                            if (!c || t == 0) continue;
+                            fprintf(df, "layer %u total %lld", il, (long long) t);
+                            for (uint32_t e = 0; e < hparams.n_expert; e++) fprintf(df, " %lld", (long long) c[e]);
+                            fprintf(df, "\n");
+                        }
+                        fclose(df);
+                    }
+                }
                 // EMA: fraction of counter history retained per healthy window (and once
                 // after each repin, to fade placement-stale history). Blended history
                 // stabilizes hit-rate and re-rank on non-stationary registers (measured:

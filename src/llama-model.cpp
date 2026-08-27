@@ -1446,10 +1446,10 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         case LLM_ARCH_DEEPSEEK4: case LLM_ARCH_QWEN3MOE: case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_MINIMAX_M2: case LLM_ARCH_QWEN35MOE: case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_HY_V3: case LLM_ARCH_KIMI_LINEAR: case LLM_ARCH_BAILINGMOE2:
-        case LLM_ARCH_OPENAI_MOE:
+        case LLM_ARCH_OPENAI_MOE: case LLM_ARCH_QWEN4EXP:
             break;
         default:
-            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear, openai-moe) — ignored\n");
+            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear, openai-moe, qwen4exp) — ignored\n");
             return;
     }
     const int n_layer  = (int) model.layers.size();
@@ -1479,6 +1479,8 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         else                    { v = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }; }
         return v;
     };
+    int    n_ok_layers = 0;
+    size_t bpe_any     = 0;
     for (int il = 0; il < n_layer; il++) {
         const auto & L = model.layers[il];
         bool ok = true;
@@ -1487,6 +1489,8 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
                 t->ne[2] != n_expert) { ok = false; break; }
         }
         if (!ok) continue;
+        n_ok_layers++;
+        if (bpe_any == 0) { for (auto * t : layer_exps(L)) bpe_any += t->nb[2]; }
         for (int e = 0; e < n_expert; e++) {
             const float h = heat[(size_t) il*n_expert + e];
             if (h > 0.0f) cands.push_back({h, il, e});
@@ -1494,10 +1498,36 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     }
     std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.h > b.h; });
 
+    // fork/2026-08-26: PER-LAYER CAP. The greedy global sort fills whole layers when the
+    // heat map is flat (all heats tie, sort is not stable), so a budget smaller than the
+    // whole expert bank covers a FEW layers completely and leaves the rest untouched. That
+    // is indistinguishable from plain -ncmoe, and it also starves the online-heat counters:
+    // they exist only on split layers, so repin can never learn about the others and the
+    // packing shape is frozen at load. Capping per layer spreads the budget over every
+    // layer, which both exposes the cross-layer hot set to the packer and gives repin
+    // global information. Measured need: qwen4exp has 1193 MB of experts PER LAYER, so a
+    // 14 GB budget buys only 12 of 48 layers whole.
+    //   LLAMA_MOE_HEAT_SPREAD=1      cap = budget / (host layers x bytes-per-expert)
+    //   LLAMA_MOE_HEAT_PER_LAYER=N   explicit cap, overrides the above
+    int cap = n_expert;
+    {
+        const bool spread = [] { const char * e = getenv("LLAMA_MOE_HEAT_SPREAD"); return e && atoi(e) != 0; }();
+        if (spread && n_ok_layers > 0 && bpe_any > 0) {
+            const size_t per_layer_budget = budget / (size_t) n_ok_layers;
+            cap = (int) (per_layer_budget / bpe_any);
+            if (cap < 1) cap = 1;
+            if (cap > n_expert) cap = n_expert;
+        }
+        if (const char * pl = getenv("LLAMA_MOE_HEAT_PER_LAYER")) {
+            const int v = atoi(pl);
+            if (v > 0) cap = v > n_expert ? n_expert : v;
+        }
+    }
     std::vector<std::vector<int>> sel(n_layer);
     size_t bytes = 0;
     int n_sel = 0;
     for (const auto & c : cands) {
+        if ((int) sel[c.il].size() >= cap) continue;   // layer full — keep scanning, do NOT stop
         const auto & L = model.layers[c.il];
         size_t bpe = 0;
         for (auto * t : layer_exps(L)) bpe += t->nb[2];
@@ -1505,6 +1535,10 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         bytes += bpe;
         sel[c.il].push_back(c.e);
         n_sel++;
+    }
+    if (cap < n_expert) {
+        LLAMA_LOG_WARN("moe-heat-split: per-layer cap %d of %d experts (%d host layers)\n",
+                       cap, n_expert, n_ok_layers);
     }
     if (n_sel == 0) {
         LLAMA_LOG_WARN("moe-heat-split: no experts selected (budget too small or no host layers) — ignored\n");
