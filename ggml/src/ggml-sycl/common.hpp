@@ -18,6 +18,7 @@
 #include <iostream>
 #include <string>
 
+#include "base.hpp"
 #include "dpct/helper.hpp"
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -61,27 +62,13 @@ void ggml_sycl_host_free(void* ptr);
 extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
+extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 
-
-#if defined(__clang__) && __has_builtin(__builtin_expect)
-// Hint the optimizer to pipeline the more likely following instruction in branches
-#    define LIKELY(expr)   __builtin_expect(expr, true)
-#    define UNLIKELY(expr) __builtin_expect(expr, false)
-#else
-#    define LIKELY(expr)   (expr)
-#    define UNLIKELY(expr) (expr)
-#endif
-
-#define GGML_SYCL_DEBUG(...)              \
-    do {                                  \
-        if (UNLIKELY(g_ggml_sycl_debug))  \
-            fprintf(stderr, __VA_ARGS__); \
-    } while (0)
 
 #define CHECK_TRY_ERROR(expr)                                            \
   [&]() {                                                                \
@@ -1022,9 +1009,20 @@ static T block_reduce(T val, T * shared_vals, int block_size_template) {
 }
 
 static __dpct_inline__ float ggml_sycl_ue4m3_to_fp32(uint8_t x) {
-    const uint32_t bits = x * (x != 0x7F && x != 0xFF);
-    const __nv_fp8_e4m3 xf = *reinterpret_cast<const __nv_fp8_e4m3 *>(&bits);
-    return static_cast<float>(xf) / 2;
+    // UE4M3 is unsigned: 4 exp bits (bias 7), 3 mantissa bits, no sign, no NaN.
+    // exp == 0xF is a valid exponent (256-448 range), not NaN.
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    float raw;
+    if (exp == 0) {
+        raw = man * (1.0f / 8.0f) * sycl::pow(2.0f, -6.0f);
+    } else {
+        raw = (1.0f + man / 8.0f) * sycl::pow(2.0f, (float) exp - 7.0f);
+    }
+    return raw * 0.5f;
 }
 
 #endif // GGML_SYCL_COMMON_HPP
