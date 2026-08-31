@@ -2779,6 +2779,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
     add_opt(common_arg(
+        {"--moe-heat-label"}, "LABEL",
+        "fork: name this workload so its converged MoE routing map is persisted and reloaded.\n"
+        "the map lands in $XDG_CACHE_HOME/llama-moe-heat/<LABEL>.heat (else ~/.cache/...), so a\n"
+        "later serve of the same shape skips the flat-map bootstrap. An explicit\n"
+        "LLAMA_MOE_HEAT_FILE still wins. Sets LLAMA_MOE_HEAT_LABEL.",
+        [](common_params & params, const std::string & value) {
+            GGML_UNUSED(params);
+            setenv("LLAMA_MOE_HEAT_LABEL", value.c_str(), 1);
+        }
+    ).set_env("LLAMA_MOE_HEAT_LABEL"));
+    add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {

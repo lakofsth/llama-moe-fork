@@ -4,6 +4,9 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+
+#include <sys/stat.h>
+#include <unistd.h>
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -2087,6 +2090,48 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 // ROUTING SKEW can be measured. The split can only beat whole-layer -ncmoe if
                 // usage is skewed enough that the hot experts of many layers beat all experts
                 // of a few; with a flat map the packer fills whole layers and the two coincide.
+                // fork: persist this workload's converged map (--moe-heat-label). Written
+                // only once the window has seen `minhit` routings, because a map built from
+                // a handful of tokens is worse than the flat bootstrap it would replace;
+                // written temp+rename so a killed server never leaves a torn map behind.
+                if (const std::string sc = llama_moe_heat_sidecar_path(); !sc.empty() && tot_all >= minhit) {
+                    const size_t dirpos = sc.rfind('/');
+                    if (dirpos != std::string::npos) {
+                        const std::string dir = sc.substr(0, dirpos);
+                        // best-effort mkdir -p of the single leaf we own
+                        if (access(dir.c_str(), W_OK) != 0) {
+                            const size_t par = dir.rfind('/');
+                            if (par != std::string::npos) {
+                                mkdir(dir.substr(0, par).c_str(), 0755);
+                            }
+                            mkdir(dir.c_str(), 0755);
+                        }
+                    }
+                    std::vector<float> map((size_t) hparams.n_layer() * hparams.n_expert, 0.0f);
+                    bool any = false;
+                    for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+                        int64_t s2 = 0, t2 = 0;
+                        const int64_t * c = ggml_cpu_moe_online_counts((int32_t) il, &s2, &t2);
+                        if (!c || t2 == 0) continue;
+                        for (uint32_t e = 0; e < hparams.n_expert; e++) {
+                            map[(size_t) il * hparams.n_expert + e] = (float) c[e];
+                        }
+                        any = true;
+                    }
+                    if (any) {
+                        const std::string tmp = sc + ".tmp";
+                        if (FILE * mf = fopen(tmp.c_str(), "wb")) {
+                            const bool ok = fwrite(map.data(), sizeof(float), map.size(), mf) == map.size();
+                            fclose(mf);
+                            if (ok && rename(tmp.c_str(), sc.c_str()) == 0) {
+                                LLAMA_LOG_WARN("moe-heat-split: persisted map for workload '%s' (%lld routings)\n",
+                                        getenv("LLAMA_MOE_HEAT_LABEL"), (long long) tot_all);
+                            } else {
+                                unlink(tmp.c_str());
+                            }
+                        }
+                    }
+                }
                 if (const char * dp = getenv("LLAMA_MOE_HEAT_DUMP")) {
                     if (FILE * df = fopen(dp, "w")) {
                         for (uint32_t il = 0; il < hparams.n_layer(); il++) {

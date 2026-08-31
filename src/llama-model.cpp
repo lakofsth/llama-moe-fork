@@ -1436,6 +1436,17 @@ static void llama_moe_heat_evict_slice(llama_model_loader & ml, const void * p, 
 
 static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
     const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
+    // fork: with no explicit map, fall back to this workload's persisted sidecar. An
+    // explicit LLAMA_MOE_HEAT_FILE always wins, so existing setups are unaffected.
+    std::string sidecar;
+    if (!hf || !*hf) {
+        sidecar = llama_moe_heat_sidecar_path();
+        if (!sidecar.empty() && access(sidecar.c_str(), R_OK) == 0) {
+            hf = sidecar.c_str();
+            LLAMA_LOG_INFO("moe-heat-split: using persisted map for workload '%s' (%s)\n",
+                    getenv("LLAMA_MOE_HEAT_LABEL"), hf);
+        }
+    }
     if (!hf || !*hf) {
         return;
     }
