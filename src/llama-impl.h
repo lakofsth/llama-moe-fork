@@ -5,6 +5,36 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <cstdlib>
+
+// fork: per-WORKLOAD heat-map sidecar. LLAMA_MOE_HEAT_LABEL (or --moe-heat-label) names
+// the workload; the converged routing map is persisted under that label and reloaded on
+// the next run, so a serve of the same shape does not pay the flat-map bootstrap again.
+// The LABEL is the whole key by design: putting the model in the label is how you get
+// per-model separation, and that keeps the path derivable without plumbing the gguf path
+// into both the loader and the context.
+static inline std::string llama_moe_heat_sidecar_path() {
+    const char * label = getenv("LLAMA_MOE_HEAT_LABEL");
+    if (!label || !*label) {
+        return std::string();
+    }
+    // refuse anything that could escape the cache directory
+    for (const char * c = label; *c; c++) {
+        if (*c == '/' || *c == '\\' || (*c == '.' && c[1] == '.')) {
+            return std::string();
+        }
+    }
+    std::string dir;
+    if (const char * x = getenv("XDG_CACHE_HOME"); x && *x) {
+        dir = std::string(x) + "/llama-moe-heat";
+    } else if (const char * h = getenv("HOME"); h && *h) {
+        dir = std::string(h) + "/.cache/llama-moe-heat";
+    } else {
+        return std::string();
+    }
+    return dir + "/" + label + ".heat";
+}
+
 
 #ifdef __GNUC__
 #    if defined(__MINGW32__) && !defined(__clang__)
