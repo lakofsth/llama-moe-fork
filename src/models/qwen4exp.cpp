@@ -926,7 +926,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            // fork: this file comes from UPSTREAM wholesale (PR #27742 merged 2026-08-28), so
+            // unlike every fork-owned arch it never passed the heat split through. The loader
+            // still packed the hot experts into VRAM, the graph then ignored them and took the
+            // stock chain, and the online counters — which ride the split's CPU branch — read
+            // ZERO. Same idiom as qwen35moe.cpp:517.
+            nullptr,
+            model.layers[il].moe_split.active() ? &model.layers[il].moe_split : nullptr);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference
