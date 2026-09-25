@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-fusion.h"
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
@@ -109,7 +110,21 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
 //   X(suffix, name): name is both the kernels/<name>.metal basename and the
 //   ggml_metallib_<name>_{start,end} embed-symbol stem.
 #define GGML_METAL_LIBS \
-    X(FA,              fa)             \
+    X(FA_AUX,          fa_aux)         \
+    X(FA_F16,          fa_f16)         \
+    X(FA_F32,          fa_f32)         \
+    X(FA_Q4_0,         fa_q4_0)        \
+    X(FA_Q4_1,         fa_q4_1)        \
+    X(FA_Q5_0,         fa_q5_0)        \
+    X(FA_Q5_1,         fa_q5_1)        \
+    X(FA_Q8_0,         fa_q8_0)        \
+    X(FA_VEC_F16,      fa_vec_f16)     \
+    X(FA_VEC_F32,      fa_vec_f32)     \
+    X(FA_VEC_Q4_0,     fa_vec_q4_0)    \
+    X(FA_VEC_Q4_1,     fa_vec_q4_1)    \
+    X(FA_VEC_Q5_0,     fa_vec_q5_0)    \
+    X(FA_VEC_Q5_1,     fa_vec_q5_1)    \
+    X(FA_VEC_Q8_0,     fa_vec_q8_0)    \
     X(MUL_MV,          mul_mv)         \
     X(MUL_MM,          mul_mm)         \
     X(QUANTIZE,        quantize)       \
@@ -896,6 +911,9 @@ struct ggml_metal_device {
 
     struct ggml_metal_device_props props;
 
+    // shared fusion debugging context
+    struct ggml_metal_fusion_info * finfo;
+
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
 };
@@ -1056,6 +1074,7 @@ static const struct {
     DEV("M5 Pro",   GGML_METAL_DEVICE_M5_PRO),
     DEV("M5 Max",   GGML_METAL_DEVICE_M5_MAX),
     DEV("M5 Ultra", GGML_METAL_DEVICE_M5_ULTRA),
+    DEV("A18 Pro",  GGML_METAL_DEVICE_A18_PRO),
 #undef DEV
 };
 
@@ -1248,7 +1267,7 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 #endif
 
                 dev->props.use_shared_buffers = dev->props.has_unified_memory;
-#if TARGET_OS_OSX
+#if TARGET_OS_OSX && TARGET_CPU_X86_64
                 // In case of eGPU, shared memory may be preferable.
                 dev->props.use_shared_buffers |= [dev->mtl_device location] == MTLDeviceLocationExternal;
 #endif
@@ -1271,6 +1290,13 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     dev->props.max_working_set_size   = dev->mtl_device.recommendedMaxWorkingSetSize;
                 } else {
                     dev->props.max_working_set_size   = dev->mtl_device.maxBufferLength;
+                }
+
+                {
+                    const char * val = getenv("GGML_METAL_FUSION_DEBUG");
+                    dev->finfo = ggml_metal_fusion_info_init(
+                            getenv("GGML_METAL_FUSION_DISABLE") == nil,
+                            val ? atoi(val) : 0);
                 }
 
                 snprintf(dev->props.name, sizeof(dev->props.name), "%s%d", "MTL", device);
@@ -1308,12 +1334,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                         }
                     }
 
+#if TARGET_CPU_X86_64
                     for (int i = MTLGPUFamilyCommon1 + 5; i >= MTLGPUFamilyCommon1; --i) {
                         if ([dev->mtl_device supportsFamily:i]) {
                             GGML_LOG_INFO("%s: GPU family: MTLGPUFamilyCommon%d (%d)\n", __func__, i - (int) MTLGPUFamilyCommon1 + 1, i);
                             break;
                         }
                     }
+#endif
 
                     for (int i = MTLGPUFamilyMetal3_GGML + 5; i >= MTLGPUFamilyMetal3_GGML; --i) {
                         if ([dev->mtl_device supportsFamily:i]) {
@@ -1346,19 +1374,23 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
 void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
-    ggml_metal_rsets_free(dev->rsets);
+    @autoreleasepool {
+        ggml_metal_fusion_info_free(dev->finfo);
 
-    ggml_metal_library_free(dev->library);
-    dev->library = NULL;
+        ggml_metal_rsets_free(dev->rsets);
 
-    if (dev->mtl_queue) {
-        [dev->mtl_queue release];
-        dev->mtl_queue = nil;
-    }
+        ggml_metal_library_free(dev->library);
+        dev->library = NULL;
 
-    if (dev->mtl_device) {
-        [dev->mtl_device release];
-        dev->mtl_device = nil;
+        if (dev->mtl_queue) {
+            [dev->mtl_queue release];
+            dev->mtl_queue = nil;
+        }
+
+        if (dev->mtl_device) {
+            [dev->mtl_device release];
+            dev->mtl_device = nil;
+        }
     }
 
     free(dev);
@@ -1446,12 +1478,14 @@ ggml_metal_event_t ggml_metal_device_event_init(ggml_metal_device_t dev) {
 }
 
 void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev) {
-    id<MTLSharedEvent> event = ev->obj;
-    [event release];
+    @autoreleasepool {
+        id<MTLSharedEvent> event = ev->obj;
+        [event release];
 
-    free(ev);
+        free(ev);
 
-    GGML_UNUSED(dev);
+        GGML_UNUSED(dev);
+    }
 }
 
 void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
@@ -1466,8 +1500,10 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
 
 void ggml_metal_device_get_memory(ggml_metal_device_t dev, size_t * free, size_t * total) {
     if (@available(macOS 10.12, iOS 16.0, *)) {
-        *total = dev->mtl_device.recommendedMaxWorkingSetSize;
-        *free  = *total - dev->mtl_device.currentAllocatedSize;
+        *total     = dev->mtl_device.recommendedMaxWorkingSetSize;
+        size_t cur = dev->mtl_device.currentAllocatedSize;
+        // it's possible to allocate more than `recommendedMaxWorkingSetSize`
+        *free      = *total > cur ? *total - cur : 0;
     } else {
         *free = 0;
         *total = 0;
@@ -1479,7 +1515,9 @@ static bool ggml_metal_supports_mul_mat_op(
         const struct ggml_tensor * op,
         bool src0_f16_has_mv,
         bool mm_path) {
-    if (!has_simdgroup_reduction || op->src[0]->type == GGML_TYPE_NVFP4) {
+    if (!has_simdgroup_reduction ||
+        op->src[0]->type == GGML_TYPE_NVFP4 ||
+        op->src[0]->type == GGML_TYPE_TQ1_0) {
         return false;
     }
 
@@ -1711,6 +1749,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->ne[0] != 576) {
                 return false;
             }
+            if (op->src[1]->ne[0] == 72 && op->src[1]->ne[0] != op->src[2]->ne[0]) {
+                return false;
+            }
+            if (op->src[1]->ne[0] < op->src[2]->ne[0]) {
+                return false;
+            }
             if (op->src[1]->type != op->src[2]->type) {
                 return false;
             }
@@ -1779,8 +1823,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->type         == GGML_TYPE_F32 &&
-                op->src[0]->ne[1] == 4 &&
-                op->src[1]->ne[0] == 4 &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_DSV4_HC_POST:
@@ -1788,16 +1830,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 &&
-                op->src[3]->type == GGML_TYPE_F32 &&
+                (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type         == GGML_TYPE_F32 &&
                 op->src[1]->ne[1] == 4 &&
                 op->src[2]->ne[0] == 4 &&
-                op->src[3]->ne[0] == 4 &&
-                op->src[3]->ne[1] == 4 &&
+                (op->src[3] == NULL || (op->src[3]->ne[0] == 4 && op->src[3]->ne[1] == 4)) &&
                 ggml_is_contiguous_rows(op->src[0]) &&
                 ggml_is_contiguous_rows(op->src[1]) &&
                 ggml_is_contiguous_rows(op->src[2]) &&
-                ggml_is_contiguous_rows(op->src[3]);
+                (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
@@ -1810,6 +1851,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_SOLVE_TRI:
             return has_simdgroup_reduction && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_MUL_MAT:
+            // the FWHT kernels read an F16 source directly; every other F16 src1 path
+            // still goes through ggml_metal_supports_mul_mat_op
+            if (op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
+                ggml_metal_op_mul_mat_use_fwht(op, dev->props.max_theadgroup_memory_size)) {
+                return has_simdgroup_reduction;
+            }
             return ggml_metal_supports_mul_mat_op(
                     has_simdgroup_reduction, op, true,
                     ggml_metal_op_mul_mat_use_mm(op, has_simdgroup_mm));
@@ -1880,7 +1927,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4;
+            return op->src[0]->type != GGML_TYPE_NVFP4 &&
+                   op->src[0]->type != GGML_TYPE_TQ1_0;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
@@ -1923,6 +1971,10 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 
 static void ggml_metal_device_disable_tensor(ggml_metal_device_t dev) {
     dev->props.has_tensor = false;
+}
+
+struct ggml_metal_fusion_info * ggml_metal_device_get_fusion_info(ggml_metal_device_t dev) {
+    return dev->finfo;
 }
 
 //
@@ -2226,13 +2278,15 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 }
 
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
-    ggml_metal_device_rsets_rm(buf->dev, buf->rset);
+    @autoreleasepool {
+        ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
-    for (int i = 0; i < buf->n_buffers; i++) {
-        [buf->buffers[i].metal release];
+        for (int i = 0; i < buf->n_buffers; i++) {
+            [buf->buffers[i].metal release];
+        }
+
+        ggml_metal_buffer_rset_free(buf);
     }
-
-    ggml_metal_buffer_rset_free(buf);
 
     if (buf->is_shared && buf->owned) {
 #if TARGET_OS_OSX

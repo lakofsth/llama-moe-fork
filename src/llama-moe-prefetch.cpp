@@ -259,7 +259,7 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
     p->n_layer  = (int) hp.n_layer();
     p->n_embd   = (int) hp.n_embd;
     p->n_expert = (int) hp.n_expert;
-    p->n_used   = (int) hp.n_expert_used;
+    p->n_used   = (int) hp.n_expert_used(); // upstream #25444: per-layer accessor; deepseek4 graph uses layer 0 too
     p->n_hash   = (int) hp.dsv4_hash_layer_count;
     p->rms_eps  = hp.f_norm_rms_eps;
 #ifdef __linux__
