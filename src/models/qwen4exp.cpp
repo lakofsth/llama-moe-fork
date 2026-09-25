@@ -556,9 +556,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, "indexer_k_pooled", il);
 
+    // count blocks along ne1, not ne2: the CUDA norm kernels launch gridDim.y = ne2, which is
+    // capped at 65535, and at the full 262144-cell pool n_blocks = 262144/4 = 65536 (upstream #27941)
+    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+
     // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
     pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow);
