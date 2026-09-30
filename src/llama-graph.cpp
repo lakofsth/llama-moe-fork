@@ -2307,6 +2307,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     arch == LLM_ARCH_HY_V3    || arch == LLM_ARCH_KIMI_LINEAR ||
                     arch == LLM_ARCH_BAILINGMOE2 ||
                     arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5NEXT ||
+                    arch == LLM_ARCH_MIMO2 ||
                     arch == LLM_ARCH_OPENAI_MOE); // heat-split whitelist (see llama_moe_heat_split_init)
         GGML_ASSERT(!weight_before_ffn && (type_op == LLM_FFN_SILU ||
                     (arch == LLM_ARCH_OPENAI_MOE && type_op == LLM_FFN_SWIGLU_OAI_MOE)));
