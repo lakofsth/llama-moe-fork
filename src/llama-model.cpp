@@ -1600,10 +1600,10 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         case LLM_ARCH_DEEPSEEK4: case LLM_ARCH_QWEN3MOE: case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_MINIMAX_M2: case LLM_ARCH_QWEN35MOE: case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_HY_V3: case LLM_ARCH_KIMI_LINEAR: case LLM_ARCH_BAILINGMOE2:
-        case LLM_ARCH_OPENAI_MOE: case LLM_ARCH_QWEN4EXP: case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_OPENAI_MOE: case LLM_ARCH_QWEN4EXP: case LLM_ARCH_GLM5NEXT: case LLM_ARCH_MIMO2:
             break;
         default:
-            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear, openai-moe, qwen4exp, glm5next) — ignored\n");
+            LLAMA_LOG_WARN("moe-heat-split: arch not yet validated (deepseek4, qwen3moe, glm4-moe, minimax-m2, qwen35moe, deepseek2, hy-v3, kimi-linear, openai-moe, qwen4exp, glm5next, mimo2) — ignored\n");
             return;
     }
     const int n_layer  = (int) model.layers.size();

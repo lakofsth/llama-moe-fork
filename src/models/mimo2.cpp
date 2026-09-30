@@ -217,7 +217,12 @@ llama_model_mimo2::graph::graph(const llama_model & model, const llm_graph_param
                     LLM_FFN_SILU, true,
                     hparams.expert_weights_scale,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
-                    il);
+                    il,
+                    // fork: pass the layer's heat split, or the loader packs hot experts into VRAM
+                    // and the graph ignores them (the qwen4exp defect, fca6dbedf). mimo2 loads no
+                    // swiglu clamp (swiglu_clamp_exp stays 0), so the split branch matches stock.
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                    model.layers[il].moe_split.active() ? &model.layers[il].moe_split : nullptr);
             cb(cur, "ffn_moe_out", il);
         }
 
