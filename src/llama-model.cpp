@@ -2059,6 +2059,22 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
 // distributed by their current heat shares — censored but slow-drifting) and swap only
 // the changed slots within the layer's existing packed quota. Runs between decodes on
 // the main thread. Sources may have been evicted: tensor_set refaults them from NVMe.
+bool llama_model_base::moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const {
+    if (il < 0 || (size_t) il >= layers.size()) return false;
+    const auto & ms = layers[il].moe_split;
+    if (!ms.active() || ms.cur_experts.empty()) return false;
+    const int n_expert = (int) hparams.n_expert;
+    for (int e = 0; e < n_expert; e++) out[e] = (float) counts[e];
+    double hshare_sum = 0.0;
+    for (float h : ms.cur_heat) hshare_sum += h;
+    const size_t G = ms.cur_experts.size();
+    for (size_t g = 0; g < G; g++) {
+        const double share = hshare_sum > 0.0 ? ms.cur_heat[g] / hshare_sum : 1.0/(double) G;
+        out[ms.cur_experts[g]] = (float) ((double) sent * share);
+    }
+    return true;
+}
+
 int llama_model_base::moe_heat_repin() {
     static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
     static const int max_swaps = [] { const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS"); return e ? atoi(e) : 0; }(); // default OFF: measured 9x384-swap thrash vs one 1403-swap pass (-13% tg) — partial maps make the desired set drift

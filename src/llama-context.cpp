@@ -2229,8 +2229,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         int64_t s2 = 0, t2 = 0;
                         const int64_t * c = ggml_cpu_moe_online_counts((int32_t) il, &s2, &t2);
                         if (!c || t2 == 0) continue;
-                        for (uint32_t e = 0; e < hparams.n_expert; e++) {
-                            map[(size_t) il * hparams.n_expert + e] = (float) c[e];
+                        // a split layer's GPU-packed experts reach the CPU op only as SENTINELS, so
+                        // raw counts are the COLD set's and the persisted map was the inverse of the
+                        // placement (2026-09-30, GLM-5.3-Flash: two windows' maps anti-correlated,
+                        // 2.8% capture at a 23% cap). Persist the repin's estimate instead.
+                        float * row = &map[(size_t) il * hparams.n_expert];
+                        if (!model.moe_heat_score((int) il, c, s2, row)) {
+                            for (uint32_t e = 0; e < hparams.n_expert; e++) row[e] = (float) c[e];
                         }
                         any = true;
                     }
