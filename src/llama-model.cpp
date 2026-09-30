@@ -1609,12 +1609,22 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     const int n_layer  = (int) model.layers.size();
     const int n_expert = (int) model.hparams.n_expert;
 
-    std::vector<float> heat((size_t) n_layer * n_expert);
+    std::vector<float> heat((size_t) n_layer * n_expert, 0.0f);
     FILE * f = fopen(hf, "rb");
-    if (!f || fread(heat.data(), sizeof(float), heat.size(), f) != heat.size()) {
+    // A map persisted by --moe-heat-label has hparams.n_layer() rows, which EXCLUDES trailing NextN
+    // layers, while model.layers is sized n_layer_all (glm5next: 45 vs 46). Accept that shorter form
+    // and leave the NextN rows at zero heat (never packed); any other size is still refused.
+    // (2026-09-30: GLM-5.3-Flash's first converged map was otherwise "ignored" by its own bench.)
+    const size_t n_read = f ? fread(heat.data(), sizeof(float), heat.size(), f) : 0;
+    const size_t n_short = (size_t) model.hparams.n_layer() * n_expert;
+    if (!f || (n_read != heat.size() && !(n_read == n_short && n_short < heat.size() && feof(f)))) {
         LLAMA_LOG_WARN("moe-heat-split: cannot read %d x %d f32 from '%s' — ignored\n", n_layer, n_expert, hf);
         if (f) fclose(f);
         return;
+    }
+    if (n_read != heat.size()) {
+        LLAMA_LOG_WARN("moe-heat-split: map '%s' has %u rows (persisted form, NextN excluded); padded to %d\n",
+                hf, model.hparams.n_layer(), n_layer);
     }
     fclose(f);
 
