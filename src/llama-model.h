@@ -837,6 +837,13 @@ struct llama_model {
     // fork: online-heat repin hook (no-op unless the heat split is active; see
     // llama_model_base::moe_heat_repin)
     virtual int moe_heat_repin() { return -1; }
+    // fork: the per-expert heat estimate of one layer in routing-count scale, as the repin
+    // ranks it: exact counts for host-served experts, and for GPU-packed experts (whose
+    // routings reach the CPU op only as sentinels) the sentinel mass shared by their current
+    // heat. Returns false when the layer has no active split (raw counts are then exact).
+    virtual bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const {
+        (void) il; (void) counts; (void) sent; (void) out; return false;
+    }
 
 protected:
     llama_model_params params;
@@ -898,6 +905,7 @@ struct llama_model_base : public llama_model {
     // routing counters (LLAMA_MOE_HEAT_ONLINE), swapping only changed slots within the
     // layer's existing quota. Returns number of expert slots swapped, -1 if inactive.
     int moe_heat_repin() override;
+    bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const override;
 };
 
 const char * llm_type_name(llm_type type);
