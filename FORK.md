@@ -30,17 +30,21 @@ redundant duplicates kept for history. Original authorship is preserved on both 
 | var | default | meaning |
 |---|---|---|
 | `LLAMA_MOE_HEAT_FILE` | unset (off) | per-layer×expert f32 heat map; enables the split |
-| `LLAMA_MOE_HEAT_VRAM_MB` | 20000 | VRAM budget for packed experts |
+| `LLAMA_MOE_HEAT_VRAM_MB` | 20000 | VRAM budget (MiB) for packed experts. **One value**: one pack on the first GPU, every host layer eligible (single-device behaviour, unchanged). **Comma list** (`15000,9000`): budget per GPU device in `CUDA_VISIBLE_DEVICES` order; each host layer's hot experts are packed only on the device that owns the layer under `-sm layer`, missing trailing values are 0, layers owned by the CPU are not packed. One `moe-heat-split: device i ...` line per device at load. An allocation failure on any device disables the split on all of them (WARN; all experts stay on the host) |
+| `LLAMA_MOE_HEAT_SPREAD` / `LLAMA_MOE_HEAT_PER_LAYER` | 0 / unset | per-layer cap on packed experts (spread the budget over every host layer / explicit cap). With a budget list the spread cap is computed per device from that device's budget and layers |
 | `LLAMA_MOE_HEAT_ONLINE` | 0 | enable online counting + auto-repin |
 | `LLAMA_MOE_REPIN_THRESH` | 0.45 | hit-rate floor that triggers a repin |
 | `LLAMA_MOE_REPIN_MIN_HITS` | 20000 | min window sample before judging |
 | `LLAMA_MOE_REPIN_BIAS_K` | 0.4 | threshold compensation per unit of router bias |
+| `LLAMA_MOE_REPIN_MAX_SWAPS` | 0 (uncapped) | cap on expert swaps per repin pass. **Comma list**: one cap per pack device (same indexing as the budget list); 0 = uncapped, **negative = never swap on that device** (use for a slow-link card) |
 | `LLAMA_MOE_ROUTER_BIAS` | 0 | ε added to resident experts' selection scores |
 | `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning — measured cost at ε=0.5: +2.6 % PPL on a narrow register but **+22 % on a wide one, +29 % on a mismatched map**; the gate holds all of these at noise level) |
-| `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`) |
+| `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`). When split layers span two or more devices a `per-device hit-rate` line follows each aggregate line (also on every repin) |
 | `LLAMA_MOE_SPLIT_PP` | unset (off) | engage the heat-split on prompt-processing batches too (default: split runs for tg-shaped batches only, pp uses the stock chain). **Opt-in, and the dominant pp lever: ~2.6–2.8× prompt throughput** — measured on V4-Flash at `-ub 2048`, ~200 t/s with it on vs ~75 off (`pb-splitpp-disc`, 2026-07-21). Numerically parity-safe (~3–4 dp; the earlier m2 CUDA illegal-access was fixed in `48cea759b`). Set `LLAMA_MOE_SPLIT_PP=1` for prompt-heavy workloads |
 | `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A). Measured no-op when weights are fully RAM/page-cache resident (Qwen3-235B warm-cache test); intended for genuinely NVMe-tail-streaming configs |
 | `LLAMA_MMAP_NO_PREFETCH` | 0 | skip whole-file MADV_WILLNEED at load |
+
+**Two or more GPUs** (`-sm layer -ts a,b`): what the budget list changes is only where each host layer's packed experts live — with its own layer's device, so a token still crosses devices once per forward pass. Unchanged: cold-expert prompt uploads (op offload) still go to backend 0, so the widest-link card must be device 0 (a WARN fires at load when it is not, by link width); KV follows its layer; the router bias and bias gate are per-layer and follow the pack. See `~/docs/moe-fork-two-card-plan-2026-09-15.md` on cubic.
 
 Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv 2`.
 
