@@ -266,6 +266,13 @@ struct llama_moe_split {
     std::vector<int32_t> cur_experts;
     std::vector<float>   cur_heat;
 
+    // fork/two-card U1: the device holding this layer's packed tensors, and its index
+    // among the model's non-meta GPU devices (the index that the list forms of
+    // LLAMA_MOE_HEAT_VRAM_MB and LLAMA_MOE_REPIN_MAX_SWAPS address). Set on split layers
+    // only; read by the per-device hit-rate tally and the per-device repin cap.
+    ggml_backend_dev_t dev     = nullptr;
+    int                dev_idx = -1;
+
     bool active() const { return gate_gpu != nullptr || gate_up_gpu != nullptr; }
 };
 

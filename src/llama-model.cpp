@@ -1540,6 +1540,40 @@ static void llama_moe_heat_evict_slice(llama_model_loader & ml, const void * p, 
 #endif
 }
 
+// fork/two-card U1: the negotiated PCIe link of a backend device, read from sysfs via the
+// PCI bus id the backend reports (ggml_backend_dev_props.device_id, lower-case
+// "dddd:bb:dd.f"). Returns e.g. "16.0 GT/s x4" and sets `width` (0 = unknown). The
+// speed is the CURRENT one and is power-managed (a 5090 at idle reads 2.5 GT/s), so
+// only the width is fit for comparison; the speed is reported for the reader.
+static std::string llama_moe_heat_pci_link(ggml_backend_dev_t dev, int & width) {
+    width = 0;
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    if (!props.device_id || !*props.device_id) {
+        return "unknown (no PCI id)";
+    }
+    auto read1 = [](const std::string & path) {
+        std::string v;
+        if (FILE * f = fopen(path.c_str(), "r")) {
+            char line[64] = {};
+            if (fgets(line, sizeof(line), f)) v = line;
+            fclose(f);
+        }
+        while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.pop_back();
+        return v;
+    };
+    const std::string base = std::string("/sys/bus/pci/devices/") + props.device_id + "/";
+    std::string speed = read1(base + "current_link_speed");
+    const std::string w = read1(base + "current_link_width");
+    if (speed.empty() || w.empty()) {
+        return std::string("unknown (") + props.device_id + ")";
+    }
+    width = atoi(w.c_str());
+    const size_t sp = speed.find(" PCIe");
+    if (sp != std::string::npos) speed.resize(sp);
+    return speed + " x" + w + " (" + props.device_id + ")";
+}
+
 static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
     const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
     // fork: with no explicit map, fall back to this workload's persisted sidecar. An
@@ -1581,9 +1615,74 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     }
     fclose(f);
 
+    // fork/two-card U1: budget. Two forms, told apart by a comma.
+    //   unset or ONE value (legacy form): one pack on the FIRST non-meta GPU, every host
+    //     layer eligible whatever device owns it, selection and logs identical to the
+    //     single-device packer this replaced — every existing recipe is unchanged.
+    //   a COMMA LIST (per-device form, e.g. "15000,9000"): value i is the budget of GPU
+    //     device i (non-meta GPUs in model.devices order = CUDA_VISIBLE_DEVICES order);
+    //     a host layer is packed only onto the device that owns it (model.dev_layer(il)),
+    //     so each layer's packed experts sit with its attention and KV (two-card plan §3).
+    //     Missing trailing values are 0 (nothing packed there); a layer owned by the CPU
+    //     or a meta device is not packable in this form.
     size_t budget = 20000ull * 1024 * 1024;
+    bool   per_dev = false;
+    std::vector<size_t> list_budget;
     if (const char * b = getenv("LLAMA_MOE_HEAT_VRAM_MB")) {
-        budget = (size_t) atoll(b) * 1024 * 1024;
+        if (strchr(b, ',') == nullptr) {
+            budget = (size_t) atoll(b) * 1024 * 1024;
+        } else {
+            per_dev = true;
+            for (const char * p = b; ; ) {
+                const char * q = strchr(p, ',');
+                const std::string tok = q ? std::string(p, q - p) : std::string(p);
+                const long long v = atoll(tok.c_str());
+                list_budget.push_back(v > 0 ? (size_t) v * 1024 * 1024 : 0);
+                if (!q) break;
+                p = q + 1;
+            }
+        }
+    }
+
+    std::vector<ggml_backend_dev_t> gpus;
+    for (const auto & d : model.devices) {
+        if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) gpus.push_back(d.dev);
+    }
+
+    // pack devices: legacy form has exactly one (index 0; its device is resolved after
+    // selection, where the single-device packer resolved it); per-device form has one
+    // per GPU
+    struct heat_pack_dev {
+        ggml_backend_dev_t    dev    = nullptr;
+        size_t                budget = 0;
+        size_t                bytes  = 0;     // selected so far
+        size_t                bpe_any = 0;    // bytes/expert of the first packable layer (spread cap)
+        int                   n_ok_layers = 0;
+        int                   cap    = 0;
+        bool                  full   = false; // first non-fit seen: closed (the legacy loop's break, per device)
+        int                   n_sel  = 0;
+        int                   n_split_layers = 0;
+        ggml_context        * ctx    = nullptr;
+        ggml_backend_buffer_t buf    = nullptr;
+    };
+    std::vector<heat_pack_dev> pd;
+    if (per_dev) {
+        if (gpus.empty()) {
+            LLAMA_LOG_WARN("moe-heat-split: no GPU device — ignored\n");
+            return;
+        }
+        if (list_budget.size() > gpus.size()) {
+            LLAMA_LOG_WARN("moe-heat-split: LLAMA_MOE_HEAT_VRAM_MB lists %zu budgets for %zu GPU devices — the extra %zu ignored\n",
+                    list_budget.size(), gpus.size(), list_budget.size() - gpus.size());
+        }
+        pd.resize(gpus.size());
+        for (size_t i = 0; i < gpus.size(); i++) {
+            pd[i].dev    = gpus[i];
+            pd[i].budget = i < list_budget.size() ? list_budget[i] : 0;
+        }
+    } else {
+        pd.resize(1);
+        pd[0].budget = budget;
     }
 
     struct cand { float h; int il; int e; };
@@ -1596,8 +1695,10 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         else                    { v = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }; }
         return v;
     };
+    // ldev[il]: pack-device index of layer il, -1 = not packable
+    std::vector<int> ldev(n_layer, -1);
     int    n_ok_layers = 0;
-    size_t bpe_any     = 0;
+    int    n_ok_unowned = 0; // per-device form: host-expert layers whose owner is not a GPU
     for (int il = 0; il < n_layer; il++) {
         const auto & L = model.layers[il];
         bool ok = true;
@@ -1606,14 +1707,27 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
                 t->ne[2] != n_expert) { ok = false; break; }
         }
         if (!ok) continue;
+        int d = 0;
+        if (per_dev) {
+            const ggml_backend_dev_t owner = model.dev_layer(il);
+            d = -1;
+            for (size_t i = 0; i < gpus.size(); i++) if (gpus[i] == owner) { d = (int) i; break; }
+            if (d < 0) { n_ok_unowned++; continue; }
+        }
+        ldev[il] = d;
         n_ok_layers++;
-        if (bpe_any == 0) { for (auto * t : layer_exps(L)) bpe_any += t->nb[2]; }
+        pd[d].n_ok_layers++;
+        if (pd[d].bpe_any == 0) { for (auto * t : layer_exps(L)) pd[d].bpe_any += t->nb[2]; }
         for (int e = 0; e < n_expert; e++) {
             const float h = heat[(size_t) il*n_expert + e];
             if (h > 0.0f) cands.push_back({h, il, e});
         }
     }
     std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.h > b.h; });
+    if (n_ok_unowned > 0) {
+        LLAMA_LOG_WARN("moe-heat-split: %d host-expert layers are owned by the CPU or a meta device — not packable in the per-device form\n",
+                n_ok_unowned);
+    }
 
     // fork/2026-08-26: PER-LAYER CAP. The greedy global sort fills whole layers when the
     // heat map is flat (all heats tie, sort is not stable), so a budget smaller than the
@@ -1626,59 +1740,120 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     // 14 GB budget buys only 12 of 48 layers whole.
     //   LLAMA_MOE_HEAT_SPREAD=1      cap = budget / (host layers x bytes-per-expert)
     //   LLAMA_MOE_HEAT_PER_LAYER=N   explicit cap, overrides the above
-    int cap = n_expert;
+    // fork/two-card U1: computed per pack device from that device's budget and the host
+    // layers it owns (legacy form: the one device owns every host layer — the old cap).
     {
         const bool spread = [] { const char * e = getenv("LLAMA_MOE_HEAT_SPREAD"); return e && atoi(e) != 0; }();
-        if (spread && n_ok_layers > 0 && bpe_any > 0) {
-            const size_t per_layer_budget = budget / (size_t) n_ok_layers;
-            cap = (int) (per_layer_budget / bpe_any);
-            if (cap < 1) cap = 1;
-            if (cap > n_expert) cap = n_expert;
-        }
-        if (const char * pl = getenv("LLAMA_MOE_HEAT_PER_LAYER")) {
-            const int v = atoi(pl);
-            if (v > 0) cap = v > n_expert ? n_expert : v;
+        const char * pl = getenv("LLAMA_MOE_HEAT_PER_LAYER");
+        for (auto & p : pd) {
+            p.cap = n_expert;
+            if (spread && p.n_ok_layers > 0 && p.bpe_any > 0) {
+                const size_t per_layer_budget = p.budget / (size_t) p.n_ok_layers;
+                p.cap = (int) (per_layer_budget / p.bpe_any);
+                if (p.cap < 1) p.cap = 1;
+                if (p.cap > n_expert) p.cap = n_expert;
+            }
+            if (pl) {
+                const int v = atoi(pl);
+                if (v > 0) p.cap = v > n_expert ? n_expert : v;
+            }
+            if (p.budget == 0) p.full = true;
         }
     }
     std::vector<std::vector<int>> sel(n_layer);
     size_t bytes = 0;
     int n_sel = 0;
+    int n_open = 0;
+    for (const auto & p : pd) if (!p.full) n_open++;
     for (const auto & c : cands) {
-        if ((int) sel[c.il].size() >= cap) continue;   // layer full — keep scanning, do NOT stop
+        if (n_open == 0) break;
+        auto & p = pd[ldev[c.il]];
+        if (p.full) continue;                          // device closed — other devices keep filling
+        if ((int) sel[c.il].size() >= p.cap) continue; // layer full — keep scanning, do NOT stop
         const auto & L = model.layers[c.il];
         size_t bpe = 0;
         for (auto * t : layer_exps(L)) bpe += t->nb[2];
-        if (bytes + bpe > budget) break;
-        bytes += bpe;
+        if (p.bytes + bpe > p.budget) {
+            // the single-device packer's `break`, applied per device: this device takes
+            // nothing more. Leaves at most one expert's bytes of its budget idle.
+            p.full = true;
+            n_open--;
+            continue;
+        }
+        p.bytes += bpe;
+        bytes   += bpe;
         sel[c.il].push_back(c.e);
+        p.n_sel++;
         n_sel++;
     }
-    if (cap < n_expert) {
-        LLAMA_LOG_WARN("moe-heat-split: per-layer cap %d of %d experts (%d host layers)\n",
-                       cap, n_expert, n_ok_layers);
+    for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) pd[ldev[il]].n_split_layers++;
+
+    if (!per_dev) {
+        const int cap = pd[0].cap;
+        if (cap < n_expert) {
+            LLAMA_LOG_WARN("moe-heat-split: per-layer cap %d of %d experts (%d host layers)\n",
+                           cap, n_expert, n_ok_layers);
+        }
+    } else {
+        // one line per device: what it was given and what it took. Printed before any
+        // early return so a failed or empty pack still says why.
+        int w0 = 0; std::string link0;
+        for (size_t d = 0; d < pd.size(); d++) {
+            const auto & p = pd[d];
+            int il_lo = -1, il_hi = -1, gmin_d = n_expert, gmax_d = 0;
+            for (int il = 0; il < n_layer; il++) {
+                if (ldev[il] != (int) d || sel[il].empty()) continue;
+                if (il_lo < 0) il_lo = il;
+                il_hi = il;
+                gmin_d = std::min(gmin_d, (int) sel[il].size());
+                gmax_d = std::max(gmax_d, (int) sel[il].size());
+            }
+            if (il_lo < 0) gmin_d = 0;
+            int width = 0;
+            const std::string link = llama_moe_heat_pci_link(p.dev, width);
+            LLAMA_LOG_WARN("moe-heat-split: device %zu %s: budget %.1f MiB, per-layer cap %d of %d experts (%d host layers), "
+                           "packed %d experts across %d layers (il %d..%d, per-layer %d..%d, %.1f MiB), link %s\n",
+                           d, ggml_backend_dev_name(p.dev), p.budget/1024.0/1024.0, p.cap, n_expert, p.n_ok_layers,
+                           p.n_sel, p.n_split_layers, il_lo, il_hi, gmin_d, gmax_d, p.bytes/1024.0/1024.0, link.c_str());
+            // the enumeration-order trap (two-card plan §3/§9): the scheduler sends every
+            // cold-expert prompt upload to backend 0, so device 0 must have the widest
+            // link. Width only: link SPEED is power-managed and reads 2.5 GT/s at idle.
+            if (d == 0) {
+                w0 = width; link0 = link;
+            } else if (w0 > 0 && width > w0) {
+                LLAMA_LOG_WARN("moe-heat-split: device 0 %s has a narrower PCIe link (%s) than device %zu %s (%s) — every "
+                               "cold-expert prompt upload goes to device 0; check CUDA_VISIBLE_DEVICES order\n",
+                               ggml_backend_dev_name(pd[0].dev), link0.c_str(), d, ggml_backend_dev_name(p.dev), link.c_str());
+            }
+        }
     }
     if (n_sel == 0) {
         LLAMA_LOG_WARN("moe-heat-split: no experts selected (budget too small or no host layers) — ignored\n");
         return;
     }
 
-    ggml_backend_dev_t gpu = nullptr;
-    for (const auto & d : model.devices) {
-        if (!d.is_meta && ggml_backend_dev_type(d.dev) == GGML_BACKEND_DEVICE_TYPE_GPU) { gpu = d.dev; break; }
-    }
-    if (!gpu) {
-        LLAMA_LOG_WARN("moe-heat-split: no GPU device — ignored\n");
-        return;
+    if (!per_dev) {
+        pd[0].dev = gpus.empty() ? nullptr : gpus[0];
+        if (!pd[0].dev) {
+            LLAMA_LOG_WARN("moe-heat-split: no GPU device — ignored\n");
+            return;
+        }
     }
 
     int n_split_layers = 0;
     for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) n_split_layers++;
 
-    ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(n_split_layers*11 + 8), nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
+    // one context per pack device that took a layer (legacy form: exactly the one
+    // context the single-device packer built, sized the same)
+    for (auto & p : pd) {
+        if (p.n_split_layers == 0) continue;
+        ggml_init_params ip = { ggml_tensor_overhead() * (size_t)(p.n_split_layers*11 + 8), nullptr, true };
+        p.ctx = ggml_init(ip);
+    }
     // openai-moe: expert biases ride along on both branches; PADDED copies (see
     // llama_moe_split header comment). CPU padded copies live in their own host-buffer
-    // context; GPU packed copies share the GPU context above.
+    // context (one, whatever the device count); GPU packed copies share their layer's
+    // device context above.
     ggml_init_params iph = { ggml_tensor_overhead() * (size_t)(n_split_layers*3 + 8), nullptr, true };
     ggml_context * ctx_host = ggml_init(iph);
 
@@ -1686,6 +1861,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         if (sel[il].empty()) continue;
         std::sort(sel[il].begin(), sel[il].end());
         auto & L = model.layers[il];
+        ggml_context * ctx = pd[ldev[il]].ctx; // this layer's device context: map/mask tensors go with the packed weights
         const int64_t G = (int64_t) sel[il].size();
         auto & ms = L.moe_split;
         if (L.ffn_gate_up_exps) {
@@ -1726,22 +1902,38 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         }
     }
 
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(gpu));
-    if (!buf) {
-        LLAMA_LOG_WARN("moe-heat-split: GPU buffer alloc failed (%.1f MiB) — ignored\n", bytes/1024.0/1024.0);
+    // one buffer per pack device. Failure on ANY device keeps the single-device contract:
+    // WARN, clear EVERY layer's split, free whatever was allocated, and return — the model
+    // runs with all experts on the host exactly as with the heat split off. Never a
+    // partial pack across devices.
+    auto release_all = [&](ggml_context * ctx_h) {
         for (int il = 0; il < n_layer; il++) model.layers[il].moe_split = {};
-        ggml_free(ctx);
-        ggml_free(ctx_host);
-        return;
+        for (auto & p : pd) {
+            if (p.buf) { ggml_backend_buffer_free(p.buf); p.buf = nullptr; }
+            if (p.ctx) { ggml_free(p.ctx); p.ctx = nullptr; }
+        }
+        ggml_free(ctx_h);
+    };
+    for (auto & p : pd) {
+        if (!p.ctx) continue;
+        p.buf = ggml_backend_alloc_ctx_tensors_from_buft(p.ctx, ggml_backend_dev_buffer_type(p.dev));
+        if (!p.buf) {
+            if (!per_dev) {
+                LLAMA_LOG_WARN("moe-heat-split: GPU buffer alloc failed (%.1f MiB) — ignored\n", bytes/1024.0/1024.0);
+            } else {
+                LLAMA_LOG_WARN("moe-heat-split: GPU buffer alloc failed on %s (%.1f MiB of %.1f MiB total) — ignored: "
+                               "split disabled on ALL devices, every expert stays on the host\n",
+                               ggml_backend_dev_name(p.dev), p.bytes/1024.0/1024.0, bytes/1024.0/1024.0);
+            }
+            release_all(ctx_host);
+            return;
+        }
     }
     // host buffer for the padded CPU bias copies (no-op sized when no arch biases exist)
     ggml_backend_buffer_t buf_host = ggml_backend_alloc_ctx_tensors_from_buft(ctx_host, ggml_backend_cpu_buffer_type());
     if (!buf_host && ggml_get_first_tensor(ctx_host) != nullptr) {
         LLAMA_LOG_WARN("moe-heat-split: host bias buffer alloc failed — ignored\n");
-        for (int il = 0; il < n_layer; il++) model.layers[il].moe_split = {};
-        ggml_backend_buffer_free(buf);
-        ggml_free(ctx);
-        ggml_free(ctx_host);
+        release_all(ctx_host);
         return;
     }
 
@@ -1820,18 +2012,24 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         }
         ggml_backend_tensor_set(ms.mask_cpu, kc.data(), 0, kc.size()*sizeof(float));
         ggml_backend_tensor_set(ms.mask_gpu, kg.data(), 0, kg.size()*sizeof(float));
+
+        // fork/two-card U1: which device holds this layer's pack (tally + repin cap)
+        ms.dev     = pd[ldev[il]].dev;
+        ms.dev_idx = per_dev ? ldev[il] : 0; // legacy form packs on the first GPU = index 0
     }
 
     // process-lifetime ownership (milestone 1: never freed before exit)
-    static ggml_context * s_ctx = nullptr;
-    static ggml_backend_buffer_t s_buf = nullptr;
+    static std::vector<ggml_context *>         s_ctx;
+    static std::vector<ggml_backend_buffer_t>  s_buf;
     static ggml_context * s_ctx_host = nullptr;
     static ggml_backend_buffer_t s_buf_host = nullptr;
-    s_ctx = ctx;
-    s_buf = buf;
+    for (const auto & p : pd) {
+        if (p.ctx) s_ctx.push_back(p.ctx);
+        if (p.buf) s_buf.push_back(p.buf);
+    }
     s_ctx_host = ctx_host;
     s_buf_host = buf_host;
-    (void) s_ctx; (void) s_buf; (void) s_ctx_host; (void) s_buf_host;
+    (void) s_ctx_host; (void) s_buf_host;
 
     int gmin = n_expert, gmax = 0;
     for (int il = 0; il < n_layer; il++) {
