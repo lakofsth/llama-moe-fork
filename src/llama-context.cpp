@@ -2154,6 +2154,45 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     int64_t s = 0, t = 0;
                     if (ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
                 }
+                // fork/two-card U2: the same window split by the device holding each layer's
+                // pack (llama_moe_split::dev_idx) — hits (sentinel ids: routed to that
+                // device's packed experts) over all routed ids of the layers packed there.
+                // The acceptance instrument for a per-device pack: the aggregate line cannot
+                // show one device's pack going inert. Taken before the decay below, printed
+                // beside the aggregate line (trace windows and repins), and only when the
+                // pack spans two or more devices — a single-device run logs exactly as before.
+                std::string per_dev_tally;
+                {
+                    struct dev_acc { ggml_backend_dev_t dev = nullptr; int64_t s = 0, t = 0; int n_layers = 0; };
+                    std::vector<dev_acc> acc;
+                    for (uint32_t il = 0; il < hparams.n_layer() && il < model.layers.size(); il++) {
+                        const auto & ms = model.layers[il].moe_split;
+                        if (!ms.active() || ms.dev_idx < 0) continue;
+                        int64_t s = 0, t = 0;
+                        if (!ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) continue;
+                        if ((size_t) ms.dev_idx >= acc.size()) acc.resize(ms.dev_idx + 1);
+                        auto & a = acc[ms.dev_idx];
+                        a.dev = ms.dev; a.s += s; a.t += t; a.n_layers++;
+                    }
+                    int n_dev = 0;
+                    for (const auto & a : acc) if (a.n_layers > 0) n_dev++;
+                    if (n_dev >= 2) {
+                        for (size_t d = 0; d < acc.size(); d++) {
+                            const auto & a = acc[d];
+                            if (a.n_layers == 0) continue;
+                            per_dev_tally += format("%sdev%zu %s %.1f%% (%lld/%lld ids, %d layers)",
+                                    per_dev_tally.empty() ? "" : " | ", d,
+                                    a.dev ? ggml_backend_dev_name(a.dev) : "?",
+                                    a.t > 0 ? 100.0*(double) a.s/(double) a.t : 0.0,
+                                    (long long) a.s, (long long) a.t, a.n_layers);
+                        }
+                    }
+                }
+                auto log_per_dev_tally = [&]() {
+                    if (!per_dev_tally.empty()) {
+                        LLAMA_LOG_WARN("moe-heat-online: per-device hit-rate %s\n", per_dev_tally.c_str());
+                    }
+                };
                 // LAB (2026-08-26, not for upstream): dump per-expert routing counts so the
                 // ROUTING SKEW can be measured. The split can only beat whole-layer -ncmoe if
                 // usage is skewed enough that the hot experts of many layers beat all experts
@@ -2230,18 +2269,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         if (swapped >= 0) {
                             LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
                                            100.0*hit, 100.0*thresh, swapped);
+                            log_per_dev_tally(); // the window that triggered the repin
                         }
                         ggml_cpu_moe_online_decay(keep); // fade pre-repin (placement-stale) history
                     } else {
                         if (trace) {
                             LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f\n",
                                            100.0*hit, 100.0*thresh, (long long) tot_all, keep);
+                            log_per_dev_tally();
                         }
                         ggml_cpu_moe_online_decay(keep);
                     }
                 } else if (trace) {
                     LLAMA_LOG_WARN("moe-heat-online: window %lld ids < %ld min, accumulating (hit-rate so far %.1f%%)\n",
                                    (long long) tot_all, minhit, tot_all > 0 ? 100.0*(double)sent_all/(double)tot_all : 0.0);
+                    log_per_dev_tally();
                 }
             }
         }
