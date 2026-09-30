@@ -2049,6 +2049,29 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
 int llama_model_base::moe_heat_repin() {
     static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
     static const int max_swaps = [] { const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS"); return e ? atoi(e) : 0; }(); // default OFF: measured 9x384-swap thrash vs one 1403-swap pass (-13% tg) — partial maps make the desired set drift
+    // fork/two-card U3: a COMMA LIST gives one cap per pack device (llama_moe_split::dev_idx,
+    // the index LLAMA_MOE_HEAT_VRAM_MB's list form uses): value i caps the swaps per repin
+    // pass onto device i; 0 (or a missing trailing value) = uncapped, as the single value;
+    // a NEGATIVE value = never swap on that device (its pack stays as loaded). The reason
+    // is link speed: one swap onto a Gen4 x4 card costs ~4x one onto Gen5 x8 by link
+    // arithmetic, so a full pass could stall decode for seconds there (estimate, not
+    // measured). A single value (no comma) keeps today's meaning exactly: one cap over
+    // all layers of the pass. A frozen device's layers still count toward the aggregate
+    // hit-rate, so a low rate there re-triggers (no-op) repins each window.
+    static const std::vector<int> max_swaps_dev = [] {
+        std::vector<int> v;
+        const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS");
+        if (e && strchr(e, ',')) {
+            for (const char * p = e; ; ) {
+                const char * q = strchr(p, ',');
+                v.push_back(atoi((q ? std::string(p, q - p) : std::string(p)).c_str()));
+                if (!q) break;
+                p = q + 1;
+            }
+        }
+        return v;
+    }();
+    std::vector<int> swapped_dev(max_swaps_dev.size(), 0);
     const int n_expert = (int) hparams.n_expert;
     int swapped_total = 0;
     bool any_active = false;
@@ -2100,7 +2123,18 @@ int llama_model_base::moe_heat_repin() {
             for (size_t g = 0; g < G; g++) if (!have[order[g]]) incoming.push_back(order[g]);
         }
         GGML_ASSERT(incoming.size() == free_slots.size());
-        if (max_swaps > 0 && swapped_total + (int) incoming.size() > max_swaps) {
+        const int di = ms.dev_idx;
+        const bool di_listed = !max_swaps_dev.empty() && di >= 0 && (size_t) di < max_swaps_dev.size();
+        if (!max_swaps_dev.empty()) {
+            const int lim = di_listed ? max_swaps_dev[di] : 0;
+            if (lim < 0) continue; // this device's pack is frozen
+            if (lim > 0 && swapped_dev[di] + (int) incoming.size() > lim) {
+                const size_t room = (size_t) std::max(0, lim - swapped_dev[di]);
+                incoming.resize(room);
+                free_slots.resize(room);
+                if (room == 0) continue; // device budget exhausted; later windows continue
+            }
+        } else if (max_swaps > 0 && swapped_total + (int) incoming.size() > max_swaps) {
             const size_t room = (size_t) std::max(0, max_swaps - swapped_total);
             incoming.resize(room);
             free_slots.resize(room);
@@ -2155,6 +2189,7 @@ int llama_model_base::moe_heat_repin() {
             ms.cur_experts[g] = e;
         }
         swapped_total += (int) incoming.size();
+        if (di_listed) swapped_dev[di] += (int) incoming.size();
 
         // rebuild the routing maps for the new set
         std::vector<int32_t> mc(n_expert), mg(n_expert, 0), mgpp(n_expert, (int32_t) G);
