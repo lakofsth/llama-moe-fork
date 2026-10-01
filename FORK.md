@@ -91,12 +91,35 @@ two-line builder change, and ships only after validation on real hardware:
 | `kimi-linear` | validated (Kimi-Linear-48B-A3B, self-quantized Q4_K_M — no community GGUFs exist: +20 % tg, flat-map bootstrap) — **not re-verified since the b10286 merge**: no Kimi-Linear-48B-A3B weights on this box |
 | `glm4-moe` | validated (GLM-4.5-Air Q4 64 G, genuine glm4moe GGUF, hybrid regime: +14 % tg at default budget) — **not re-verified since the b10286 merge**: no GLM-4.5-Air weights on this box |
 | `openai-moe` | ported (gpt-oss-120b MXFP4; whitelist + expert-bias split support). Runs with the split engaged and generates cleanly, but on a 16-token smoke run only — **throughput never measured, so not validated** |
+| `glm5next` | validated on two cards (GLM-5.3-Flash UD-IQ3_XXS 120 G, upstream PR #27754 merged into the fork; needs `-fa off` and `NVIDIA_TF32_OVERRIDE=0`). Converged map, per-device packs 20000,20000 MiB: **13.0 t/s tg vs 10.4 with whole layers on the GPUs (+25 %)**, 7.7–8.0 all-host; frozen map validated at a 58–59 % served hit-rate on a fresh corpus slice |
+| `mimo2` | validated on two cards (MiMo-V2.6-Flash-MOPD MXFP4 167 G — the experts are natively MXFP4, so this is full quality). Converged map (profiled with per-window re-ranking), packs 22000,22000 MiB: **12.6 t/s tg vs 10.1 whole-layer (+25 %)**, 90.5 vs 76.6 pp2048. Routing is content-dependent: a static map transfers at ~40 % hit-rate; serve it frozen — continuous repinning reached 63–70 % hit but halved decode (swap traffic over PCIe) |
 | `bailingmoe2` | plumbed; NOTE: Ling-2.6-flash itself is BailingMoeV2_5 (MLA + linear-attn hybrid) — needs new upstream converter+runtime support, not just this fork's plumbing |
 | `qwen3next`, `step35` | next — two-line recipe; merged gate_up supported |
 
 Models without a profiled heat map bootstrap from a **flat map**: online repin measures the
 real per-expert heat during the first hundreds of tokens and repacks VRAM by itself —
 self-profiling, no logging pipeline needed.
+
+## Profiling a heat map that is worth serving (2026-10-01)
+
+Three properties of the online counters decide whether `--moe-heat-label` persists a useful map:
+
+- **Packed experts are invisible to the CPU op.** Their routings reach `mul_mat_id` as sentinels,
+  so the raw counters hold the COLD set only. Until 6f945a95a the persisted map was those raw
+  counts, the inverse of the placement it came from; it now persists the repin's own estimate
+  (exact counts for host experts, sentinel mass shared by current heat for packed ones).
+- **The counters are an EMA.** `LLAMA_MOE_COUNT_DECAY` (default 0.5) keeps half per healthy
+  window, so a default-decay profile is ~2 windows of routing however long it runs. Profile at
+  0.95 (the cap).
+- **A healthy window never repins** (`LLAMA_MOE_REPIN_THRESH`, default 0.45), so the placement —
+  and with it the packed experts' estimated heat — freezes at window 1. Profile with the
+  threshold at 0.99 (re-rank every window), then **serve frozen** at the default.
+
+Validate a map by serving it frozen (`LLAMA_MOE_REPIN_THRESH=0`, no label, so nothing is
+overwritten) on a corpus slice it was not counted on, and reading the trace's served hit-rate. A
+map's capture scored on its own counts overstates it. Persisted maps exclude NextN layers
+(`hparams.n_layer()`); the loader zero-pads them since f3901a0ec. Instruments:
+`llm-config/eval/two-card/heat-profile.sh`, `heat-ceiling.py`.
 
 ## Measured models (single 5090 + 128 GB DDR5; flat-map bootstrap, ε=0.5 gated, tg tokens/s)
 
