@@ -2211,6 +2211,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         }
                     }
                 }
+                // fork-strata-ports: the same window over ALL MoE layers, comparable with an engine
+                // that counts every layer (Strata's "decode expert cache hit rate"). The counters
+                // see only split layers; every MoE layer routes the same ids per decoded token, so
+                // each uncounted MoE layer adds tot_all / n_counted ids — all hits when its expert
+                // weights sit in a device buffer (whole on a GPU), all misses when in a host buffer
+                // (whole on the CPU, -ncmoe without a split). Prompt batches are not in the window.
+                std::string all_layer_tally;
+                {
+                    int n_counted = 0, n_gpu_whole = 0, n_cpu_whole = 0;
+                    for (uint32_t il = 0; il < hparams.n_layer() && il < model.layers.size(); il++) {
+                        const auto & L = model.layers[il];
+                        if (!L.ffn_gate_inp) continue; // dense layer: no routing
+                        if (L.moe_split.active()) { n_counted++; continue; } // its ids are in tot_all
+                        const ggml_tensor * w = L.ffn_up_exps ? L.ffn_up_exps : L.ffn_gate_up_exps;
+                        if (w && w->buffer && !ggml_backend_buffer_is_host(w->buffer)) n_gpu_whole++; else n_cpu_whole++;
+                    }
+                    if (n_counted > 0 && n_gpu_whole + n_cpu_whole > 0) {
+                        const double per  = (double) tot_all / n_counted;
+                        const double hits = (double) sent_all + per * n_gpu_whole;
+                        const double all  = (double) tot_all  + per * (n_gpu_whole + n_cpu_whole);
+                        all_layer_tally = format(" [all %d MoE layers %.1f%%: %d split, %d whole-GPU, %d whole-CPU]",
+                                n_counted + n_gpu_whole + n_cpu_whole, all > 0 ? 100.0*hits/all : 0.0,
+                                n_counted, n_gpu_whole, n_cpu_whole);
+                    }
+                }
                 auto log_per_dev_tally = [&]() {
                     if (!per_dev_tally.empty()) {
                         LLAMA_LOG_WARN("moe-heat-online: per-device hit-rate %s\n", per_dev_tally.c_str());
@@ -2305,23 +2330,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         const int swapped = const_cast<llama_model &>(model).moe_heat_repin();
                         if (swapped >= 0) {
                             if (gain >= 0.0) {
-                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts >= %.1f -> repinned %d expert slots\n",
-                                               100.0*hit, 100.0*gain, 100.0*gain_min, swapped);
+                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts >= %.1f -> repinned %d expert slots%s\n",
+                                               100.0*hit, 100.0*gain, 100.0*gain_min, swapped, all_layer_tally.c_str());
                             } else {
-                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
-                                               100.0*hit, 100.0*thresh, swapped);
+                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots%s\n",
+                                               100.0*hit, 100.0*thresh, swapped, all_layer_tally.c_str());
                             }
                             log_per_dev_tally(); // the window that triggered the repin
                         }
                         ggml_cpu_moe_online_decay(keep); // fade pre-repin (placement-stale) history
                     } else {
                         if (trace && gain >= 0.0) {
-                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts < %.1f (window %lld ids) -> healthy, decay x%.2f\n",
-                                           100.0*hit, 100.0*gain, 100.0*gain_min, (long long) tot_all, keep);
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts < %.1f (window %lld ids) -> healthy, decay x%.2f%s\n",
+                                           100.0*hit, 100.0*gain, 100.0*gain_min, (long long) tot_all, keep, all_layer_tally.c_str());
                             log_per_dev_tally();
                         } else if (trace) {
-                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f\n",
-                                           100.0*hit, 100.0*thresh, (long long) tot_all, keep);
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f%s\n",
+                                           100.0*hit, 100.0*thresh, (long long) tot_all, keep, all_layer_tally.c_str());
                             log_per_dev_tally();
                         }
                         ggml_cpu_moe_online_decay(keep);
