@@ -18,8 +18,17 @@
 //     LLAMA_MOE_HEAT_ONLINE=1 LLAMA_MOE_COUNT_ALL=1 LLAMA_MOE_REPIN_MIN_HITS=9000000000000000000
 //     GGML_OP_OFFLOAD_MIN_BATCH=1000000  ... -ngl 99 --n-cpu-moe <n_layer>
 // (MIN_HITS that high keeps the online repin block from decaying the counters mid-segment.)
+// Every token is decoded as an output: the graph computes the last layer for output rows only,
+// so anything less leaves the last layer's routing unmeasured.
 // A segment that would overflow the context ends that conversation: the rest of it is skipped and
 // logged, never truncated silently.
+//
+// --ids-out FILE (with LLAMA_MOE_TRACE_IDS=1) also writes the routing in TOKEN ORDER, for replaying
+// a cache policy step by step: a 16-byte header "MOEIDS1\0", int32 n_layer, int32 n_used, then for
+// every segment written to --out, in the same order, n_tokens x n_layer x n_used uint16 expert ids
+// (0xFFFF for a layer with no routed experts). File size = 16 + 2*n_layer*n_used*sum(n_tokens).
+// Each layer's ids are swept once per expert matmul, so the tap holds 2-3 copies per decode; they
+// must agree exactly or the run stops. Needs -ub equal to -b (one graph per decode).
 
 #include "arg.h"
 #include "common.h"
@@ -57,15 +66,16 @@ static bool read_segments(const std::string & path, std::vector<segment> & out) 
 }
 
 int main(int argc, char ** argv) {
-    std::string seg_path, out_path;
+    std::string seg_path, out_path, ids_path;
     std::vector<char *> rest = { argv[0] };
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--segments") && i + 1 < argc) { seg_path = argv[++i]; continue; }
         if (!strcmp(argv[i], "--out")      && i + 1 < argc) { out_path = argv[++i]; continue; }
+        if (!strcmp(argv[i], "--ids-out")  && i + 1 < argc) { ids_path = argv[++i]; continue; }
         rest.push_back(argv[i]);
     }
     if (seg_path.empty() || out_path.empty()) {
-        fprintf(stderr, "usage: %s --segments FILE --out FILE <llama args: -m MODEL -c N -b N -ub N ...>\n", argv[0]);
+        fprintf(stderr, "usage: %s --segments FILE --out FILE [--ids-out FILE] <llama args: -m MODEL -c N -b N -ub N ...>\n", argv[0]);
         return 1;
     }
     const char * cnt_all = getenv("LLAMA_MOE_COUNT_ALL");
@@ -73,6 +83,10 @@ int main(int argc, char ** argv) {
     if (!cnt_all || !atoi(cnt_all) || !online || !atoi(online)) {
         fprintf(stderr, "set LLAMA_MOE_HEAT_ONLINE=1 and LLAMA_MOE_COUNT_ALL=1 (see the header) — without them every count is 0\n");
         return 1;
+    }
+    if (!ids_path.empty()) {
+        const char * tr = getenv("LLAMA_MOE_TRACE_IDS");
+        if (!tr || !atoi(tr)) { fprintf(stderr, "--ids-out needs LLAMA_MOE_TRACE_IDS=1\n"); return 1; }
     }
 
     common_params params;
@@ -100,6 +114,55 @@ int main(int argc, char ** argv) {
     FILE * out = fopen(out_path.c_str(), "w");
     if (!out) { LOG_ERR("cannot write %s\n", out_path.c_str()); return 1; }
 
+    FILE * ids_out = NULL;
+    int n_used = 0, copies = 0;            // learned from the first decode, then held fixed
+    std::vector<int> moe_layer(n_layer, -1); // -1 unknown, 0 dense, 1 routed
+    std::vector<uint16_t> seg_ids;        // the current segment's [token][layer][n_used]
+    if (!ids_path.empty()) {
+        if ((int) llama_n_ubatch(ctx) != n_batch) {
+            LOG_ERR("--ids-out needs -ub equal to -b (got %d vs %d): split ubatches interleave the tap's copies\n",
+                    (int) llama_n_ubatch(ctx), n_batch);
+            return 1;
+        }
+        ids_out = fopen(ids_path.c_str(), "wb");
+        if (!ids_out) { LOG_ERR("cannot write %s\n", ids_path.c_str()); return 1; }
+    }
+    // drain the tap after one decode of n tokens into seg_ids; false = the tap is inconsistent
+    auto drain = [&](int n) -> bool {
+        const size_t base = seg_ids.size();
+        if (n_used > 0) seg_ids.resize(base + (size_t) n*n_layer*n_used, 0xFFFF);
+        for (int il = 0; il < n_layer; il++) {
+            int64_t len = 0; int32_t k = 0;
+            const int32_t * v = ggml_cpu_moe_trace_ids(il, &len, &k);
+            const int routed = len > 0 ? 1 : 0;
+            if (moe_layer[il] < 0) moe_layer[il] = routed;
+            if (moe_layer[il] != routed) { LOG_ERR("layer %d: routed in one decode, not in another\n", il); return false; }
+            if (!routed) continue;
+            if (n_used == 0) {
+                n_used = k;
+                seg_ids.resize(base + (size_t) n*n_layer*n_used, 0xFFFF);
+            }
+            if (k != n_used) { LOG_ERR("layer %d: %d ids per token, layer 0's width is %d\n", il, k, n_used); return false; }
+            const int64_t one = (int64_t) n*k;
+            if (len % one != 0) { LOG_ERR("layer %d: %lld ids is not a whole number of %d-token copies\n", il, (long long) len, n); return false; }
+            const int c = (int) (len/one);
+            if (copies == 0) copies = c;
+            if (c != copies) { LOG_ERR("layer %d: %d copies, expected %d\n", il, c, copies); return false; }
+            for (int r = 1; r < c; r++) {
+                if (memcmp(v, v + r*one, (size_t) one*sizeof(int32_t)) != 0) {
+                    LOG_ERR("layer %d: sweep copy %d disagrees with copy 0\n", il, r); return false;
+                }
+            }
+            for (int t = 0; t < n; t++) for (int j = 0; j < k; j++) {
+                const int32_t e = v[(int64_t) t*k + j];
+                if (e < 0 || e >= n_expert) { LOG_ERR("layer %d: id %d outside [0,%d) — sentinel ids mean a split graph, not a trace run\n", il, e, n_expert); return false; }
+                seg_ids[base + ((size_t) t*n_layer + il)*n_used + j] = (uint16_t) e;
+            }
+        }
+        if (n_used == 0) { LOG_ERR("no layer routed any token — is LLAMA_MOE_COUNT_ALL set?\n"); return false; }
+        return true;
+    };
+
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::string conv; std::string skipping;
     int pos = 0, seg_idx = 0, n_written = 0, n_skipped = 0;
@@ -116,18 +179,38 @@ int main(int argc, char ** argv) {
             skipping = conv; n_skipped++; continue;
         }
         ggml_cpu_moe_online_reset();
+        seg_ids.clear();
         for (size_t i = 0; i < toks.size(); i += n_batch) {
             common_batch_clear(batch);
             const size_t n = std::min(toks.size() - i, (size_t) n_batch);
             for (size_t j = 0; j < n; j++) {
-                common_batch_add(batch, toks[i + j], pos++, { 0 }, i + j + 1 == toks.size());
+                // every token an output: the graph prunes the LAST layer to output rows
+                // (inp_out_ids), so with logits on the final token only, the last layer's
+                // routing would cover one token per batch. Costs n_batch x n_vocab floats.
+                common_batch_add(batch, toks[i + j], pos++, { 0 }, true);
             }
+            ggml_cpu_moe_trace_reset();
             if (llama_decode(ctx, batch) != 0) {
                 LOG_ERR("%s: llama_decode failed at pos %d\n", conv.c_str(), pos);
                 fclose(out); llama_batch_free(batch); return 1;
             }
+            if (ids_out) {
+                llama_synchronize(ctx);
+                if (!drain((int) n)) {
+                    LOG_ERR("%s seg %d: routing tap inconsistent; stopping\n", conv.c_str(), seg_idx);
+                    fclose(out); fclose(ids_out); llama_batch_free(batch); return 1;
+                }
+            }
         }
         llama_synchronize(ctx);
+        if (ids_out) {
+            if (ftell(ids_out) == 0 && n_used > 0) {
+                const int32_t hdr[2] = { n_layer, n_used };
+                fwrite("MOEIDS1", 1, 8, ids_out); fwrite(hdr, sizeof(int32_t), 2, ids_out);
+            }
+            if (!seg_ids.empty()) fwrite(seg_ids.data(), sizeof(uint16_t), seg_ids.size(), ids_out);
+            fflush(ids_out);
+        }
         fprintf(out, "%s %s %d %zu %d %d", conv.c_str(), s.kind.c_str(), seg_idx, toks.size(), n_layer, n_expert);
         int64_t grand = 0;
         for (int il = 0; il < n_layer; il++) {
@@ -148,6 +231,7 @@ int main(int argc, char ** argv) {
         seg_idx++; n_written++;
     }
     fclose(out);
+    if (ids_out) fclose(ids_out);
     llama_batch_free(batch);
     LOG_INF("wrote %d segments, skipped %d\n", n_written, n_skipped);
     return 0;
