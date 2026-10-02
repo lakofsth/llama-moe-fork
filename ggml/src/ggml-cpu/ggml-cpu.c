@@ -1522,6 +1522,61 @@ static int ggml_moe_online_layer_from_name(const char * name) {
     return (int) il;
 }
 
+// fork/repin-trigger: LLAMA_MOE_TRACE_IDS=1 — alongside the counts, append every routing id
+// this sweep sees to a per-layer buffer IN TOKEN ORDER, so a measurement tool can replay a
+// cache policy step by step (the counts above are order-free). Same layer filter as the counts
+// (ggml_moe_online_layer_from_name), so for the stock graph it needs LLAMA_MOE_COUNT_ALL=1 too.
+// Each of a layer's expert matmuls sweeps the same ids, so one graph eval appends a layer's ids
+// 2-3 times; the consumer (llama-moe-route-trace --ids-out) checks the copies agree and keeps
+// one. Drained with ggml_cpu_moe_trace_ids + ggml_cpu_moe_trace_reset. Not for serving.
+static int32_t * g_moe_trace_buf[GGML_MOE_ONLINE_MAX_LAYERS];
+static int64_t   g_moe_trace_len[GGML_MOE_ONLINE_MAX_LAYERS];
+static int64_t   g_moe_trace_cap[GGML_MOE_ONLINE_MAX_LAYERS];
+static int32_t   g_moe_trace_nids[GGML_MOE_ONLINE_MAX_LAYERS];
+
+static int ggml_moe_trace_enabled(void) {
+    static int en = -1;
+    if (en < 0) {
+        const char * e = getenv("LLAMA_MOE_TRACE_IDS");
+        en = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return en;
+}
+
+static void ggml_moe_trace_append(int il, const struct ggml_tensor * ids) {
+    const int64_t n_ids = ids->ne[0], n_tok = ids->ne[1];
+    if (g_moe_trace_len[il] > 0 && g_moe_trace_nids[il] != (int32_t) n_ids) {
+        GGML_ABORT("moe trace: layer %d ids width changed %d -> %d", il, g_moe_trace_nids[il], (int) n_ids);
+    }
+    g_moe_trace_nids[il] = (int32_t) n_ids;
+    const int64_t need = g_moe_trace_len[il] + n_ids*n_tok;
+    if (need > g_moe_trace_cap[il]) {
+        int64_t cap = g_moe_trace_cap[il] ? g_moe_trace_cap[il] : 4096;
+        while (cap < need) cap *= 2;
+        int32_t * nb = (int32_t *) realloc(g_moe_trace_buf[il], (size_t) cap*sizeof(int32_t));
+        GGML_ASSERT(nb != NULL);
+        g_moe_trace_buf[il] = nb; g_moe_trace_cap[il] = cap;
+    }
+    int32_t * dst = g_moe_trace_buf[il] + g_moe_trace_len[il];
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t k = 0; k < n_ids; ++k) {
+            *dst++ = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + k*ids->nb[0]);
+        }
+    }
+    g_moe_trace_len[il] = need;
+}
+
+const int32_t * ggml_cpu_moe_trace_ids(int32_t il, int64_t * n_values, int32_t * n_ids) {
+    if (il < 0 || il >= GGML_MOE_ONLINE_MAX_LAYERS) { if (n_values) *n_values = 0; if (n_ids) *n_ids = 0; return NULL; }
+    if (n_values) *n_values = g_moe_trace_len[il];
+    if (n_ids)    *n_ids    = g_moe_trace_nids[il];
+    return g_moe_trace_buf[il];
+}
+
+void ggml_cpu_moe_trace_reset(void) {
+    for (int il = 0; il < GGML_MOE_ONLINE_MAX_LAYERS; il++) g_moe_trace_len[il] = 0;
+}
+
 const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total) {
     if (il < 0 || il >= GGML_MOE_ONLINE_MAX_LAYERS) return NULL;
     if (sentinel) *sentinel = g_moe_online_sentinel[il];
@@ -1761,6 +1816,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         // fork: online heat counting piggybacks on this single-threaded ids sweep
         const int online_il = ggml_moe_online_enabled() ? ggml_moe_online_layer_from_name(ids->name) : -1;
+        if (online_il >= 0 && ggml_moe_trace_enabled()) ggml_moe_trace_append(online_il, ids);
 
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
