@@ -453,7 +453,11 @@ llama_context::llama_context(
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            // fork/repin-trigger: LLAMA_PIPELINE_WITH_OVERRIDES=1 lifts the tensor-override exclusion
+            // for a measurement — --n-cpu-moe IS an override, so every hybrid run loses pipelining of
+            // prompt micro-batches across the cards. Experimental: if the reserve OOMs, the existing
+            // fallback below retries without; correctness is checked by perplexity parity, not assumed.
+            (!model.has_tensor_overrides() || [] { const char * e = getenv("LLAMA_PIPELINE_WITH_OVERRIDES"); return e && atoi(e) != 0; }());
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
