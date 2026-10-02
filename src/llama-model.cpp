@@ -2075,6 +2075,34 @@ bool llama_model_base::moe_heat_score(int il, const int64_t * counts, int64_t se
     return true;
 }
 
+bool llama_model_base::moe_heat_projected_gain(int64_t * gain, int64_t * tot) const {
+    const int n_expert = (int) hparams.n_expert;
+    std::vector<float> sc(n_expert);
+    double  g   = 0.0;
+    int64_t t   = 0;
+    bool    any = false;
+    for (size_t il = 0; il < layers.size(); il++) {
+        const auto & ms = layers[il].moe_split;
+        if (!ms.active() || ms.cur_experts.empty()) continue;
+        int64_t sent = 0, lt = 0;
+        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &lt);
+        if (!counts || lt <= 0) continue;
+        if (!moe_heat_score((int) il, counts, sent, sc.data())) continue;
+        // the top-G scores' sum: the capture of the set moe_heat_repin would choose
+        const size_t G = std::min(ms.cur_experts.size(), (size_t) n_expert);
+        std::vector<float> top(sc);
+        std::nth_element(top.begin(), top.begin() + (G - 1), top.end(), std::greater<float>());
+        double best = 0.0;
+        for (size_t k = 0; k < G; k++) best += top[k];
+        g += std::max(0.0, best - (double) sent);
+        t += lt;
+        any = true;
+    }
+    if (gain) *gain = (int64_t) llround(g);
+    if (tot)  *tot  = t;
+    return any;
+}
+
 int llama_model_base::moe_heat_repin() {
     static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
     static const int max_swaps = [] { const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS"); return e ? atoi(e) : 0; }(); // default OFF: measured 9x384-swap thrash vs one 1403-swap pass (-13% tg) — partial maps make the desired set drift

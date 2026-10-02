@@ -2152,6 +2152,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 return t;
             }();
             static const long   minhit = [] { const char * e = getenv("LLAMA_MOE_REPIN_MIN_HITS"); return e ? atol(e) : 20000; }();
+            // fork/repin-trigger: LLAMA_MOE_REPIN_GAIN (a fraction, e.g. 0.03) replaces the fixed
+            // hit-rate floor with the repin's own projected benefit: repin when re-ranking from
+            // this window's counters would raise the hit-rate by at least that much. The floor
+            // answers "is the hit-rate low?", which a placement that is already the best this
+            // budget allows can be (thresh 0.99 then repins every window for little or nothing),
+            // and a placement that has drifted can sit above (the resident's default 0.45 would
+            // not have repinned the frozen map that held 61% on tb21 fn-iq4xs's scored tasks,
+            // 2026-10-02, where re-ranking every window held ~82%). Unset or <= 0: the threshold
+            // rule, unchanged.
+            static const double gain_min = [] { const char * e = getenv("LLAMA_MOE_REPIN_GAIN"); return e ? atof(e) : 0.0; }();
             // trace: log every check window (WARN so llama-cli shows it); repin events
             // are always WARN — they are rare and change the placement, silent is worse
             static const bool trace = [] { const char * e = getenv("LLAMA_MOE_HEAT_TRACE"); return e && atoi(e) != 0; }();
@@ -2277,17 +2287,35 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }();
                 if (tot_all >= minhit) {
                     const double hit = (double) sent_all / (double) tot_all;
-                    if (hit < thresh) {
+                    double gain = -1.0; // projected hit-rate gain of a repin now; -1 = not computed
+                    bool repin;
+                    if (gain_min > 0.0) {
+                        int64_t g = 0, t = 0;
+                        gain  = model.moe_heat_projected_gain(&g, &t) && t > 0 ? (double) g / (double) t : 0.0;
+                        repin = gain >= gain_min;
+                    } else {
+                        repin = hit < thresh;
+                    }
+                    if (repin) {
                         synchronize();
                         const int swapped = const_cast<llama_model &>(model).moe_heat_repin();
                         if (swapped >= 0) {
-                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
-                                           100.0*hit, 100.0*thresh, swapped);
+                            if (gain >= 0.0) {
+                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts >= %.1f -> repinned %d expert slots\n",
+                                               100.0*hit, 100.0*gain, 100.0*gain_min, swapped);
+                            } else {
+                                LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% < %.0f%% -> repinned %d expert slots\n",
+                                               100.0*hit, 100.0*thresh, swapped);
+                            }
                             log_per_dev_tally(); // the window that triggered the repin
                         }
                         ggml_cpu_moe_online_decay(keep); // fade pre-repin (placement-stale) history
                     } else {
-                        if (trace) {
+                        if (trace && gain >= 0.0) {
+                            LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts < %.1f (window %lld ids) -> healthy, decay x%.2f\n",
+                                           100.0*hit, 100.0*gain, 100.0*gain_min, (long long) tot_all, keep);
+                            log_per_dev_tally();
+                        } else if (trace) {
                             LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f\n",
                                            100.0*hit, 100.0*thresh, (long long) tot_all, keep);
                             log_per_dev_tally();

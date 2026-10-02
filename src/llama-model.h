@@ -844,6 +844,14 @@ struct llama_model {
     virtual bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const {
         (void) il; (void) counts; (void) sent; (void) out; return false;
     }
+    // fork: what a repin would buy NOW, in routings. Over the split layers, `gain` is what the
+    // top-G set by moe_heat_score would have captured in the current counter window minus what
+    // the current pack captured (its sentinels), and `tot` is those layers' routings, so
+    // gain/tot is the hit-rate a repin would add on this window's traffic. Never negative: the
+    // current pack is one candidate top-G set. Returns false when no split is active.
+    virtual bool moe_heat_projected_gain(int64_t * gain, int64_t * tot) const {
+        (void) gain; (void) tot; return false;
+    }
 
 protected:
     llama_model_params params;
@@ -906,6 +914,7 @@ struct llama_model_base : public llama_model {
     // layer's existing quota. Returns number of expert slots swapped, -1 if inactive.
     int moe_heat_repin() override;
     bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const override;
+    bool moe_heat_projected_gain(int64_t * gain, int64_t * tot) const override;
 };
 
 const char * llm_type_name(llm_type type);
