@@ -1496,8 +1496,25 @@ static int ggml_moe_online_layer_from_name(const char * name) {
     // NOTE: the sched renames input copies ("CPU#ffn_moe_ids_cpu-7#0"), so match by
     // substring and parse the digits right after it, ignoring any suffix.
     const char * p = strstr(name, "ffn_moe_ids_cpu-");
-    if (!p) return -1;
-    p += 16;
+    if (p) {
+        p += 16;
+    } else {
+        // fork/repin-trigger: LLAMA_MOE_COUNT_ALL=1 also counts the STOCK graph's routing ids
+        // ("ffn_moe_topk-<il>", or "ffn_moe_topk_gated-<il>"), for a measurement run with no
+        // split: every expert host-side (-ncmoe all layers) and GGML_OP_OFFLOAD_MIN_BATCH above
+        // the batch, so every mul_mat_id runs here and every count is exact (no sentinels). Each
+        // of a layer's expert matmuls sweeps the same ids, so counts carry a constant per-layer
+        // factor (2 merged gate_up, 3 otherwise) — fractions are unaffected. Not for serving.
+        static int all = -1;
+        if (all < 0) { const char * e = getenv("LLAMA_MOE_COUNT_ALL"); all = (e && atoi(e) != 0) ? 1 : 0; }
+        if (!all) return -1;
+        p = strstr(name, "ffn_moe_topk");
+        if (!p) return -1;
+        p += 12;
+        if (strncmp(p, "_gated", 6) == 0) p += 6;
+        if (*p != '-') return -1;
+        p++;
+    }
     if (*p < '0' || *p > '9') return -1;
     long il = 0;
     while (*p >= '0' && *p <= '9') { il = il*10 + (*p - '0'); p++; }
