@@ -1728,6 +1728,30 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// fork-strata-ports: one counter window over ALL MoE layers, comparable with an engine that counts
+// every layer (Strata's "decode expert cache hit rate"). The counters see only split layers; every
+// MoE layer routes the same ids per decoded token, so each uncounted MoE layer adds tot / n_counted
+// ids — all hits when its expert weights sit in a device buffer (whole on a GPU), all misses when in
+// a host buffer (whole on the CPU, -ncmoe without a split). Prompt batches are not in the window.
+// Empty when there is nothing to add (no split layer, or every MoE layer split).
+static std::string llama_moe_all_layer_tally(const llama_model & model, int64_t sent, int64_t tot) {
+    int n_counted = 0, n_gpu_whole = 0, n_cpu_whole = 0;
+    for (uint32_t il = 0; il < model.hparams.n_layer() && il < model.layers.size(); il++) {
+        const auto & L = model.layers[il];
+        if (!L.ffn_gate_inp) continue; // dense layer: no routing
+        if (L.moe_split.active()) { n_counted++; continue; } // its ids are in tot
+        const ggml_tensor * w = L.ffn_up_exps ? L.ffn_up_exps : L.ffn_gate_up_exps;
+        if (w && w->buffer && !ggml_backend_buffer_is_host(w->buffer)) n_gpu_whole++; else n_cpu_whole++;
+    }
+    if (n_counted == 0 || n_gpu_whole + n_cpu_whole == 0) return "";
+    const double per  = (double) tot / n_counted;
+    const double hits = (double) sent + per * n_gpu_whole;
+    const double all  = (double) tot  + per * (n_gpu_whole + n_cpu_whole);
+    return format(" [all %d MoE layers %.1f%%: %d split, %d whole-GPU, %d whole-CPU]",
+            n_counted + n_gpu_whole + n_cpu_whole, all > 0 ? 100.0*hits/all : 0.0,
+            n_counted, n_gpu_whole, n_cpu_whole);
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2189,8 +2213,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 if (++since_check >= 64) {
                     since_check = 0;
                     if (win_tot > 0) {
-                        LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% (window %lld ids) -> adaptive tier, %lld swaps\n",
-                                       100.0*(double) win_hits/(double) win_tot, (long long) win_tot, (long long) win_swaps);
+                        LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% (window %lld ids) -> adaptive tier, %lld swaps%s\n",
+                                       100.0*(double) win_hits/(double) win_tot, (long long) win_tot, (long long) win_swaps,
+                                       llama_moe_all_layer_tally(model, win_hits, win_tot).c_str());
                     }
                     win_hits = win_tot = win_swaps = 0;
                 }
@@ -2236,31 +2261,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         }
                     }
                 }
-                // fork-strata-ports: the same window over ALL MoE layers, comparable with an engine
-                // that counts every layer (Strata's "decode expert cache hit rate"). The counters
-                // see only split layers; every MoE layer routes the same ids per decoded token, so
-                // each uncounted MoE layer adds tot_all / n_counted ids — all hits when its expert
-                // weights sit in a device buffer (whole on a GPU), all misses when in a host buffer
-                // (whole on the CPU, -ncmoe without a split). Prompt batches are not in the window.
-                std::string all_layer_tally;
-                {
-                    int n_counted = 0, n_gpu_whole = 0, n_cpu_whole = 0;
-                    for (uint32_t il = 0; il < hparams.n_layer() && il < model.layers.size(); il++) {
-                        const auto & L = model.layers[il];
-                        if (!L.ffn_gate_inp) continue; // dense layer: no routing
-                        if (L.moe_split.active()) { n_counted++; continue; } // its ids are in tot_all
-                        const ggml_tensor * w = L.ffn_up_exps ? L.ffn_up_exps : L.ffn_gate_up_exps;
-                        if (w && w->buffer && !ggml_backend_buffer_is_host(w->buffer)) n_gpu_whole++; else n_cpu_whole++;
-                    }
-                    if (n_counted > 0 && n_gpu_whole + n_cpu_whole > 0) {
-                        const double per  = (double) tot_all / n_counted;
-                        const double hits = (double) sent_all + per * n_gpu_whole;
-                        const double all  = (double) tot_all  + per * (n_gpu_whole + n_cpu_whole);
-                        all_layer_tally = format(" [all %d MoE layers %.1f%%: %d split, %d whole-GPU, %d whole-CPU]",
-                                n_counted + n_gpu_whole + n_cpu_whole, all > 0 ? 100.0*hits/all : 0.0,
-                                n_counted, n_gpu_whole, n_cpu_whole);
-                    }
-                }
+                const std::string all_layer_tally = llama_moe_all_layer_tally(model, sent_all, tot_all);
                 auto log_per_dev_tally = [&]() {
                     if (!per_dev_tally.empty()) {
                         LLAMA_LOG_WARN("moe-heat-online: per-device hit-rate %s\n", per_dev_tally.c_str());
