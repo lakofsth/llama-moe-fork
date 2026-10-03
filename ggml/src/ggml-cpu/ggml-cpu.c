@@ -1481,6 +1481,10 @@ UseGgmlGemm2:;
 static int64_t g_moe_online_counts[GGML_MOE_ONLINE_MAX_LAYERS][GGML_MOE_ONLINE_MAX_EXPERTS];
 static int64_t g_moe_online_sentinel[GGML_MOE_ONLINE_MAX_LAYERS];
 static int64_t g_moe_online_total[GGML_MOE_ONLINE_MAX_LAYERS];
+// fork-strata-ports: per-expert hits on the GPU-resident set, decoded from per-expert sentinels
+// (id n_as + 1 + e, llama_moe_cpu_sentinel). The old shared sentinel (id n_as) adds to the layer's
+// sentinel total only, as before. sentinel == sum(hits) when every resident has its own id.
+static int64_t g_moe_online_hits[GGML_MOE_ONLINE_MAX_LAYERS][GGML_MOE_ONLINE_MAX_EXPERTS];
 
 static int ggml_moe_online_enabled(void) {
     static int en = -1;
@@ -1584,7 +1588,13 @@ const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64
     return g_moe_online_counts[il];
 }
 
+const int64_t * ggml_cpu_moe_online_hits(int32_t il) {
+    if (il < 0 || il >= GGML_MOE_ONLINE_MAX_LAYERS) return NULL;
+    return g_moe_online_hits[il];
+}
+
 void ggml_cpu_moe_online_reset(void) {
+    memset(g_moe_online_hits,     0, sizeof(g_moe_online_hits));
     memset(g_moe_online_counts,   0, sizeof(g_moe_online_counts));
     memset(g_moe_online_sentinel, 0, sizeof(g_moe_online_sentinel));
     memset(g_moe_online_total,    0, sizeof(g_moe_online_total));
@@ -1600,6 +1610,7 @@ void ggml_cpu_moe_online_decay(float keep) {
         if (g_moe_online_total[il] == 0 && g_moe_online_sentinel[il] == 0) continue;
         for (int e = 0; e < GGML_MOE_ONLINE_MAX_EXPERTS; e++) {
             g_moe_online_counts[il][e] = (int64_t) (g_moe_online_counts[il][e] * keep);
+            g_moe_online_hits[il][e]   = (int64_t) (g_moe_online_hits[il][e]   * keep);
         }
         g_moe_online_sentinel[il] = (int64_t) (g_moe_online_sentinel[il] * keep);
         g_moe_online_total[il]    = (int64_t) (g_moe_online_total[il]    * keep);
@@ -1830,6 +1841,8 @@ static void ggml_compute_forward_mul_mat_id(
                     if (online_il >= 0) {
                         g_moe_online_sentinel[online_il]++;
                         g_moe_online_total[online_il]++;
+                        const int64_t e = (int64_t) i02 - n_as - 1; // per-expert sentinel -> resident expert e
+                        if (e >= 0 && e < n_as && e < GGML_MOE_ONLINE_MAX_EXPERTS) g_moe_online_hits[online_il][e]++;
                     }
                     continue;
                 }

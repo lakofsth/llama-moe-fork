@@ -152,6 +152,7 @@ extern "C" {
     // *sentinel. Returns per-expert counts for layer il, or NULL if il out of range.
     GGML_BACKEND_API const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total);
     GGML_BACKEND_API void            ggml_cpu_moe_online_reset(void);
+    GGML_BACKEND_API const int64_t * ggml_cpu_moe_online_hits(int32_t il);
     GGML_BACKEND_API void            ggml_cpu_moe_online_decay(float keep);
     GGML_BACKEND_API const int32_t * ggml_cpu_moe_trace_ids(int32_t il, int64_t * n_values, int32_t * n_ids);
     GGML_BACKEND_API void            ggml_cpu_moe_trace_reset(void);
