@@ -266,6 +266,9 @@ struct llama_moe_split {
     // (index = packed slot g) and the heat estimate that put them there
     std::vector<int32_t> cur_experts;
     std::vector<float>   cur_heat;
+    // fork-strata-ports: the adaptive tier's decayed usage per expert, in routings
+    // (llama_model_base::moe_heat_adapt; empty until its first round)
+    std::vector<float>   usage;
 
     // fork/two-card U1: the device holding this layer's packed tensors, and its index
     // among the model's non-meta GPU devices (the index that the list forms of
@@ -837,6 +840,9 @@ struct llama_model {
     // fork: online-heat repin hook (no-op unless the heat split is active; see
     // llama_model_base::moe_heat_repin)
     virtual int moe_heat_repin() { return -1; }
+    // fork-strata-ports: one round of Strata's adaptive tier (see llama_model_base::moe_heat_adapt).
+    // Returns the swaps made, -1 when no split is active or the tier cannot run here.
+    virtual int moe_heat_adapt(int64_t * hits, int64_t * tot) { (void) hits; (void) tot; return -1; }
     // fork: the per-expert heat estimate of one layer in routing-count scale, as the repin
     // ranks it: exact counts for host-served experts, and for GPU-packed experts (whose
     // routings reach the CPU op only as sentinels) the sentinel mass shared by their current
@@ -913,6 +919,7 @@ struct llama_model_base : public llama_model {
     // routing counters (LLAMA_MOE_HEAT_ONLINE), swapping only changed slots within the
     // layer's existing quota. Returns number of expert slots swapped, -1 if inactive.
     int moe_heat_repin() override;
+    int moe_heat_adapt(int64_t * hits, int64_t * tot) override;
     bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const override;
     bool moe_heat_projected_gain(int64_t * gain, int64_t * tot) const override;
 };

@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-moe-adapt.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2285,6 +2286,106 @@ int llama_model_base::moe_heat_repin() {
     if (!any_active) return -1;
     ggml_cpu_moe_online_reset();
     return swapped_total;
+}
+
+// fork-strata-ports: one round of Strata's adaptive VRAM tier (LLAMA_MOE_ADAPT=1; the rule is
+// llama_moe_adapt_select, src/llama-moe-adapt.h). Each round: add the window's routings to every
+// split layer's decayed usage — cold experts from the CPU counts, resident experts from their own
+// sentinels (ggml_cpu_moe_online_hits; exact, unlike the repin's censored estimate) — pick the
+// swaps, copy each incoming expert into its victim's packed slot, rebuild the touched layers' maps,
+// decay usage, reset the counters. Copies are synchronous between decodes: the replayed rule moves
+// ~3.5 experts per token (cache-sim.py, fn-iq4xs score snapshot), ~32 MiB per 4-token round.
+// Refused (-1, logged once) with the openai-moe bias copies, which keep the shared sentinel and so
+// cannot count resident experts. `hits` / `tot` return the window's resident hits and routings
+// (sweep units) for the caller's hit-rate line.
+int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out) {
+    static const float min_usage = [] { const char * e = getenv("LLAMA_MOE_ADAPT_MIN");    return e ? (float) atof(e) : 2.0f; }();
+    static const float margin    = [] { const char * e = getenv("LLAMA_MOE_ADAPT_MARGIN"); return e ? (float) atof(e) : 1.5f; }();
+    static const float decay     = [] { const char * e = getenv("LLAMA_MOE_ADAPT_DECAY");  return e ? (float) atof(e) : 0.7f; }();
+    static const int   max_swaps = [] { const char * e = getenv("LLAMA_MOE_ADAPT_SWAPS");  return e ? atoi(e) : 96; }();
+    const int n_expert = (int) hparams.n_expert;
+    int64_t hits_all = 0, tot_all = 0;
+
+    std::vector<int> lay;                     // split layers in this round, model layer index
+    std::vector<std::vector<uint8_t>> res;
+    for (size_t il = 0; il < layers.size(); il++) {
+        auto & L  = layers[il];
+        auto & ms = L.moe_split;
+        if (!ms.active() || ms.cur_experts.empty()) continue;
+        if (ms.up_b_cpu || ms.gate_b_cpu || ms.down_b_cpu) {
+            static bool warned = false;
+            if (!warned) { LLAMA_LOG_WARN("moe-heat-adapt: expert biases keep the shared sentinel — resident usage is not countable, the adaptive tier does not run on this model\n"); warned = true; }
+            return -1;
+        }
+        int64_t sent = 0, tot = 0;
+        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &tot);
+        const int64_t * hits   = ggml_cpu_moe_online_hits((int32_t) il);
+        if (!counts || !hits) continue;
+        const float sweeps = L.ffn_gate_up_exps ? 2.0f : 3.0f; // one count per expert matmul
+        if (ms.usage.size() != (size_t) n_expert) ms.usage.assign(n_expert, 0.0f);
+        for (int e = 0; e < n_expert && e < 1024; e++) ms.usage[e] += (float) (counts[e] + hits[e]) / sweeps;
+        hits_all += sent; tot_all += tot;
+        std::vector<uint8_t> r(n_expert, 0);
+        for (int e : ms.cur_experts) r[e] = 1;
+        lay.push_back((int) il);
+        res.push_back(std::move(r));
+    }
+    if (hits_out) *hits_out = hits_all;
+    if (tot_out)  *tot_out  = tot_all;
+    if (lay.empty()) return -1;
+
+    std::vector<const float *>   up(lay.size());
+    std::vector<const uint8_t *> rp(lay.size());
+    for (size_t k = 0; k < lay.size(); k++) { up[k] = layers[lay[k]].moe_split.usage.data(); rp[k] = res[k].data(); }
+    const auto swaps = llama_moe_adapt_select(up, rp, n_expert, min_usage, margin, max_swaps);
+
+    std::vector<char> touched(lay.size(), 0);
+    for (const auto & sw : swaps) {
+        auto & L  = layers[lay[sw.layer]];
+        auto & ms = L.moe_split;
+        const auto it = std::find(ms.cur_experts.begin(), ms.cur_experts.end(), sw.out);
+        GGML_ASSERT(it != ms.cur_experts.end()); // the victim is resident by construction
+        const size_t g = (size_t) (it - ms.cur_experts.begin());
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *> dsts;
+        if (L.ffn_gate_up_exps) { srcs = { L.ffn_gate_up_exps, L.ffn_down_exps };               dsts = { ms.gate_up_gpu, ms.down_gpu }; }
+        else                    { srcs = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }; dsts = { ms.gate_gpu, ms.up_gpu, ms.down_gpu }; }
+        for (size_t j = 0; j < srcs.size(); j++) {
+            ggml_backend_tensor_set(dsts[j], (const char *) srcs[j]->data + (size_t) sw.in * srcs[j]->nb[2],
+                                    g * dsts[j]->nb[2], srcs[j]->nb[2]);
+        }
+        ms.cur_experts[g] = sw.in;
+        touched[sw.layer] = 1;
+    }
+    for (size_t k = 0; k < lay.size(); k++) {
+        auto & ms = layers[lay[k]].moe_split;
+        if (touched[k]) {
+            const size_t G = ms.cur_experts.size();
+            std::vector<int32_t> mc(n_expert), mg(n_expert, 0), mgpp(n_expert, (int32_t) G);
+            std::vector<float>   kc(n_expert, 1.0f), kg(n_expert, 0.0f);
+            for (int e = 0; e < n_expert; e++) mc[e] = e;
+            for (size_t g = 0; g < G; g++) {
+                const int e = ms.cur_experts[g];
+                mc[e] = llama_moe_cpu_sentinel(ms, n_expert, e); mg[e] = (int32_t) g; mgpp[e] = (int32_t) g;
+                kc[e] = 0.0f; kg[e] = 1.0f;
+            }
+            ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
+            ggml_backend_tensor_set(ms.mask_cpu,   kc.data(),   0, kc.size()*sizeof(float));
+            ggml_backend_tensor_set(ms.mask_gpu,   kg.data(),   0, kg.size()*sizeof(float));
+        }
+        // keep the repin's heat shares meaningful (the persisted map reads them): usage shares
+        double ssum = 0.0;
+        for (int e : ms.cur_experts) ssum += ms.usage[e];
+        ms.cur_heat.resize(ms.cur_experts.size());
+        for (size_t g = 0; g < ms.cur_experts.size(); g++) {
+            ms.cur_heat[g] = ssum > 0.0 ? (float) (ms.usage[ms.cur_experts[g]] / ssum) : 0.0f;
+        }
+        for (float & u : ms.usage) u *= decay;
+    }
+    ggml_cpu_moe_online_reset();
+    return (int) swaps.size();
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
