@@ -2170,6 +2170,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // are always WARN — they are rare and change the placement, silent is worse
             static const bool trace = [] { const char * e = getenv("LLAMA_MOE_HEAT_TRACE"); return e && atoi(e) != 0; }();
             static int since_check = 0;
+            // fork-strata-ports: LLAMA_MOE_ADAPT=1 replaces the window repin below with Strata's
+            // adaptive tier — a round every LLAMA_MOE_ADAPT_EVERY (default 4) decode calls, and a
+            // hit-rate line every 64 (the same cadence and prefix as the repin's, so the greps
+            // that collect it are unchanged). Rule and parameters: llama_model_base::moe_heat_adapt.
+            static const bool adapt = [] { const char * e = getenv("LLAMA_MOE_ADAPT"); return e && atoi(e) != 0; }();
+            if (adapt) {
+                static const int every = [] { const char * e = getenv("LLAMA_MOE_ADAPT_EVERY"); const int v = e ? atoi(e) : 4; return v > 0 ? v : 4; }();
+                static int since_round = 0;
+                static int64_t win_hits = 0, win_tot = 0, win_swaps = 0;
+                if (++since_round >= every) {
+                    since_round = 0;
+                    synchronize(); // the swaps write packed GPU tensors and the maps
+                    int64_t h = 0, t = 0;
+                    const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t);
+                    if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; }
+                }
+                if (++since_check >= 64) {
+                    since_check = 0;
+                    if (win_tot > 0) {
+                        LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% (window %lld ids) -> adaptive tier, %lld swaps\n",
+                                       100.0*(double) win_hits/(double) win_tot, (long long) win_tot, (long long) win_swaps);
+                    }
+                    win_hits = win_tot = win_swaps = 0;
+                }
+            } else
             if (++since_check >= 64) {
                 since_check = 0;
                 int64_t sent_all = 0, tot_all = 0;
