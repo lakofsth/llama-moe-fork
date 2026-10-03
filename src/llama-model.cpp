@@ -1577,6 +1577,17 @@ static std::string llama_moe_heat_pci_link(ggml_backend_dev_t dev, int & width) 
     return speed + " x" + w + " (" + props.device_id + ")";
 }
 
+// fork-strata-ports: the CPU branch's id for a GPU-resident expert. Any id outside [0, n_expert) is
+// a sentinel to every consumer (CPU mul_mat_id, CUDA mmq/mmvq/cuBLAS fallback, the sched's
+// partial-upload scan — all range checks, none an equality with n_expert), so each resident expert
+// gets its OWN sentinel, n_expert + 1 + e, and the CPU counters can count its hits exactly
+// (ggml_cpu_moe_online_hits) instead of one total per layer. Except with the openai-moe bias
+// copies: their add_id must land on the zero pad row at exactly n_expert.
+static int32_t llama_moe_cpu_sentinel(const llama_moe_split & ms, int n_expert, int e) {
+    if (ms.up_b_cpu || ms.gate_b_cpu || ms.down_b_cpu) return n_expert;
+    return n_expert + 1 + e;
+}
+
 static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
     const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
     // fork: with no explicit map, fall back to this workload's persisted sidecar. An
@@ -1978,7 +1989,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
                             srcs[j]->nb[2], evicted);
                 }
             }
-            mc[e]   = n_expert;    // sentinel: patched CPU op skips + zeroes; CUDA mm_ids_helper + sched scan skip out-of-range
+            mc[e]   = llama_moe_cpu_sentinel(ms, n_expert, e); // out of range: patched CPU op skips + zeroes; CUDA mm_ids_helper + sched scan skip it
             mg[e]   = (int32_t) g; // tg (mmvq): packed id for hot, dummy 0 for cold (weight-masked)
             mgpp[e] = (int32_t) g; // pp (MMQ):  packed id for hot, sentinel G for cold (skipped; dst zero-filled)
             kc[e] = 0.0f;
@@ -2254,7 +2265,7 @@ int llama_model_base::moe_heat_repin() {
         for (int e = 0; e < n_expert; e++) mc[e] = e;
         for (size_t g = 0; g < G; g++) {
             const int e = ms.cur_experts[g];
-            mc[e] = n_expert; mg[e] = (int32_t) g; mgpp[e] = (int32_t) g;
+            mc[e] = llama_moe_cpu_sentinel(ms, n_expert, e); mg[e] = (int32_t) g; mgpp[e] = (int32_t) g;
             kc[e] = 0.0f; kg[e] = 1.0f;
         }
         ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
