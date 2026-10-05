@@ -19,11 +19,19 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+
+// fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP=1 orders a split MoE layer's GPU work ahead of its CPU branch so
+// the scheduler can overlap them (ggml-backend.cpp, the overlap cut and eager copies read the same variable).
+bool llama_moe_overlap() {
+    static const bool v = [] { const char * e = std::getenv("LLAMA_MOE_OVERLAP"); return e && std::atoi(e) != 0; }();
+    return v;
+}
 
 // dedup helpers
 
@@ -2340,23 +2348,45 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
         // CPU branch uses the split's own PADDED bias copies, never the raw *_exps_b
         // args: the CPU sentinel id (n_expert) must resolve to the zero pad row.
+        // fork (fork-kernel-fusion): with LLAMA_MOE_OVERLAP=1 the GPU branch is put in the graph BEFORE the CPU
+        // branch, so the scheduler can run it while the host computes the missed experts (see
+        // ggml_backend_sched's overlap cut); otherwise graph order puts it after, and the GPU waits.
+        const bool overlap = llama_moe_overlap();
+        ggml_tensor * ex_gpu   = nullptr;
+        ggml_tensor * gpu_part = nullptr;
+        auto build_gpu = [&]() {
+            ex_gpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_gpu,
+                    msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, msplit->gate_up_gpu, type_op,
+                    msplit->up_b_gpu, msplit->gate_b_gpu, msplit->down_b_gpu, il);
+            cb(ex_gpu, "ffn_moe_split_gpu", il);
+            ggml_tensor * m_gpu = ggml_reshape_3d(ctx0,
+                    ggml_get_rows(ctx0, msplit->mask_gpu, sel_flat), 1, n_expert_used, n_tokens);
+            gpu_part = ggml_mul(ctx0, ex_gpu, ggml_mul(ctx0, weights, m_gpu));
+        };
+        if (overlap) {
+            // the CPU branch's ids first: they end the device split the host waits for (the overlap cut)
+            ggml_build_forward_expand(gf, ids_cpu);
+            build_gpu();
+            ggml_build_forward_expand(gf, gpu_part);
+            if (moe_overlap_extra) {
+                ggml_build_forward_expand(gf, moe_overlap_extra);
+            }
+        }
+        moe_overlap_extra = nullptr;
         ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_cpu,
                 up_exps, gate_exps, down_exps, gate_up_exps, type_op,
                 msplit->up_b_cpu, msplit->gate_b_cpu, msplit->down_b_cpu, il);
         cb(ex_cpu, "ffn_moe_split_cpu", il);
-        ggml_tensor * ex_gpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_gpu,
-                msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, msplit->gate_up_gpu, type_op,
-                msplit->up_b_gpu, msplit->gate_b_gpu, msplit->down_b_gpu, il);
-        cb(ex_gpu, "ffn_moe_split_gpu", il);
+        if (!overlap) {
+            build_gpu();
+        }
 
         ggml_tensor * m_cpu = ggml_reshape_3d(ctx0,
                 ggml_get_rows(ctx0, msplit->mask_cpu, sel_flat), 1, n_expert_used, n_tokens);
-        ggml_tensor * m_gpu = ggml_reshape_3d(ctx0,
-                ggml_get_rows(ctx0, msplit->mask_gpu, sel_flat), 1, n_expert_used, n_tokens);
 
         experts = ggml_add(ctx0,
                 ggml_mul(ctx0, ex_cpu, ggml_mul(ctx0, weights, m_cpu)),
-                ggml_mul(ctx0, ex_gpu, ggml_mul(ctx0, weights, m_gpu)));
+                gpu_part);
         cb(experts, "ffn_moe_weighted_split", il);
     } else {
 
