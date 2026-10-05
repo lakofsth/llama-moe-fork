@@ -11323,6 +11323,99 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_hc_mix (fork, fork-kernel-fusion)
+//
+// The reference for the CUDA kernels: one thread, every product summed in double, the weights
+// dequantized row by row with the type's own to_float. Definition: ggml.h ggml_hc_mix.
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * w_norm   = dst->src[1];
+    const ggml_tensor * w_down   = dst->src[2];
+    const ggml_tensor * w_up     = dst->src[3];
+    const ggml_tensor * w_inject = dst->src[4];
+
+    const int64_t n_embd = x->ne[0];
+    const int64_t hc     = x->ne[1];
+    const int64_t nt     = x->ne[2];
+    const int64_t hd     = n_embd*hc;
+    const int64_t r      = w_down->ne[1];
+
+    const float eps   = ggml_get_op_params_f32(dst, 0);
+    const float scale = ggml_get_op_params_f32(dst, 1);
+
+    ggml_to_float_t const down_to_float = ggml_get_type_traits(w_down->type)->to_float;
+    ggml_to_float_t const up_to_float   = ggml_get_type_traits(w_up->type)->to_float;
+    GGML_ASSERT(w_down->type == GGML_TYPE_F32 || down_to_float);
+    GGML_ASSERT(w_up->type   == GGML_TYPE_F32 || up_to_float);
+
+    std::vector<float>  xn(hd), row(hd), lo(r), gate(hd);
+    const float * wn = (const float *) w_norm->data;
+
+    auto get_row = [&](const ggml_tensor * w, ggml_to_float_t f, int64_t i, int64_t n) {
+        const char * src = (const char *) w->data + i*w->nb[1];
+        if (w->type == GGML_TYPE_F32) {
+            memcpy(row.data(), src, n*sizeof(float));
+        } else {
+            f(src, row.data(), n);
+        }
+    };
+
+    for (int64_t t = 0; t < nt; ++t) {
+        const float * xt = (const float *) ((const char *) x->data + t*x->nb[2]);
+        float       * mt = (float *) dst->data + t*n_embd;           // mixed [n_embd, nt]
+        float       * wt = (float *) dst->data + nt*n_embd + t*hc;   // w [hc, nt]
+
+        for (int64_t h = 0; h < hc; ++h) {
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                ss += (double) xt[h*n_embd + i]*xt[h*n_embd + i];
+            }
+            const float rs = 1.0f/sqrtf((float) (ss/n_embd) + eps);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                xn[h*n_embd + i] = xt[h*n_embd + i]*rs*wn[h*n_embd + i];
+            }
+        }
+        for (int64_t k = 0; k < r; ++k) {
+            get_row(w_down, down_to_float, k, hd);
+            double s = 0.0;
+            for (int64_t j = 0; j < hd; ++j) {
+                s += (double) row[j]*xn[j];
+            }
+            const float v = scale*(float) s;
+            lo[k] = v/(1.0f + expf(-v));
+        }
+        for (int64_t j = 0; j < hd; ++j) {
+            get_row(w_up, up_to_float, j, r);
+            double s = 0.0;
+            for (int64_t k = 0; k < r; ++k) {
+                s += (double) row[k]*lo[k];
+            }
+            gate[j] = (float) s;
+        }
+        for (int64_t i = 0; i < n_embd; ++i) {
+            double s = 0.0;
+            for (int64_t h = 0; h < hc; ++h) {
+                s += (double) xn[h*n_embd + i]/(1.0 + exp(-(double) gate[h*n_embd + i]));
+            }
+            mt[i] = scale*(float) s;
+        }
+        for (int64_t h = 0; h < hc; ++h) {
+            const float * wi = (const float *) ((const char *) w_inject->data + h*w_inject->nb[1]);
+            double s = 0.0;
+            for (int64_t j = 0; j < hd; ++j) {
+                s += (double) wi[j]*xn[j];
+            }
+            wt[h] = 2.0f/(1.0f + expf(-scale*(float) s));
+        }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_post
 
 static void ggml_compute_forward_dsv4_hc_post_f32(

@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2725,6 +2726,27 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // hc_mix (fork, fork-kernel-fusion): the whole hyper-connection read of a Qwen3.8-Flash-Next layer
+    // in one op. x [n_embd, hc, n_tokens], w_norm [n_embd, hc], w_down [hc*n_embd, r],
+    // w_up [r, hc*n_embd], w_inject [hc*n_embd, hc] -> 1-D [(n_embd + hc)*n_tokens]: the mixed input
+    // [n_embd, n_tokens] first, then the hc_post weights [hc, n_tokens] — each a contiguous view:
+    //   xn[i, h]  = x[i, h]*w_norm[i, h]/sqrt(mean_i x[i, h]^2 + eps)        (per stream h)
+    //   lo        = silu(scale*(w_down . xn))                                  (xn flattened to hc*n_embd)
+    //   gate      = w_up . lo
+    //   mixed[i, t] = scale*sum_h xn[i, h]*sigmoid(gate[i + h*n_embd])
+    //   w[h, t]     = 2*sigmoid(scale*(w_inject . xn)[h])
+    // scale is 1/hc. Rows of x must be contiguous.
+    //
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
+            float                 eps,
+            float                 scale);
 
     // custom operators
 

@@ -2305,6 +2305,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
             } break;
+        case GGML_OP_HC_MIX:
+            {
+                ggml_compute_forward_hc_mix(params, tensor);
+            } break;
         case GGML_OP_MAP_CUSTOM1:
             {
                 ggml_compute_forward_map_custom1(params, tensor);
@@ -2490,6 +2494,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_POST:
             {
                 n_tasks = n_threads;
+            } break;
+        case GGML_OP_HC_MIX:
+            {
+                n_tasks = 1; // the reference implementation (fork-kernel-fusion); CUDA carries the speed
             } break;
         case GGML_OP_REPEAT:
         case GGML_OP_REPEAT_BACK:
