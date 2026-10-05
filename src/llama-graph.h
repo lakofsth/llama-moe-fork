@@ -890,6 +890,9 @@ struct llm_graph_params {
     }
 };
 
+// fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP=1, see llama-graph.cpp
+bool llama_moe_overlap();
+
 struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
@@ -1043,6 +1046,11 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP — device work of the layer that does not depend on the split
+    // MoE's CPU branch (the shared expert), built by the model and handed to build_moe_ffn, which expands it into
+    // the graph after the GPU experts and before the CPU branch; consumed (reset) by that call
+    mutable ggml_tensor * moe_overlap_extra = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
