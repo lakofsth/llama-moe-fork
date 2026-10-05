@@ -4345,6 +4345,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // fork (fork-kernel-fusion): q8_1 copies never outlive one evaluation (see ggml_cuda_q8_1_cache)
+            cuda_ctx->q8_1_cache.clear();
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4387,7 +4389,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                // fork (fork-kernel-fusion): this node is about to overwrite its bytes; a fused group's other
+                // nodes are dropped below, once the group has run (its matvec may hit on its own input)
+                cuda_ctx->q8_1_cache.invalidate(node->data, ggml_nbytes(node));
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                for (int j = 1; j <= nodes_to_skip; ++j) {
+                    const ggml_tensor * f = cgraph->nodes[i + j];
+                    if (f->data != nullptr) {
+                        cuda_ctx->q8_1_cache.invalidate(f->data, ggml_nbytes(f));
+                    }
+                }
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG

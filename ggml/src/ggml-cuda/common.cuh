@@ -1443,6 +1443,132 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// fork (fork-kernel-fusion): the q8_1 copy of a matvec's F32 input, kept for the next mul_mat_vec_q that
+// reads the same activation. Decode runs several matvecs on one input (attn qkv + gate, q/k/v, the routed
+// and shared experts) and each used to quantize it again. An entry stands while its source bytes are
+// unchanged: the graph loop drops every entry a node writes over (invalidate) and all of them at the start
+// of each graph evaluation (clear), so a hit never crosses a graph or a host-side copy into the buffers.
+// The key is the source pointer, ne10 and the row walk (the dims with ne > 1, innermost first, with their
+// strides): two calls with the same walk quantize to the same bytes, whatever their shapes' ones.
+// Slots are allocated once and never moved — a captured CUDA graph holds their addresses. Stream 0 only
+// (a concurrent-streams region bypasses it). GGML_CUDA_Q8_1_CACHE=0 turns it off.
+struct ggml_cuda_q8_1_cache {
+    static constexpr int    n_slots    = 4;
+    static constexpr size_t slot_bytes = 512*1024;
+
+    struct key {
+        const char * lo   = nullptr; // source byte range [lo, hi)
+        const char * hi   = nullptr;
+        int64_t      ne10 = 0;
+        int64_t      ne[3] = {1, 1, 1}; // the row walk, innermost first; unused entries 1/0
+        int64_t      s [3] = {0, 0, 0};
+        bool operator==(const key & o) const {
+            return lo == o.lo && hi == o.hi && ne10 == o.ne10 &&
+                   ne[0] == o.ne[0] && ne[1] == o.ne[1] && ne[2] == o.ne[2] &&
+                   s[0] == o.s[0] && s[1] == o.s[1] && s[2] == o.s[2];
+        }
+    };
+
+    struct slot {
+        bool     valid = false;
+        key      k;
+        uint64_t used  = 0;
+        void *   q     = nullptr;
+    };
+
+    slot     slots[n_slots];
+    uint64_t tick    = 0;
+    int      enabled = -1; // -1 = read the environment on first use
+    uint64_t n_hit   = 0;
+    uint64_t n_store = 0;
+
+    bool is_enabled() {
+        if (enabled < 0) {
+            const char * e = getenv("GGML_CUDA_Q8_1_CACHE");
+            enabled = (e == nullptr || atoi(e) != 0) ? 1 : 0;
+        }
+        return enabled == 1;
+    }
+
+    // src: the F32 input; ne1..3 / s1..3: its row dims and strides in floats
+    static key make_key(const float * src, int64_t ne10, const int64_t ne_r[3], const int64_t s_r[3]) {
+        key k;
+        k.ne10 = ne10;
+        int     j   = 0;
+        int64_t end = ne10;
+        for (int d = 0; d < 3; ++d) {
+            if (ne_r[d] > 1) {
+                k.ne[j] = ne_r[d];
+                k.s [j] = s_r[d];
+                end += (ne_r[d] - 1)*s_r[d];
+                ++j;
+            }
+        }
+        k.lo = (const char *) src;
+        k.hi = (const char *) (src + end);
+        return k;
+    }
+
+    const void * lookup(const key & k) {
+        for (slot & s : slots) {
+            if (s.valid && s.k == k) {
+                s.used = ++tick;
+                ++n_hit;
+                return s.q;
+            }
+        }
+        return nullptr;
+    }
+
+    // a slot to quantize k into, or nullptr when the copy does not fit a slot
+    void * store(const key & k, size_t nbytes) {
+        if (nbytes > slot_bytes) {
+            return nullptr;
+        }
+        slot * best = &slots[0];
+        for (slot & s : slots) {
+            if (!s.valid) { best = &s; break; }
+            if (s.used < best->used) { best = &s; }
+        }
+        if (best->q == nullptr) {
+            if (cudaMalloc(&best->q, slot_bytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                best->q = nullptr;
+                return nullptr;
+            }
+        }
+        best->valid = true;
+        best->k     = k;
+        best->used  = ++tick;
+        ++n_store;
+        return best->q;
+    }
+
+    void clear() {
+        for (slot & s : slots) {
+            s.valid = false;
+        }
+    }
+
+    void invalidate(const void * data, size_t nbytes) {
+        const char * lo = (const char *) data;
+        const char * hi = lo + nbytes;
+        for (slot & s : slots) {
+            if (s.valid && lo < s.k.hi && s.k.lo < hi) {
+                s.valid = false;
+            }
+        }
+    }
+
+    ~ggml_cuda_q8_1_cache() {
+        for (slot & s : slots) {
+            if (s.q != nullptr) {
+                cudaFree(s.q);
+            }
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1454,6 +1580,8 @@ struct ggml_backend_cuda_context {
     size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
 
     int curr_stream_no = 0;
+
+    ggml_cuda_q8_1_cache q8_1_cache;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
