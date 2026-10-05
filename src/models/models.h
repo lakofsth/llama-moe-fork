@@ -2462,13 +2462,15 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * w_up,
                     ggml_tensor * w_inject,
                     ggml_tensor ** inject,
-                            int   il);
+                            int   il,
+                           bool * inject_is_w = nullptr);
 
         ggml_tensor * build_hc_combine(
                     ggml_tensor * residual,
                     ggml_tensor * block_out,
                     ggml_tensor * inject,
-                            int   il);
+                            int   il,
+                           bool   inject_is_w = false);
 
         ggml_tensor * build_layer_attn(
               llm_graph_input_attn_kv * inp_attn,

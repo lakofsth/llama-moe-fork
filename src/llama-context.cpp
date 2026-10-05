@@ -78,6 +78,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_comb_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_hc_mix_probe = {
+    /*.op               =*/ LLM_FUSED_OP_HC_MIX,
+    /*.name             =*/ "fused hyper-connection read (HC_MIX)",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_POST,
     /*.name             =*/ "fused DeepSeek V4 HC post",
@@ -263,6 +269,12 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
     cparams.auto_fhc           = true;
+
+    // fork (fork-kernel-fusion): LLAMA_FUSED_HC_MIX=0 keeps the unfused hyper-connection read (A/B on one binary)
+    {
+        const char * e = getenv("LLAMA_FUSED_HC_MIX");
+        cparams.fused_hc_mix = !(e && atoi(e) == 0);
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -602,6 +614,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
+        if (cparams.fused_hc_mix) {
+            resolve(llm_fused_op_hc_mix_probe, cparams.fused_hc_mix);
+        }
         cparams.auto_fhc = false;
     }
 }

@@ -271,10 +271,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
         ggml_tensor *  w_up,
         ggml_tensor *  w_inject,
         ggml_tensor ** inject,
-        int            il) {
+        int            il,
+        bool         * inject_is_w) {
     const int64_t hc     = hparams.dsv4_hc_mult;
     const int64_t hc_dim = hc * n_embd;
     const int64_t nt     = x->ne[2];
+
+    if (inject_is_w) {
+        *inject_is_w = false;
+    }
+    // fork (fork-kernel-fusion): the whole read in one op for decode-sized batches (a step of a few slots
+    // or a speculative window); it also returns hc_combine's 2*sigmoid(inject/hc) weights, not inject.
+    // Prompt batches keep the matmul path. ggml.h ggml_hc_mix.
+    if (cparams.fused_hc_mix && il >= 0 && inject && inject_is_w && w_inject && nt <= 8 &&
+            w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 && w_inject->type == GGML_TYPE_F32 &&
+            x->nb[1] == (size_t) n_embd*ggml_element_size(x)) {
+        ggml_tensor * out = ggml_hc_mix(ctx0, x, w_norm, w_down, w_up, w_inject, hparams.f_norm_rms_eps, 1.0f / (float) hc);
+        res->add_fused_node({LLM_FUSED_OP_HC_MIX, out, il});
+        ggml_tensor * mixed = ggml_view_2d(ctx0, out, n_embd, nt, n_embd*ggml_element_size(out), 0);
+        *inject = ggml_view_2d(ctx0, out, hc, nt, hc*ggml_element_size(out), n_embd*nt*ggml_element_size(out));
+        *inject_is_w = true;
+        cb(mixed, "hc_mixed", il);
+        cb(*inject, "hc_inject_w", il);
+        return mixed;
+    }
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
@@ -324,13 +344,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
         ggml_tensor * residual,
         ggml_tensor * block_out,
         ggml_tensor * inject,
-        int           il) {
+        int           il,
+        bool          inject_is_w) {
     const int64_t hc = hparams.dsv4_hc_mult;
     const int64_t nt = residual->ne[2];
 
     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
-    ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
-    w = ggml_scale(ctx0, w, 2.0f);
+    // (inject_is_w: ggml_hc_mix has already applied it)
+    ggml_tensor * w = inject;
+    if (!inject_is_w) {
+        w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx0, w, 2.0f);
+    }
 
     ggml_tensor * cur = nullptr;
     if (cparams.fused_dsv4_hc_post && il >= 0) {
@@ -399,12 +424,13 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         ggml_tensor * inject = nullptr;
+        bool inject_is_w = false;
         ggml_tensor * cur = build_hc_mix(res_hc,
                 model.layers[il].hc_attn_norm,
                 model.layers[il].hc_attn_down,
                 model.layers[il].hc_attn_up,
                 model.layers[il].hc_attn_inject,
-                &inject, il);
+                &inject, il, &inject_is_w);
 
         ggml_build_forward_expand(gf, cur);
 
@@ -424,19 +450,19 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
         }
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+        res_hc = build_hc_combine(res_hc, cur, inject, il, inject_is_w);
 
         cur = build_hc_mix(res_hc,
                 model.layers[il].hc_ffn_norm,
                 model.layers[il].hc_ffn_down,
                 model.layers[il].hc_ffn_up,
                 model.layers[il].hc_ffn_inject,
-                &inject, il);
+                &inject, il, &inject_is_w);
 
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 
-        res_hc = build_hc_combine(res_hc, cur, inject, il);
+        res_hc = build_hc_combine(res_hc, cur, inject, il, inject_is_w);
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);

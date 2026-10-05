@@ -4338,6 +4338,51 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_HC_MIX (fork, fork-kernel-fusion): a Qwen3.8-Flash-Next hyper-connection read in one op
+struct test_hc_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t n_hc;
+    const int64_t r;
+    const int64_t n_tokens;
+    const ggml_type type_w;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd, n_hc, r, n_tokens, type_w);
+    }
+
+    double max_nmse_err() override {
+        // the CUDA kernels round xn and lo to q8_1 like the unfused path (mul_mat_vec_q); the CPU reference does
+        // not. That rounding is ~1e-4 here, a wrong reading is O(1); the tight check against the unfused ops is
+        // tests/test-hc-mix-composition (CUDA: nmse ~1e-14).
+        return 5e-3;
+    }
+
+    test_hc_mix(int64_t n_embd = 64, int64_t n_hc = 4, int64_t r = 32, int64_t n_tokens = 1, ggml_type type_w = GGML_TYPE_Q8_0)
+        : n_embd(n_embd), n_hc(n_hc), r(r), n_tokens(n_tokens), type_w(type_w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hd = n_embd*n_hc;
+        ggml_tensor * x        = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+        ggml_tensor * w_norm   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_hc);
+        ggml_tensor * w_down   = ggml_new_tensor_2d(ctx, type_w, hd, r);
+        ggml_tensor * w_up     = ggml_new_tensor_2d(ctx, type_w, r, hd);
+        ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd, n_hc);
+        ggml_set_name(x, "x");
+        ggml_set_name(w_norm, "w_norm");
+        ggml_set_name(w_down, "w_down");
+        ggml_set_name(w_up, "w_up");
+        ggml_set_name(w_inject, "w_inject");
+        ggml_tensor * out = ggml_hc_mix(ctx, x, w_norm, w_down, w_up, w_inject, 1e-6f, 1.0f/n_hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9172,6 +9217,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    for (int64_t nt : {1, 2, 3, 4, 6, 8, 9, 17}) {
+        test_cases.emplace_back(new test_hc_mix(256, 4, 32, nt));
+    }
+    for (int64_t nt : {1, 2, 4, 6}) {
+        test_cases.emplace_back(new test_hc_mix(2560, 4, 320, nt)); // Qwen3.8-Flash-Next
+    }
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
