@@ -5,7 +5,7 @@
 //   hc_mix_prep  xn = x*w_norm/rms per stream (rms recomputed per block), F32 and q8_1 (as quantize_q8_1)
 //   hc_mix_down  row k of w_down . xn with vec_dot_q8_0_q8_1 in mmvq's layout; lo = silu(scale*dot);
 //                plus F32 inject partials (as mul_mat_vec_f)
-//   hc_mix_up    lo -> q8_1 in shared memory, a thread per gate row (i, h), mixed = scale*sum_h xn*sigmoid(gate)
+//   hc_mix_up    lo -> q8_1 in shared memory, a thread per (gate row, Q8_0 block), mixed = scale*sum_h xn*sigmoid(gate)
 //                (as hc_pre); block 0 finishes w = 2*sigmoid(scale*inject)
 // The arithmetic mirrors the unfused path (q8_1 activations, the same dot), so the result differs from it only in
 // summation order; v2 kept F32 activations and moved KLD 3x past the adaptive tier's (gate-20261005T0827*).
@@ -22,6 +22,7 @@
 #define HC_MIX_PREP_SLICE 256 // xn elements a prep block quantizes
 #define HC_MIX_ROW_THREADS 128 // threads per down row (mmvq's layout: 4 per Q8_0 block, 32 blocks per pass)
 #define HC_MIX_INJ_PARTS  16  // blocks per inject row; hc_mix_up sums their partials
+#define HC_MIX_UP_I       8   // outputs i per up block
 
 static __device__ __forceinline__ float hc_mix_block_sum(float v, float * sh) {
     v = warp_reduce_sum(v);
@@ -120,55 +121,69 @@ static __global__ void hc_mix_down(const block_q8_0 * __restrict__ w_down, const
     }
 }
 
-// a thread per gate row (i, h) of w_up (K = r) against lo quantized to q8_1 in shared memory (each block quantizes
-// it again — r values); the hc rows of one i are adjacent lanes: mixed[i] = scale*sum_h xn*sigmoid(gate), as hc_pre.
-// Block 0 also finishes w[t][h] = 2*sigmoid(scale*sum of the inject partials).
+// a block per HC_MIX_UP_I outputs i: its HC_MIX_UP_I*hc gate rows (i + h*n_embd) times nb = r/32 Q8_0 blocks, a thread
+// per (row, block) — coalesced, and n_embd/HC_MIX_UP_I blocks to fill the card. lo is quantized to q8_1 in shared
+// memory by every block (r values); the per-block dots are summed per row in a fixed order, then
+// mixed[i] = scale*sum_h xn*sigmoid(gate), as hc_pre. Block 0 also finishes w = 2*sigmoid(scale*sum of the inject partials).
 template <int NT>
 static __global__ void hc_mix_up(const block_q8_0 * __restrict__ w_up, const float * __restrict__ lo,
         const float * __restrict__ xn, const float * __restrict__ inj_part, float * __restrict__ mixed, float * __restrict__ w_out,
         const int n_embd, const int hd, const int hc, const int r, const float scale) {
-    extern __shared__ block_q8_1 loq[]; // [NT][r/32]
-    const int nb = r/QK8_1;
+    extern __shared__ char smem[];
+    const int nb   = r/QK8_1;
+    const int rows = HC_MIX_UP_I*hc;
+    block_q8_1 * loq  = (block_q8_1 *) smem;                           // [NT][nb]
+    float      * part = (float *) (smem + NT*nb*sizeof(block_q8_1));   // [NT][rows][nb]
     for (int b = threadIdx.x/WARP_SIZE; b < NT*nb; b += blockDim.x/WARP_SIZE) {
         hc_mix_quantize_lane(lo[(b/nb)*r + (b%nb)*QK8_1 + threadIdx.x % WARP_SIZE], loq + b);
     }
-    if (blockIdx.x == 0 && (int) threadIdx.x < NT*hc) {
+    for (int q = threadIdx.x; blockIdx.x == 0 && q < NT*hc; q += blockDim.x) {
         float v = 0.0f;
-        for (int part = 0; part < HC_MIX_INJ_PARTS; ++part) {
-            v += inj_part[(int64_t) threadIdx.x*HC_MIX_INJ_PARTS + part];
+        for (int p = 0; p < HC_MIX_INJ_PARTS; ++p) {
+            v += inj_part[(int64_t) q*HC_MIX_INJ_PARTS + p];
         }
         const float u = scale*v;
-        w_out[threadIdx.x] = 2.0f*(1.0f/(1.0f + expf(-u)));
+        w_out[q] = 2.0f*(1.0f/(1.0f + expf(-u)));
     }
     __syncthreads();
-    const int tid = blockIdx.x*blockDim.x + threadIdx.x;
-    const int i = tid/hc, h = tid%hc;
-    const bool live = i < n_embd;
-    float g[NT];
+    const int rl  = threadIdx.x/nb;   // row in this block: il*hc + h
+    const int kbx = threadIdx.x%nb;
+    const int i0  = blockIdx.x*HC_MIX_UP_I;
+    {
+        const int il = rl/hc, h = rl%hc, i = i0 + il;
+        float s[NT];
 #pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        g[t] = 0.0f;
-    }
-    if (live) {
-        const block_q8_0 * row = w_up + (int64_t) (i + h*n_embd)*nb;
-        for (int kbx = 0; kbx < nb; ++kbx) {
+        for (int t = 0; t < NT; ++t) {
+            s[t] = 0.0f;
+        }
+        if (i < n_embd) {
+            const block_q8_0 * row = w_up + (int64_t) (i + h*n_embd)*nb;
 #pragma unroll
             for (int iqs = 0; iqs < QI8_0; iqs += VDR_Q8_0_Q8_1_MMVQ) {
 #pragma unroll
                 for (int t = 0; t < NT; ++t) {
-                    g[t] += vec_dot_q8_0_q8_1(row, loq + t*nb + kbx, kbx, iqs);
+                    s[t] += vec_dot_q8_0_q8_1(row, loq + t*nb + kbx, kbx, iqs);
                 }
             }
         }
-    }
-    const int e = h*n_embd + i;
 #pragma unroll
-    for (int t = 0; t < NT; ++t) {
-        float v = live ? xn[(int64_t) t*hd + e]*(1.0f/(1.0f + expf(-g[t]))) : 0.0f;
-        for (int off = 1; off < hc; off <<= 1) {
-            v += __shfl_xor_sync(0xffffffff, v, off, WARP_SIZE);
+        for (int t = 0; t < NT; ++t) {
+            part[(t*rows + rl)*nb + kbx] = s[t];
         }
-        if (live && h == 0) {
+    }
+    __syncthreads();
+    for (int q = threadIdx.x; q < NT*HC_MIX_UP_I; q += blockDim.x) {
+        const int t = q/HC_MIX_UP_I, il = q%HC_MIX_UP_I, i = i0 + il;
+        if (i < n_embd) {
+            float v = 0.0f;
+            for (int h = 0; h < hc; ++h) {
+                const float * pr = part + (t*rows + il*hc + h)*nb;
+                float g = 0.0f;
+                for (int b = 0; b < nb; ++b) {
+                    g += pr[b];
+                }
+                v += xn[(int64_t) t*hd + h*n_embd + i]*(1.0f/(1.0f + expf(-g)));
+            }
             mixed[t*n_embd + i] = scale*v;
         }
     }
@@ -181,8 +196,9 @@ static void hc_mix_launch(const float * x, const float * w_norm, const block_q8_
     const int hd = n_embd*hc;
     hc_mix_prep<<<dim3(hd/HC_MIX_PREP_SLICE, NT), HC_MIX_PREP_SLICE, 0, stream>>>(x, w_norm, xn, xq, n_embd, hd, sx_t, eps);
     hc_mix_down<NT><<<r + hc*HC_MIX_INJ_PARTS, HC_MIX_ROW_THREADS, 0, stream>>>(w_down, w_inject, xq, xn, lo, inj_part, hd, r, hc, scale);
-    const int threads = 256;
-    hc_mix_up<NT><<<(hd + threads - 1)/threads, threads, NT*(r/QK8_1)*sizeof(block_q8_1), stream>>>(
+    const int nb = r/QK8_1, threads = HC_MIX_UP_I*hc*nb;
+    const size_t smem = NT*nb*sizeof(block_q8_1) + (size_t) NT*HC_MIX_UP_I*hc*nb*sizeof(float);
+    hc_mix_up<NT><<<(n_embd + HC_MIX_UP_I - 1)/HC_MIX_UP_I, threads, smem, stream>>>(
         w_up, lo, xn, inj_part, mixed, w_out, n_embd, hd, hc, r, scale);
 }
 
@@ -192,7 +208,8 @@ bool ggml_cuda_hc_mix_supported(const ggml_tensor * op) {
     const int64_t n_embd = op->src[0]->ne[0], hc = op->src[0]->ne[1];
     return w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
            w_down->ne[1] % QK8_0 == 0 && (size_t) HC_MIX_MAX_T*w_down->ne[1]*sizeof(float) <= 48*1024 &&
-           hc <= HC_MIX_MAX_HC && (hc & (hc - 1)) == 0 && n_embd % HC_MIX_PREP_SLICE == 0 && (n_embd*hc) % WARP_SIZE == 0;
+           hc <= HC_MIX_MAX_HC && n_embd % HC_MIX_PREP_SLICE == 0 &&
+           (HC_MIX_UP_I*hc*(w_down->ne[1]/QK8_0)) % WARP_SIZE == 0 && HC_MIX_UP_I*hc*(w_down->ne[1]/QK8_0) <= 1024;
 }
 
 void ggml_cuda_op_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
