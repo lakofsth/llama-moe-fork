@@ -2980,6 +2980,18 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // fork (fork-kernel-fusion, MTP): draft only while few slots generate. Measured on the qwen4exp resident
+        // (mtp-ab run-20261006T142*, n_max 3, acceptance 0.63): MTP +44% aggregate decode at 1 generating slot,
+        // +2% at 2, -6/-9/-13% at 3/4/6 — a verify batch per slot costs more than its accepted drafts save once
+        // the step is wide. LLAMA_SPEC_MAX_GEN_SLOTS=K starts no new draft in a step with more than K slots
+        // generating (a draft already in flight is still verified); unset, every step may draft, as before.
+        static const int spec_max_gen = [] { const char * e = getenv("LLAMA_SPEC_MAX_GEN_SLOTS"); return e ? atoi(e) : -1; }();
+        int n_gen_slots = 0;
+        for (const auto & s : slots) {
+            n_gen_slots += s.state == SLOT_STATE_GENERATING;
+        }
+        const bool spec_gate_open = spec_max_gen < 0 || n_gen_slots <= spec_max_gen;
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3011,6 +3023,8 @@ private:
                         if (use_ckpt_tgt) {
                             GGML_ASSERT(!slot.spec_ckpt.empty());
                         }
+                    } else if (!spec_gate_open) {
+                        // too many slots generating this step: no new draft (LLAMA_SPEC_MAX_GEN_SLOTS)
                     } else {
                         GGML_ASSERT(slot.spec_i_batch.empty());
 
