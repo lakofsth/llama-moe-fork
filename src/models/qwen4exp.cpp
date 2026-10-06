@@ -534,6 +534,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     if (cparams.embeddings_nextn) {
         ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         cb(h_nextn, "h_nextn", -1);
+        // a view nothing downstream reads (the masked path prunes res_hc itself) is not a graph node, so the
+        // scheduler names no backend for it and llama_context's nextn copy asserts (mtp-ab 6 Oct, M1: backend_h)
+        ggml_build_forward_expand(gf, h_nextn);
         res->t_h_nextn = h_nextn;
     }
     if (inp_out_ids && !mask_early) {
@@ -654,6 +657,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the next draft step reads this R, every row of it
     ggml_tensor * h_nextn = ggml_reshape_2d(ctx0, R, hc_dim, n_tokens);
     cb(h_nextn, "h_nextn", -1);
+    ggml_build_forward_expand(gf, h_nextn);   // a graph node whatever reads it below (see the trunk's h_nextn)
     res->t_h_nextn = h_nextn;
 
     if (inp_out_ids) {
