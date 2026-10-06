@@ -1214,6 +1214,10 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
+    // fork/pin: host ranges of the CPU-resident expert originals registered as pinned (cudaHostRegister)
+    // under GGML_CUDA_REGISTER_HOST, so their prompt-time uploads run as DMA; unregistered before unmap
+    std::vector<void *> pinned_ranges;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -1298,6 +1302,68 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // fork/pin: unpin before the mappings (pimpl members) are unmapped
+    if (!pimpl->pinned_ranges.empty()) {
+        ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+        auto unreg = reg ? (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer") : nullptr;
+        if (unreg) {
+            for (void * p : pimpl->pinned_ranges) {
+                unreg(p);
+            }
+        }
+    }
+}
+
+// fork/pin: register the host bytes of every CPU-resident expert tensor (name *_exps) as pinned memory, page-aligned
+// and coalesced, so the CUDA backend's uploads of those weights (prompt-time offload to a GPU) are DMA from page-locked
+// memory instead of staged copies from pageable mmap pages. Off unless GGML_CUDA_REGISTER_HOST is set (the CUDA
+// backend's own switch). Runs after the heat split, so originals the split keeps on the host are the ones pinned.
+static void llama_model_pin_host_experts(const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
+                                         std::vector<void *> & pinned) {
+    if (getenv("GGML_CUDA_REGISTER_HOST") == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    auto reg_fn = reg ? (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer") : nullptr;
+    if (!reg_fn) {
+        LLAMA_LOG_WARN("%s: GGML_CUDA_REGISTER_HOST set but no CUDA host-register entry point; nothing pinned\n", __func__);
+        return;
+    }
+    const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+    for (const auto & [ctx, bufs] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            if (!t->buffer || !t->data || !ggml_backend_buffer_is_host(t->buffer) || strstr(t->name, "_exps") == nullptr) {
+                continue;
+            }
+            const uintptr_t b = (uintptr_t) t->data & ~(page - 1);
+            const uintptr_t e = ((uintptr_t) t->data + ggml_nbytes(t) + page - 1) & ~(page - 1);
+            ranges.emplace_back(b, e);
+        }
+    }
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+    for (const auto & r : ranges) {
+        if (!merged.empty() && r.first <= merged.back().second) {
+            merged.back().second = std::max(merged.back().second, r.second);
+        } else {
+            merged.push_back(r);
+        }
+    }
+    const int64_t t0 = ggml_time_us();
+    size_t ok_bytes = 0, fail_bytes = 0;
+    int n_fail = 0;
+    for (const auto & r : merged) {
+        if (reg_fn((void *) r.first, r.second - r.first)) {
+            pinned.push_back((void *) r.first);
+            ok_bytes += r.second - r.first;
+        } else {
+            fail_bytes += r.second - r.first;
+            n_fail++;
+        }
+    }
+    LLAMA_LOG_INFO("%s: pinned %.1f MiB of host expert weights in %zu ranges (%zu tensors) in %.1f s; %d ranges (%.1f MiB) failed\n",
+                   __func__, ok_bytes / 1048576.0, pinned.size(), ranges.size(), (ggml_time_us() - t0) / 1e6, n_fail, fail_bytes / 1048576.0);
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2825,6 +2891,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // fork/phase-b: heat-driven expert split (no-op unless LLAMA_MOE_HEAT_FILE is set).
     // Must run while ml still owns the mappings (eviction resolves file offsets there).
     llama_moe_heat_split_init(*this, ml);
+
+    llama_model_pin_host_experts(pimpl->ctxs_bufs, pimpl->pinned_ranges);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
