@@ -259,6 +259,7 @@ llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
 llama_build_and_test(test-jinja.cpp)
 llama_build_and_test(test-moe-online-hits.cpp) # fork-strata-ports: per-expert sentinel hit counters
 llama_build_and_test(test-moe-adapt-select.cpp) # fork-strata-ports: the adaptive tier swap rule
+llama_build_and_test(test-moe-heat-select.cpp) # fork-kernel-fusion: the heat-split selection (H1)
 llama_build_and_test(test-cuda-q8-1-cache.cpp) # fork-kernel-fusion: the shared q8_1 copy of a matvec input
 llama_build_and_test(test-hc-mix-composition.cpp) # fork-kernel-fusion: HC_MIX against the unfused ops it replaces
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

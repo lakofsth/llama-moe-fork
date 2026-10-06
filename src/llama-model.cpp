@@ -1,5 +1,6 @@
 #include "llama-model.h"
 #include "llama-moe-adapt.h"
+#include "llama-moe-heat-select.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1710,9 +1711,6 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         pd[0].budget = budget;
     }
 
-    struct cand { float h; int il; int e; };
-    std::vector<cand> cands;
-    cands.reserve(heat.size());
     // per-layer expert tensor set: merged (gate_up + down) or separate (gate + up + down)
     auto layer_exps = [](const llama_layer & L) {
         std::vector<const ggml_tensor *> v;
@@ -1743,12 +1741,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         n_ok_layers++;
         pd[d].n_ok_layers++;
         if (pd[d].bpe_any == 0) { for (auto * t : layer_exps(L)) pd[d].bpe_any += t->nb[2]; }
-        for (int e = 0; e < n_expert; e++) {
-            const float h = heat[(size_t) il*n_expert + e];
-            if (h > 0.0f) cands.push_back({h, il, e});
-        }
     }
-    std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.h > b.h; });
     if (n_ok_unowned > 0) {
         LLAMA_LOG_WARN("moe-heat-split: %d host-expert layers are owned by the CPU or a meta device — not packable in the per-device form\n",
                 n_ok_unowned);
@@ -1785,39 +1778,33 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
             if (p.budget == 0) p.full = true;
         }
     }
-    std::vector<std::vector<int>> sel(n_layer);
+    // the selection itself: src/llama-moe-heat-select.h (tests/test-moe-heat-select.cpp, invariant H1).
+    // LLAMA_MOE_HEAT_FILL=1: zero-heat experts fill each layer to its cap after every positive one.
+    const bool fill = [] { const char * e = getenv("LLAMA_MOE_HEAT_FILL"); return e && atoi(e) != 0; }();
+    std::vector<size_t> bpe_l(n_layer, 0);
+    for (int il = 0; il < n_layer; il++) {
+        if (ldev[il] < 0) continue;
+        for (auto * t : layer_exps(model.layers[il])) bpe_l[il] += t->nb[2];
+    }
+    std::vector<llama_moe_heat_pack> hp(pd.size());
+    for (size_t d = 0; d < pd.size(); d++) { hp[d].budget = pd[d].budget; hp[d].cap = pd[d].cap; hp[d].full = pd[d].full; }
+    std::vector<std::vector<int>> sel = llama_moe_heat_select(heat, n_layer, n_expert, ldev, bpe_l, hp, fill);
     size_t bytes = 0;
     int n_sel = 0;
-    int n_open = 0;
-    for (const auto & p : pd) if (!p.full) n_open++;
-    for (const auto & c : cands) {
-        if (n_open == 0) break;
-        auto & p = pd[ldev[c.il]];
-        if (p.full) continue;                          // device closed — other devices keep filling
-        if ((int) sel[c.il].size() >= p.cap) continue; // layer full — keep scanning, do NOT stop
-        const auto & L = model.layers[c.il];
-        size_t bpe = 0;
-        for (auto * t : layer_exps(L)) bpe += t->nb[2];
-        if (p.bytes + bpe > p.budget) {
-            // the single-device packer's `break`, applied per device: this device takes
-            // nothing more. Leaves at most one expert's bytes of its budget idle.
-            p.full = true;
-            n_open--;
-            continue;
-        }
-        p.bytes += bpe;
-        bytes   += bpe;
-        sel[c.il].push_back(c.e);
-        p.n_sel++;
-        n_sel++;
+    for (size_t d = 0; d < pd.size(); d++) {
+        pd[d].bytes = hp[d].bytes; pd[d].n_sel = hp[d].n_sel; pd[d].full = hp[d].full;
+        bytes += hp[d].bytes; n_sel += hp[d].n_sel;
     }
     for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) pd[ldev[il]].n_split_layers++;
 
     if (!per_dev) {
         const int cap = pd[0].cap;
         if (cap < n_expert) {
-            LLAMA_LOG_WARN("moe-heat-split: per-layer cap %d of %d experts (%d host layers)\n",
-                           cap, n_expert, n_ok_layers);
+            // the packed size on the line the default log level shows (the INFO 'ENABLED' line is hidden): a map
+            // naming fewer experts than the cap packs less than the budget unless LLAMA_MOE_HEAT_FILL=1
+            LLAMA_LOG_WARN("moe-heat-split: per-layer cap %d of %d experts (%d host layers), packed %d experts %.1f MiB of %.1f%s\n",
+                           cap, n_expert, n_ok_layers, n_sel, bytes/1024.0/1024.0, pd[0].budget/1024.0/1024.0,
+                           fill ? " (fill)" : "");
         }
     } else {
         // one line per device: what it was given and what it took. Printed before any
