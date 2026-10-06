@@ -2495,6 +2495,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    // fork (fork-kernel-fusion, MTP): the draft context's micro-batch. It inherits the target's -ub, and a
+    // qwen4exp NextN block at -ub 2048 reserves a ~1,959 MiB compute buffer for a whole MoE layer over 2048 rows,
+    // which the card holding the block cannot spare beside the resident (mtp-ab 2026-10-06, M1: cudaMalloc OOM on
+    // device 1). Only n_ubatch shrinks: process() hands the draft whole target batches, so n_batch must stay.
+    if (const char * e = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+        const int v = atoi(e);
+        if (v > 0 && v < (int) result.n_ubatch) {
+            result.n_ubatch = v;
+        }
+    }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
