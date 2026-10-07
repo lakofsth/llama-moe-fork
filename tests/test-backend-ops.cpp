@@ -10777,6 +10777,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2047, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2048, 2, 1, 3}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 2, 1, 3}, k));
+        // fork (fork-kernel-fusion, 2026-10-07): an MoE router's shape — 512 experts over a 2048-token micro-batch,
+        // and a 6-slot decode step — the rows the batched path of ggml_cuda_op_top_k takes.
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 2048, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 6, 1, 1}, k));
     }
 
     // Large-k, including multi-row and ties (qwen4exp)

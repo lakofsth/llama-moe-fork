@@ -226,6 +226,28 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
 #ifdef CUB_TOP_K_AVAILABLE
+    // fork (fork-kernel-fusion, 2026-10-07): CUB DeviceTopK is single-row, so the loop below launches its kernels,
+    // a pool allocation and a memset PER ROW — for an MoE router over a 2048-token micro-batch that is tens of
+    // thousands of launches per micro-batch (nsys p0/run-20261007T070029Z: 65,536 DeviceTopK kernels + 24,827
+    // memsets per micro-batch, GPUs idle 57%). Rows of <= 1024 columns whose padded row fits shared memory take the
+    // batched bitonic argsort instead: ONE launch for all rows, a deterministic sorted order, and every index in
+    // [0, ncols) (a permutation, whatever the inputs). GGML_CUDA_TOPK_CUB=1 restores the per-row CUB path.
+    {
+        static const bool force_cub = [] { const char * e = getenv("GGML_CUDA_TOPK_CUB"); return e && atoi(e) != 0; }();
+        int ncols_pad = 1;
+        while (ncols_pad < ncols) {
+            ncols_pad *= 2;
+        }
+        const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+        if (!force_cub && nrows > 1 && ncols <= 1024 && ncols_pad * sizeof(int) <= max_shared_mem) {
+            ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+            int *                     tmp_dst = temp_dst_alloc.get();
+            argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+            CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+                                         cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
+    }
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
