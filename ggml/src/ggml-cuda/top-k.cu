@@ -48,7 +48,11 @@ static int next_power_of_2(int x) {
 
 #endif                            // CUB_TOP_K_AVAILABLE
 
-#if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+// fork (fork-kernel-fusion, 2026-10-07): the radix-select top-k below is compiled for CUDA too. It takes every row in
+// ~10 launches whatever ncols is, where CUB DeviceTopK is single-row: qwen4exp's DSA indexer runs top-k over n_kv
+// context cells for every query row, and per-row CUB was 49,152 DeviceTopK launches per 2048-token micro-batch
+// (p0/run-20261007T1301*). Ties at the k-th key are resolved in atomic order, as unordered as CUB's not_guaranteed.
+#if defined(GGML_USE_HIP) || defined(CUB_TOP_K_AVAILABLE)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     const uint32_t bits = __float_as_uint(value);
@@ -208,7 +212,7 @@ static void top_k_radix_cuda(
             src, dst, states, ncols, k, blocks_per_row);
 }
 
-#endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
+#endif // defined(GGML_USE_HIP) || defined(CUB_TOP_K_AVAILABLE)
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
@@ -245,6 +249,10 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             argsort_f32_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
             CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
                                          cudaMemcpyDeviceToDevice, stream));
+            return;
+        }
+        if (!force_cub && nrows > 1 && ncols > 1024) {
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
             return;
         }
     }
