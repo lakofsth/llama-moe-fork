@@ -10782,6 +10782,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 2048, 1, 1}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {512, 6, 1, 1}, k));
     }
+    // fork (fork-kernel-fusion, 2026-10-07): the DSA indexer's shape — top_k 2048 (+ the block tail) over n_kv context
+    // cells for every query row — which the batched radix-select path of ggml_cuda_op_top_k takes.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {35000, 256, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192, 64, 1, 1}, 2048));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2049, 64, 1, 1}, 2048));
 
     // Large-k, including multi-row and ties (qwen4exp)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1024,  1, 1, 1 }, 1024));
