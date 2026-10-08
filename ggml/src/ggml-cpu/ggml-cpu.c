@@ -1476,8 +1476,8 @@ UseGgmlGemm2:;
 // preamble below: valid ids are COLD experts (exact counts), sentinels are hits on the
 // GPU-resident hot set (exact per-layer hit-rate). Layer parsed from the ids tensor
 // name suffix ("ffn_moe_ids_cpu-<il>"). Consumed by the repin logic in llama-context.
-#define GGML_MOE_ONLINE_MAX_LAYERS  128
-#define GGML_MOE_ONLINE_MAX_EXPERTS 1024
+#define GGML_MOE_ONLINE_MAX_LAYERS  GGML_CPU_MOE_ONLINE_MAX_LAYERS
+#define GGML_MOE_ONLINE_MAX_EXPERTS GGML_CPU_MOE_ONLINE_MAX_EXPERTS
 static int64_t g_moe_online_counts[GGML_MOE_ONLINE_MAX_LAYERS][GGML_MOE_ONLINE_MAX_EXPERTS];
 static int64_t g_moe_online_sentinel[GGML_MOE_ONLINE_MAX_LAYERS];
 static int64_t g_moe_online_total[GGML_MOE_ONLINE_MAX_LAYERS];

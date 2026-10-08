@@ -299,6 +299,9 @@ private:
     // fork/phase-a: MoE router-lookahead prefetch (null unless LLAMA_MOE_PREFETCH is set)
     llama_moe_prefetch_ptr moe_prefetch;
 
+    // fork: decodes since the last online-heat check window (per context, not per process)
+    int moe_since_check = 0;
+
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 

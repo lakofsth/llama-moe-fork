@@ -2234,7 +2234,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // touches GPU tensors and the mmap originals, both idle at this point.
     {
         static const bool online = [] { const char * e = getenv("LLAMA_MOE_HEAT_ONLINE"); return e && atoi(e) != 0; }();
-        if (online && n_outputs > 0) {
+        // only the model that owns the counter table reads it (see llama_model::moe_online_owner)
+        if (online && n_outputs > 0 && model.moe_online_owner) {
             static const double thresh = [] {
                 // the counters see POST-bias selections, so LLAMA_MOE_ROUTER_BIAS inflates the
                 // measured hit-rate by a roughly register-independent boost (~+18pts at eps=0.2,
@@ -2268,7 +2269,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // trace: log every check window (WARN so llama-cli shows it); repin events
             // are always WARN — they are rare and change the placement, silent is worse
             static const bool trace = [] { const char * e = getenv("LLAMA_MOE_HEAT_TRACE"); return e && atoi(e) != 0; }();
-            static int since_check = 0;
             // fork-strata-ports: LLAMA_MOE_ADAPT=1 replaces the window repin below with Strata's
             // adaptive tier — a round every LLAMA_MOE_ADAPT_EVERY (default 4) decode calls, and a
             // hit-rate line every 64 (the same cadence and prefix as the repin's, so the greps
@@ -2298,8 +2298,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t, async ? moe_adapt_io.get() : nullptr);
                     if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; }
                 }
-                if (++since_check >= 64) {
-                    since_check = 0;
+                if (++moe_since_check >= 64) {
+                    moe_since_check = 0;
                     if (win_tot > 0) {
                         LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% (window %lld ids) -> adaptive tier, %lld swaps%s\n",
                                        100.0*(double) win_hits/(double) win_tot, (long long) win_tot, (long long) win_swaps,
@@ -2308,8 +2308,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     win_hits = win_tot = win_swaps = 0;
                 }
             } else
-            if (++since_check >= 64) {
-                since_check = 0;
+            if (++moe_since_check >= 64) {
+                moe_since_check = 0;
                 int64_t sent_all = 0, tot_all = 0;
                 for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                     int64_t s = 0, t = 0;
