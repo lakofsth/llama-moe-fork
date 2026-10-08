@@ -1726,6 +1726,13 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     std::vector<int> ldev(n_layer, -1);
     int    n_ok_layers = 0;
     int    n_ok_unowned = 0; // per-device form: host-expert layers whose owner is not a GPU
+    // fork (posture M5): shapes the split chain cannot carry are skipped per layer here, with
+    // a count per reason, rather than aborting at the first graph build. The graph's asserts
+    // on the same conditions stay as the backstop; a layer skipped here is never split.
+    int    n_skip_scale = 0;  // per-expert quant-scale tensors (*_exps_s): the chain applies none
+    int    n_skip_bias  = 0;  // expert biases present on some but not all of up/gate/down
+    int    n_skip_bias_merged = 0; // biases with a merged gate_up tensor: unsupported in the chain
+    int    n_skip_bias_dev = 0;    // biases not resident on the host (e.g. -ot kept them on a GPU)
     for (int il = 0; il < n_layer; il++) {
         const auto & L = model.layers[il];
         bool ok = true;
@@ -1734,6 +1741,20 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
                 t->ne[2] != n_expert) { ok = false; break; }
         }
         if (!ok) continue;
+        if (L.ffn_up_exps_s || L.ffn_gate_exps_s || L.ffn_down_exps_s) { n_skip_scale++; continue; }
+        {
+            const ggml_tensor * bs[3] = { L.ffn_up_exps_b, L.ffn_gate_exps_b, L.ffn_down_exps_b };
+            const int nb = (bs[0] != nullptr) + (bs[1] != nullptr) + (bs[2] != nullptr);
+            if (nb != 0 && nb != 3) { n_skip_bias++; continue; }
+            if (nb == 3) {
+                if (L.ffn_gate_up_exps) { n_skip_bias_merged++; continue; }
+                bool host = true;
+                for (auto * b : bs) {
+                    if (!b->buffer || !ggml_backend_buffer_is_host(b->buffer) || !b->data) { host = false; break; }
+                }
+                if (!host) { n_skip_bias_dev++; continue; }
+            }
+        }
         int d = 0;
         if (per_dev) {
             const ggml_backend_dev_t owner = model.dev_layer(il);
@@ -1751,6 +1772,18 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         }
     }
     std::sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.h > b.h; });
+    if (n_skip_scale > 0) {
+        LLAMA_LOG_WARN("moe-heat-split: %d layers carry per-expert scale tensors (*_exps_s) the split chain does not apply — not split\n", n_skip_scale);
+    }
+    if (n_skip_bias > 0) {
+        LLAMA_LOG_WARN("moe-heat-split: %d layers have expert biases on only some of up/gate/down — not split\n", n_skip_bias);
+    }
+    if (n_skip_bias_merged > 0) {
+        LLAMA_LOG_WARN("moe-heat-split: %d layers have expert biases with a merged gate_up tensor (unsupported in the split chain) — not split\n", n_skip_bias_merged);
+    }
+    if (n_skip_bias_dev > 0) {
+        LLAMA_LOG_WARN("moe-heat-split: %d layers have expert biases that are not host-resident (host experts, device biases) — not split\n", n_skip_bias_dev);
+    }
     if (n_ok_unowned > 0) {
         LLAMA_LOG_WARN("moe-heat-split: %d host-expert layers are owned by the CPU or a meta device — not packable in the per-device form\n",
                 n_ok_unowned);
