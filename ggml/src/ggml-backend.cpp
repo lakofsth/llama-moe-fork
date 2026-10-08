@@ -818,6 +818,7 @@ struct ggml_backend_sched {
     int next_copy;
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     ggml_backend_event_t overlap_events[GGML_SCHED_MAX_BACKENDS]; // fork: LLAMA_MOE_OVERLAP eager copies
+    ggml_backend_event_t h2d_events[GGML_SCHED_MAX_BACKENDS];     // fork (posture M1): recorded after each async host->device input copy
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1733,6 +1734,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // event the host waits on for them instead of draining the device stream (see the overlap cut)
     std::vector<const ggml_tensor *> prefetched;
     ggml_backend_event_t prefetch_event = NULL;
+    // fork (posture M1): per backend, whether an async host->device input copy issued by this
+    // call may still be in flight on that backend's stream. Set at the async_h2d copy, cleared
+    // by any ggml_backend_synchronize of that backend here, and drained (a) before a host
+    // backend computes, (b) before a copy that writes host memory, (c) before returning — so
+    // the caller's next host write (set_inputs of the next ubatch, a user input) never lands on
+    // bytes a DMA is still reading. LLAMA_SCHED_SYNC_COPIES=1 never sets a bit (stock path).
+    bool h2d_pending[GGML_SCHED_MAX_BACKENDS] = { false };
+    // The wait is on the EVENT recorded behind the copies, never the whole stream: under
+    // LLAMA_MOE_OVERLAP the host split H runs while the device runs S2, and a stream-wide
+    // synchronize here would wait for S2 too and cancel the overlap on every layer. Where a
+    // device has no events, the stream synchronize is the fallback (overlap lost there anyway).
+    auto h2d_drain = [](ggml_backend_sched_t s, bool * pend, int except_backend_id) {
+        for (int b = 0; b < s->n_backends; b++) {
+            if (pend[b] && b != except_backend_id) {
+                if (s->h2d_events[b] != NULL) {
+                    ggml_backend_event_synchronize(s->h2d_events[b]);
+                } else {
+                    ggml_backend_synchronize(s->backends[b]);
+                }
+                pend[b] = false;
+            }
+        }
+    };
+    auto split_is_host = [](ggml_backend_t backend) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        return dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    };
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1746,6 +1774,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                h2d_pending[prev_backend_id] = false;
             }
         }
 
@@ -1756,6 +1785,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // LLAMA_SCHED_SYNC_COPIES=1 restores the stock per-input sync path.
         static const bool no_async_cross = [] { const char * e = getenv("LLAMA_SCHED_SYNC_COPIES"); return e && atoi(e) != 0; }();
         ggml_backend_t pending_get_sync = NULL;
+
+        // fork (posture M1): a host-side writer must not touch host memory an async host->device
+        // copy is still reading. The copy is stream-ordered on its own device only, so before
+        // this split computes on a HOST backend (its compute overwrites host regions gallocr may
+        // have reused), and before a host-writing copy below, drain every OTHER device's pending
+        // host->device copies. The split's own device needs nothing: same stream, same order.
+        if (split_is_host(split_backend)) {
+            h2d_drain(sched, h2d_pending, -1);
+        }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1781,6 +1819,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
+                    h2d_pending[split_backend_id] = false;
+                }
+                if (dst_host) {
+                    h2d_drain(sched, h2d_pending, split_backend_id); // M1: host write below
                 }
                 ggml_backend_tensor_copy(input, input_cpy);
             } else {
@@ -1792,6 +1834,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
                 } else if (!async_h2d) {
                     ggml_backend_synchronize(split_backend);
+                    h2d_pending[split_backend_id] = false;
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1902,14 +1945,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     if (pending_get_sync != NULL && pending_get_sync != input_backend) {
                         ggml_backend_synchronize(pending_get_sync);
                     }
+                    // M1: this copy writes host memory; a host->device copy still reading it on
+                    // another device is unordered against it (same device: same stream, ordered)
+                    h2d_drain(sched, h2d_pending, ggml_backend_sched_backend_id(sched, input_backend));
                     ggml_backend_tensor_get_async(input_backend, input, input_cpy->data, 0, ggml_nbytes(input));
                     pending_get_sync = input_backend;
                 } else if (async_h2d) {
                     // fork: host -> device crossing. Stream-ordered on the split backend:
                     // runs after prior reads of input_cpy and before the upcoming compute —
-                    // no host-blocking sync at all. (Host source is stable: the producing CPU
-                    // split completed synchronously before dispatch reached this split.)
+                    // no host-blocking sync at all. The host SOURCE is stable until the next
+                    // host write, which h2d_pending guards (posture M1): the producing CPU
+                    // split completed before dispatch reached here, and nothing host-side
+                    // writes again before this backend is drained.
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    if (sched->h2d_events[split_backend_id] == NULL) {
+                        sched->h2d_events[split_backend_id] = ggml_backend_event_new(ggml_backend_get_device(split_backend));
+                    }
+                    if (sched->h2d_events[split_backend_id] != NULL) {
+                        ggml_backend_event_record(sched->h2d_events[split_backend_id], split_backend);
+                    }
+                    h2d_pending[split_backend_id] = true;
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1919,6 +1974,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
+                            h2d_pending[split_backend_id] = false;
+                        }
+                        if (dst_host) {
+                            h2d_drain(sched, h2d_pending, -1); // M1: host write below
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
                     }
@@ -1929,6 +1988,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // fork: complete any batched async device->host input copies before this split computes
         if (pending_get_sync != NULL) {
             ggml_backend_synchronize(pending_get_sync);
+            h2d_pending[ggml_backend_sched_backend_id(sched, pending_get_sync)] = false;
         }
         if (prefetch_event != NULL && ggml_backend_sched_is_host(sched, split_backend_id)) {
             ggml_backend_event_synchronize(prefetch_event); // the copies, not the device split queued after them
@@ -1949,6 +2009,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_sched_is_host(sched, sched->splits[split_id + 2].backend_id) &&
                     !ggml_backend_sched_is_host(sched, split_backend_id) && sched->n_copies == 1) {
                 struct ggml_backend_sched_split * H = &splits[split_id + 2];
+                // M1: these copies write host memory; another device's pending host->device copy
+                // may still be reading it (this device's own is stream-ordered)
+                h2d_drain(sched, h2d_pending, split_backend_id);
                 for (int k = 0; k < H->n_inputs; k++) {
                     struct ggml_tensor * input = H->inputs[k];
                     if (ggml_backend_sched_get_tensor_backend(sched, input) != split_backend || (input->flags & GGML_TENSOR_FLAG_INPUT)) {
@@ -2000,6 +2063,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // TODO: pass backend to the callback, then the user can decide if they want to synchronize
                 ggml_backend_synchronize(split_backend);
+                h2d_pending[split_backend_id] = false;
 
                 if (need && !sched->callback_eval(t, false, sched->callback_eval_user_data)) {
                     break;
@@ -2016,6 +2080,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         prev_backend_id = split_backend_id;
     }
+
+    // fork (posture M1): nothing after this call may write host memory an async host->device
+    // copy is still reading — the caller's next set_inputs reuses these regions
+    h2d_drain(sched, h2d_pending, -1);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -2102,6 +2170,9 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         }
         if (sched->overlap_events[b] != NULL) {
             ggml_backend_event_free(sched->overlap_events[b]);
+        }
+        if (sched->h2d_events[b] != NULL) {
+            ggml_backend_event_free(sched->h2d_events[b]);
         }
     }
     ggml_gallocr_free(sched->galloc);
