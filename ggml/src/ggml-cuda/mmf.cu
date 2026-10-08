@@ -100,6 +100,14 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
 
+    // fork (posture M2): with ids, a slot whose id is a sentinel (out of [0, ne02)) matches no
+    // expert and its dst row is never written — on the slot_map path a duplicate slot is also
+    // skipped. Zero-fill so those (weight-masked) rows are finite, as mmq does; stock ids
+    // (distinct, in range) write every row and the fill is then merely redundant.
+    if (ids) {
+        CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), ctx.stream()));
+    }
+
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;

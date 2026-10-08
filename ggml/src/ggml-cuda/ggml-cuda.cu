@@ -1968,27 +1968,42 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     std::vector<int32_t> tokens_per_expert(ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
-    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
+    // fork (posture M2): one extra, zeroed row at index ne_get_rows — the row every sentinel
+    // slot (id out of [0, ne02), "slot not computed on this branch") gathers its output from
+    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), (ne2 *n_expert_used + 1)* ne0*ts_dst_sorted);
+    CUDA_CHECK(cudaMemsetAsync(dst_sorted.ptr + ne_get_rows*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    // fork (posture M2): every (token, slot) whose id is in range gets its own sorted row —
+    // no per-token `break`, so a duplicate id within a token (the split graph's dummy
+    // encoding) is computed redundantly and masked by the caller, as mm_ids_helper does.
+    // A sentinel slot gets no row and reads the zeroed row ne_get_rows at scatter time.
+    std::vector<char> slot_seen(ne_get_rows, 0);
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
-                    break;
+                    slot_seen[i12*n_expert_used + iex] = 1;
                 }
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+    GGML_ASSERT(ids_to_sorted_host.size() <= size_t(ne_get_rows));
+    for (int64_t i = 0; i < ne_get_rows; ++i) {
+        if (!slot_seen[i]) {
+            ids_from_sorted_host[i] = (int32_t) ne_get_rows; // the zeroed row
+        }
+    }
+    // the src1 gather below reads ne_get_rows indices; pad the unused tail (never consumed by
+    // the per-expert GEMMs, whose rows sum to the in-range count) with a valid row
+    ids_to_sorted_host.resize(ne_get_rows, 0);
 
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
