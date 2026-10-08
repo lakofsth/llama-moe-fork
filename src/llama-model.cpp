@@ -2274,7 +2274,7 @@ bool llama_model_base::moe_heat_projected_gain(int64_t * gain, int64_t * tot) co
         const auto & ms = layers[il].moe_split;
         if (!ms.active() || ms.cur_experts.empty()) continue;
         int64_t sent = 0, lt = 0;
-        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &lt);
+        const int64_t * counts = llama_moe_online_counts((int32_t) il, &sent, &lt);
         if (!counts || lt <= 0) continue;
         if (!moe_heat_score((int) il, counts, sent, sc.data())) continue;
         // the top-G scores' sum: the capture of the set moe_heat_repin would choose
@@ -2569,8 +2569,8 @@ int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out, llam
             return -1;
         }
         int64_t sent = 0, tot = 0;
-        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &tot);
-        const int64_t * hits   = ggml_cpu_moe_online_hits((int32_t) il);
+        const int64_t * counts = llama_moe_online_counts((int32_t) il, &sent, &tot);
+        const int64_t * hits   = llama_moe_online_hits((int32_t) il);
         if (!counts || !hits) continue;
         const float sweeps = L.ffn_gate_up_exps ? 2.0f : 3.0f; // one count per expert matmul
         if (ms.usage.size() != (size_t) n_expert) ms.usage.assign(n_expert, 0.0f);
@@ -2642,7 +2642,7 @@ int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out, llam
         }
         for (float & u : ms.usage) u *= decay;
     }
-    ggml_cpu_moe_online_reset();
+    llama_moe_online_reset();
     return (int) swaps.size();
 }
 

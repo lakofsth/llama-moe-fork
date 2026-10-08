@@ -680,6 +680,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_cpu_moe_online_counts") == 0) {
         return (void *)ggml_cpu_moe_online_counts;
     }
+    if (strcmp(name, "ggml_cpu_moe_online_hits") == 0) {
+        return (void *)ggml_cpu_moe_online_hits;
+    }
     if (strcmp(name, "ggml_cpu_moe_online_reset") == 0) {
         return (void *)ggml_cpu_moe_online_reset;
     }

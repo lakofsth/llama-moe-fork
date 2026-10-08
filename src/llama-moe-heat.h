@@ -30,5 +30,6 @@ bool llama_moe_heat_read_map(
 // never by direct symbol — the same route as ggml_backend_cpu_set_threadpool. Without a
 // CPU backend loaded, counts returns nullptr and the others are no-ops.
 const int64_t * llama_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total);
+const int64_t * llama_moe_online_hits(int32_t il);
 void            llama_moe_online_reset(void);
 void            llama_moe_online_decay(float keep);
