@@ -2329,7 +2329,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // MMQ's per-expert row bound (the distinct-ids invariant) -> garbage tail rows.
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
-        cb(ids_cpu, "ffn_moe_ids_cpu", il);
+        // the counting op matches "ffn_moe_ids_cpu-<il>" by substring: only the model that
+        // owns the process-wide counters gets that name (see llama_model::moe_online_owner)
+        cb(ids_cpu, msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc", il);
         ggml_tensor * map_gpu_use = n_tokens <= 4 ? msplit->map_gpu : msplit->map_gpu_pp;
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, map_gpu_use, sel_flat), n_expert_used, n_tokens);

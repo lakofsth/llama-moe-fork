@@ -64,7 +64,7 @@ struct layer_info {
     // per-expert weight slices, 3 per expert (gate/up/down); only for host-resident layers
     std::vector<expert_slice> slices;
     bool host = false;
-    uint64_t advised[4] = {0, 0, 0, 0}; // 256-bit dedup bitmap — WORKER THREAD ONLY
+    std::vector<uint64_t> advised;      // dedup bitmap, (n_expert+63)/64 words — WORKER THREAD ONLY
 };
 
 } // namespace
@@ -117,6 +117,8 @@ struct llama_moe_prefetch {
     // ---- worker-thread side ----
 
     void advise(layer_info & li, int e) {
+        // the bitmap is sized from n_expert at create; an id outside it would write past it
+        if (e < 0 || e >= n_expert || (size_t) (e >> 6) >= li.advised.size()) return;
         if (li.advised[e >> 6] & (1ull << (e & 63))) return;
         li.advised[e >> 6] |= 1ull << (e & 63);
 #ifdef __linux__
@@ -133,7 +135,7 @@ struct llama_moe_prefetch {
     }
 
     void clear_advised() {
-        for (auto & li : layers) memset(li.advised, 0, sizeof(li.advised));
+        for (auto & li : layers) std::fill(li.advised.begin(), li.advised.end(), 0);
     }
 
     // predict layer T's top-k experts from state x (pre-norm, [n_embd]) and advise
@@ -261,6 +263,8 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
     p->n_expert = (int) hp.n_expert;
     p->n_used   = (int) hp.n_expert_used(); // upstream #25444: per-layer accessor; deepseek4 graph uses layer 0 too
     p->n_hash   = (int) hp.dsv4_hash_layer_count;
+    // nth_element with k past the end is undefined; a tiny expert bank caps the lookahead
+    p->k        = std::min(p->k, p->n_expert);
     p->rms_eps  = hp.f_norm_rms_eps;
 #ifdef __linux__
     p->page = sysconf(_SC_PAGESIZE);
@@ -279,6 +283,7 @@ llama_moe_prefetch_ptr llama_moe_prefetch_create(const llama_model & model) {
         for (auto * t : exps) {
             if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) || !t->data) { host = false; break; }
         }
+        li.advised.assign(((size_t) p->n_expert + 63) / 64, 0);
         if (host) {
             li.slices.resize((size_t) 3 * p->n_expert);
             for (int j = 0; j < 3; j++) {
