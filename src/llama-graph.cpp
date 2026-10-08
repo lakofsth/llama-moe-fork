@@ -2350,7 +2350,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // the counting op matches "ffn_moe_ids_cpu-<il>" by substring: only the model that
         // owns the process-wide counters gets that name (see llama_model::moe_online_owner)
         cb(ids_cpu, msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc", il);
-        ggml_tensor * map_gpu_use = n_tokens <= 4 ? msplit->map_gpu : msplit->map_gpu_pp;
+        // The dummy-0 encoding (a CPU-resident slot re-labelled as packed expert 0, weight-masked)
+        // is a contract only the quantized kernels honour: mmvq/mmq compute every (token, slot)
+        // pair. mmf — the path for F16/BF16/F32 experts up to 16 tokens — keeps ONE slot per
+        // expert per token, chosen by a lane race, and reads that slot's input, so a duplicate id
+        // leaves the real slot zero or computed from a dummy's activations (posture M2,
+        // test_mul_mat_id_fork_ids mode 2/3, 2026-10-08). Non-quantized experts take the sentinel
+        // encoding on every batch shape; every kernel zero-fills a sentinel row.
+        const ggml_tensor * exps_gpu = msplit->up_gpu ? msplit->up_gpu : msplit->gate_up_gpu; // merged form has no up_gpu
+        const bool dummy_ok = exps_gpu != nullptr && ggml_is_quantized(exps_gpu->type);
+        ggml_tensor * map_gpu_use = (n_tokens <= 4 && dummy_ok) ? msplit->map_gpu : msplit->map_gpu_pp;
         ggml_tensor * ids_gpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, map_gpu_use, sel_flat), n_expert_used, n_tokens);
         cb(ids_gpu, "ffn_moe_ids_gpu", il);
