@@ -2760,7 +2760,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "LLAMA_MOE_HEAT_FILE still wins. Sets LLAMA_MOE_HEAT_LABEL.",
         [](common_params & params, const std::string & value) {
             GGML_UNUSED(params);
+            // fork (posture L6): setenv is POSIX; MSVC has _putenv_s
+#ifdef _WIN32
+            _putenv_s("LLAMA_MOE_HEAT_LABEL", value.c_str());
+#else
             setenv("LLAMA_MOE_HEAT_LABEL", value.c_str(), 1);
+#endif
         }
     ).set_env("LLAMA_MOE_HEAT_LABEL"));
     add_opt(common_arg(

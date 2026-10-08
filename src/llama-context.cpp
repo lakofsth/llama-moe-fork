@@ -5,13 +5,12 @@
 #include "llama-graph.h"
 #include "llama-impl.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
+#include "llama-moe-heat.h" // fork: online-heat counter access (registry-resolved)
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -2161,7 +2160,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 int64_t sent_all = 0, tot_all = 0;
                 for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                     int64_t s = 0, t = 0;
-                    if (ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
+                    if (llama_moe_online_counts((int32_t) il, &s, &t)) { sent_all += s; tot_all += t; }
                 }
                 // fork/two-card U2: the same window split by the device holding each layer's
                 // pack (llama_moe_split::dev_idx) — hits (sentinel ids: routed to that
@@ -2178,7 +2177,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         const auto & ms = model.layers[il].moe_split;
                         if (!ms.active() || ms.dev_idx < 0) continue;
                         int64_t s = 0, t = 0;
-                        if (!ggml_cpu_moe_online_counts((int32_t) il, &s, &t)) continue;
+                        if (!llama_moe_online_counts((int32_t) il, &s, &t)) continue;
                         if ((size_t) ms.dev_idx >= acc.size()) acc.resize(ms.dev_idx + 1);
                         auto & a = acc[ms.dev_idx];
                         a.dev = ms.dev; a.s += s; a.t += t; a.n_layers++;
@@ -2215,19 +2214,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (dirpos != std::string::npos) {
                         const std::string dir = sc.substr(0, dirpos);
                         // best-effort mkdir -p of the single leaf we own
-                        if (access(dir.c_str(), W_OK) != 0) {
+                        if (LLAMA_FORK_ACCESS(dir.c_str(), W_OK) != 0) {
                             const size_t par = dir.rfind('/');
                             if (par != std::string::npos) {
-                                mkdir(dir.substr(0, par).c_str(), 0755);
+                                LLAMA_FORK_MKDIR(dir.substr(0, par).c_str());
                             }
-                            mkdir(dir.c_str(), 0755);
+                            LLAMA_FORK_MKDIR(dir.c_str());
                         }
                     }
                     std::vector<float> map((size_t) hparams.n_layer() * hparams.n_expert, 0.0f);
                     bool any = false;
                     for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                         int64_t s2 = 0, t2 = 0;
-                        const int64_t * c = ggml_cpu_moe_online_counts((int32_t) il, &s2, &t2);
+                        const int64_t * c = llama_moe_online_counts((int32_t) il, &s2, &t2);
                         if (!c || t2 == 0) continue;
                         // a split layer's GPU-packed experts reach the CPU op only as SENTINELS, so
                         // raw counts are the COLD set's and the persisted map was the inverse of the
@@ -2248,7 +2247,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                                 LLAMA_LOG_WARN("moe-heat-split: persisted map for workload '%s' (%lld routings)\n",
                                         getenv("LLAMA_MOE_HEAT_LABEL"), (long long) tot_all);
                             } else {
-                                unlink(tmp.c_str());
+                                LLAMA_FORK_UNLINK(tmp.c_str());
                             }
                         }
                     }
@@ -2257,7 +2256,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (FILE * df = fopen(dp, "w")) {
                         for (uint32_t il = 0; il < hparams.n_layer(); il++) {
                             int64_t s = 0, t = 0;
-                            const int64_t * c = ggml_cpu_moe_online_counts((int32_t) il, &s, &t);
+                            const int64_t * c = llama_moe_online_counts((int32_t) il, &s, &t);
                             if (!c || t == 0) continue;
                             fprintf(df, "layer %u total %lld", il, (long long) t);
                             for (uint32_t e = 0; e < hparams.n_expert; e++) fprintf(df, " %lld", (long long) c[e]);
@@ -2285,14 +2284,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                                            100.0*hit, 100.0*thresh, swapped);
                             log_per_dev_tally(); // the window that triggered the repin
                         }
-                        ggml_cpu_moe_online_decay(keep); // fade pre-repin (placement-stale) history
+                        llama_moe_online_decay(keep); // fade pre-repin (placement-stale) history
                     } else {
                         if (trace) {
                             LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%% >= %.0f%% (window %lld ids) -> healthy, decay x%.2f\n",
                                            100.0*hit, 100.0*thresh, (long long) tot_all, keep);
                             log_per_dev_tally();
                         }
-                        ggml_cpu_moe_online_decay(keep);
+                        llama_moe_online_decay(keep);
                     }
                 } else if (trace) {
                     LLAMA_LOG_WARN("moe-heat-online: window %lld ids < %ld min, accumulating (hit-rate so far %.1f%%)\n",

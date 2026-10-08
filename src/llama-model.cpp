@@ -9,7 +9,7 @@
 #include "llama-model-loader.h"
 #include "llama-moe-heat.h"
 
-#include "ggml-cpu.h" // fork: online-heat counters
+#include "ggml-cpu.h" // fork: GGML_CPU_MOE_ONLINE_MAX_* (header only; the counters are reached through the registry, see llama-moe-heat.h)
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1599,7 +1599,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     std::string sidecar;
     if (!hf || !*hf) {
         sidecar = llama_moe_heat_sidecar_path();
-        if (!sidecar.empty() && access(sidecar.c_str(), R_OK) == 0) {
+        if (!sidecar.empty() && LLAMA_FORK_ACCESS(sidecar.c_str(), R_OK) == 0) {
             hf = sidecar.c_str();
             LLAMA_LOG_INFO("moe-heat-split: using persisted map for workload '%s' (%s)\n",
                     getenv("LLAMA_MOE_HEAT_LABEL"), hf);
@@ -2118,7 +2118,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
             const llama_model * expected = nullptr;
             if (g_moe_online_owner.compare_exchange_strong(expected, &model)) {
                 model.moe_online_owner = true;
-                ggml_cpu_moe_online_reset(); // a previous owner's history must not seed this model
+                llama_moe_online_reset(); // a previous owner's history must not seed this model
                 for (int il = 0; il < n_layer; il++) {
                     if (model.layers[il].moe_split.active()) model.layers[il].moe_split.online_counted = true;
                 }
@@ -2197,7 +2197,7 @@ int llama_model_base::moe_heat_repin() {
         any_active = true;
 
         int64_t sent = 0, tot = 0;
-        const int64_t * counts = ggml_cpu_moe_online_counts((int32_t) il, &sent, &tot);
+        const int64_t * counts = llama_moe_online_counts((int32_t) il, &sent, &tot);
         if (!counts || tot <= 0) continue;
 
         const size_t G = ms.cur_experts.size();
@@ -2329,7 +2329,7 @@ int llama_model_base::moe_heat_repin() {
     }
 
     if (!any_active) return -1;
-    ggml_cpu_moe_online_reset();
+    llama_moe_online_reset();
     return swapped_total;
 }
 
