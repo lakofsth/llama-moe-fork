@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "llama-moe-heat.h"
 
 #include "ggml-cpu.h" // fork: online-heat counters
 
@@ -1623,24 +1624,22 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     const int n_layer  = (int) model.layers.size();
     const int n_expert = (int) model.hparams.n_expert;
 
-    std::vector<float> heat((size_t) n_layer * n_expert, 0.0f);
-    FILE * f = fopen(hf, "rb");
     // A map persisted by --moe-heat-label has hparams.n_layer() rows, which EXCLUDES trailing NextN
     // layers, while model.layers is sized n_layer_all (glm5next: 45 vs 46). Accept that shorter form
-    // and leave the NextN rows at zero heat (never packed); any other size is still refused.
+    // and leave the NextN rows at zero heat (never packed); any other size is refused — including a
+    // LONGER file (posture L4), which is another model's map under the same label, not this one's.
     // (2026-09-30: GLM-5.3-Flash's first converged map was otherwise "ignored" by its own bench.)
-    const size_t n_read = f ? fread(heat.data(), sizeof(float), heat.size(), f) : 0;
-    const size_t n_short = (size_t) model.hparams.n_layer() * n_expert;
-    if (!f || (n_read != heat.size() && !(n_read == n_short && n_short < heat.size() && feof(f)))) {
-        LLAMA_LOG_WARN("moe-heat-split: cannot read %d x %d f32 from '%s' — ignored\n", n_layer, n_expert, hf);
-        if (f) fclose(f);
+    std::vector<float> heat;
+    std::string map_err;
+    bool map_padded = false;
+    if (!llama_moe_heat_read_map(hf, n_layer, n_expert, (int) model.hparams.n_layer(), heat, map_err, &map_padded)) {
+        LLAMA_LOG_WARN("moe-heat-split: cannot read %d x %d f32 from '%s' (%s) — ignored\n", n_layer, n_expert, hf, map_err.c_str());
         return;
     }
-    if (n_read != heat.size()) {
+    if (map_padded) {
         LLAMA_LOG_WARN("moe-heat-split: map '%s' has %u rows (persisted form, NextN excluded); padded to %d\n",
                 hf, model.hparams.n_layer(), n_layer);
     }
-    fclose(f);
 
     // fork/two-card U1: budget. Two forms, told apart by a comma.
     //   unset or ONE value (legacy form): one pack on the FIRST non-meta GPU, every host
