@@ -244,6 +244,17 @@ int main() {
             }
         }
 
+        // 6. GPU only: a tie at the cut on rows wide enough for the radix-select top-k (> 1024 columns, > 1 row).
+        //    The lowest blocks among the tied must win, the same on every run (ggml-cuda top-k.cu, top_k_radix_ties);
+        //    the CPU's partial_sort promises no tie order, so the CPU is not held to it.
+        if (name != "CPU") {
+            scene s { 4, 2048, 3, 1, 512, { 8190, 6001, 4100 }, {} };
+            for (int64_t t = 0; t < 3; ++t) {
+                for (int64_t b = 0; b < 2048; ++b) s.blk_score.push_back(b % 5 == 0 ? 1.0f : 0.0f);  // fewer than 512 at 1: the cut falls among the 0s
+            }
+            for (int rep = 0; rep < 5; ++rep) check_exact(be, ("radix tie at the cut, run " + std::to_string(rep)).c_str(), s);
+        }
+
         printf("== backend %s: %s\n", name.c_str(), fails == before ? "PASS" : "FAIL");
     }
 

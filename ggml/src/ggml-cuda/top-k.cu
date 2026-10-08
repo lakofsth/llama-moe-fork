@@ -51,7 +51,10 @@ static int next_power_of_2(int x) {
 // fork (fork-kernel-fusion, 2026-10-07): the radix-select top-k below is compiled for CUDA too. It takes every row in
 // ~10 launches whatever ncols is, where CUB DeviceTopK is single-row: qwen4exp's DSA indexer runs top-k over n_kv
 // context cells for every query row, and per-row CUB was 49,152 DeviceTopK launches per 2048-token micro-batch
-// (p0/run-20261007T1301*). Ties at the k-th key are resolved in atomic order, as unordered as CUB's not_guaranteed.
+// (p0/run-20261007T1301*). Keys above the k-th key are written in atomic order (a set, unordered); when more keys
+// equal the k-th key than slots remain, the lowest columns among them win (top_k_radix_ties, 2026-10-08), so the
+// SET a row selects is a function of its values: qwen4exp's indexer scores blocks through a relu, and blocks tied
+// at 0 at the cut otherwise changed what a query attends from run to run (topk-block/gate-20261008T133236Z).
 #if defined(GGML_USE_HIP) || defined(CUB_TOP_K_AVAILABLE)
 
 static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
@@ -66,12 +69,13 @@ struct top_k_radix_state {
     int rank;
     int greater_count;
     int equal_count;
+    int equal_total; // keys equal to the k-th key, from the last select pass: > rank means a tie at the cut
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k, 0, 0, 0};
     }
 }
 
@@ -138,6 +142,7 @@ static __global__ void top_k_radix_select(
         }
         state.prefix |= (uint32_t) bin << shift;
         state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+        state.equal_total = histogram[bin];
         states[row] = state;
     }
 }
@@ -172,12 +177,52 @@ static __global__ void top_k_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
+        } else if (key == state->prefix && state->equal_total <= state->rank) {
+            // every equal key is taken, so their order does not matter; a tie at the cut is top_k_radix_ties'
             const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
-            }
+            row_dst[k - state->rank + pos] = col;
         }
+    }
+}
+
+// a tie at the cut (more keys equal to the k-th key than slots left): fill the slots with the lowest such columns,
+// scanning the row in column order, one block per row; rows without a tie return at once
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_ties(
+        const float * __restrict__ src,
+        int * __restrict__ dst,
+        const top_k_radix_state * __restrict__ states,
+        int ncols,
+        int k) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const top_k_radix_state state = states[row];
+    if (state.equal_total <= state.rank) {
+        return;
+    }
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k + (k - state.rank);
+
+    __shared__ int scan[BLOCK_SIZE];
+    int filled = 0;
+    for (int base = 0; base < ncols && filled < state.rank; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const int flag = col < ncols && top_k_float_to_ordered(row_src[col]) == state.prefix;
+        scan[tid] = flag;
+        __syncthreads();
+        // inclusive Hillis-Steele scan over the block
+        for (int off = 1; off < BLOCK_SIZE; off *= 2) {
+            const int v = tid >= off ? scan[tid - off] : 0;
+            __syncthreads();
+            scan[tid] += v;
+            __syncthreads();
+        }
+        const int pos = filled + scan[tid] - flag;
+        if (flag && pos < state.rank) {
+            row_dst[pos] = col;
+        }
+        filled += scan[BLOCK_SIZE - 1];
+        __syncthreads();
     }
 }
 
@@ -210,6 +255,8 @@ static void top_k_radix_cuda(
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
             src, dst, states, ncols, k, blocks_per_row);
+    top_k_radix_ties<BLOCK_SIZE>
+        <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
 #endif // defined(GGML_USE_HIP) || defined(CUB_TOP_K_AVAILABLE)
