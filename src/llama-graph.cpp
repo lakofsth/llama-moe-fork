@@ -2009,10 +2009,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 // Expert biases (openai-moe): each bias tensor carries a zero pad row at that
 // branch's sentinel index (see llama_moe_split), so add_id on sentinel/dummy rows is
 // in-range; contaminated rows are weight-masked by the caller exactly like weights.
+// fork (posture L3): which archs apply the clamped SwiGLU as the fused ggml_swiglu_clamp
+// (silu(min(gate, L)) * clamp(up)) rather than the unfused min(silu(gate), L) * clamp(up).
+// ONE predicate for the stock chain and the split chain, so the two cannot drift.
+static bool moe_swiglu_clamp_fused(llm_arch arch, const llama_hparams & hparams) {
+    return arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT ||
+           (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4;
+}
+
 // type_op: LLM_FFN_SILU (clamped-swiglu family) or LLM_FFN_SWIGLU_OAI_MOE (gpt-oss;
 // constants mirror the stock path's).
 static ggml_tensor * moe_ffn_chain_ds4(
         ggml_context * ctx0,
+        llm_arch arch,
         const llama_hparams & hparams,
         ggml_tensor * x,     // [n_embd, 1, n_tokens]
         ggml_tensor * sel,   // I32 [n_expert_used, n_tokens]; out-of-range = sentinel (CPU op zeroes)
@@ -2048,13 +2057,22 @@ static ggml_tensor * moe_ffn_chain_ds4(
         constexpr float limit = 7.0f;
         act = ggml_swiglu_oai(ctx0, gate, up, alpha, limit);
     } else {
+        // fork (posture L3): mirror the stock LLM_FFN_SILU case exactly — the clamp applies
+        // to the separate gate/up form only (stock applies none on merged gate_up), fused
+        // for the archs moe_swiglu_clamp_fused names, unfused min(silu(gate), L) otherwise
         const float limit = il >= 0 ? hparams.swiglu_clamp_exp[il] : 0.0f;
-        if (limit > 1e-6f) {
-            up   = ggml_clamp(ctx0, up, -limit, limit);
-            gate = ggml_clamp(ctx0, gate, -INFINITY, limit);
-            act  = ggml_swiglu_split(ctx0, gate, up);
+        constexpr float eps = 1e-6f;
+        if (gate_up_exps == nullptr && limit > eps) {
+            if (moe_swiglu_clamp_fused(arch, hparams)) {
+                act = ggml_swiglu_clamp(ctx0, gate, up, limit);
+            } else {
+                up = ggml_clamp(ctx0, up, -limit, limit);
+                ggml_tensor * gate_act = ggml_silu(ctx0, gate);
+                gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
+                act = ggml_mul(ctx0, gate_act, up);
+            }
         } else {
-            act  = ggml_swiglu_split(ctx0, gate, up);
+            act = ggml_swiglu_split(ctx0, gate, up);
         }
     }
     ggml_tensor * out = ggml_mul_mat_id(ctx0, down_exps, act, sel);
@@ -2342,11 +2360,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s);
         // CPU branch uses the split's own PADDED bias copies, never the raw *_exps_b
         // args: the CPU sentinel id (n_expert) must resolve to the zero pad row.
-        ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_cpu,
+        ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, arch, hparams, cur, ids_cpu,
                 up_exps, gate_exps, down_exps, gate_up_exps, type_op,
                 msplit->up_b_cpu, msplit->gate_b_cpu, msplit->down_b_cpu, il);
         cb(ex_cpu, "ffn_moe_split_cpu", il);
-        ggml_tensor * ex_gpu = moe_ffn_chain_ds4(ctx0, hparams, cur, ids_gpu,
+        ggml_tensor * ex_gpu = moe_ffn_chain_ds4(ctx0, arch, hparams, cur, ids_gpu,
                 msplit->up_gpu, msplit->gate_gpu, msplit->down_gpu, msplit->gate_up_gpu, type_op,
                 msplit->up_b_gpu, msplit->gate_b_gpu, msplit->down_b_gpu, il);
         cb(ex_gpu, "ffn_moe_split_gpu", il);
@@ -2421,7 +2439,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
-                        if (arch == LLM_ARCH_MAPLE || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || (arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) || arch == LLM_ARCH_HY_V4) {
+                        if (moe_swiglu_clamp_fused(arch, hparams)) {
                             cur = ggml_swiglu_clamp(ctx0, cur, up, limit);
                         } else {
                             up = ggml_clamp(ctx0, up, -limit, limit);
