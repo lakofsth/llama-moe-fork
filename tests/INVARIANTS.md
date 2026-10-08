@@ -17,3 +17,9 @@ One sentence per invariant; each names the test that pins it.
   layer to its per-layer cap while the device budget lasts — zero-heat experts after every positive one — and
   its selection contains the selection made without it; without the variable the selection is the packer's
   previous one. Pinned by `tests/test-moe-heat-select.cpp` (red with the zero-heat candidates dropped under fill).
+- **S1 (fork-kernel-fusion, 2026-10-08).** The cells a qwen4exp QSA query attends are a function of its block scores
+  alone: its top indexer_top_k/ratio whole blocks among the whole blocks wholly before its tail, plus every cell of
+  its tail (positions tail_start..q), and nothing else. No block other than the tail is ever attended in part, so no
+  tie among the cells of one block can change what is attended. (Exact ties between two blocks' scores at the cut
+  remain the top-k kernel's to order.) Test: tests/test-qsa-select.cpp (llama_qsa_select_cells); end to end, a
+  5,864-token prompt pass at temperature 0 repeats bit-exact under the deterministic config.
