@@ -1,5 +1,7 @@
 #include "llama-moe-heat.h"
 
+#include "ggml-backend.h"
+
 #include <cstdio>
 
 bool llama_moe_heat_read_map(
@@ -51,4 +53,43 @@ bool llama_moe_heat_read_map(
         heat.assign(n_full, 0.0f);
     }
     return ok;
+}
+
+// ---- online counters via the CPU backend's proc-address table (posture L6)
+
+namespace {
+struct llama_moe_online_fns {
+    const int64_t * (*counts)(int32_t, int64_t *, int64_t *) = nullptr;
+    void (*reset)(void) = nullptr;
+    void (*decay)(float) = nullptr;
+    bool resolved = false;
+};
+
+llama_moe_online_fns & llama_moe_online_resolve() {
+    static llama_moe_online_fns fns;
+    if (!fns.resolved) {
+        fns.resolved = true;
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CPU")) {
+            fns.counts = (const int64_t * (*)(int32_t, int64_t *, int64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_online_counts");
+            fns.reset  = (void (*)(void))  ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_online_reset");
+            fns.decay  = (void (*)(float)) ggml_backend_reg_get_proc_address(reg, "ggml_cpu_moe_online_decay");
+        }
+    }
+    return fns;
+}
+} // namespace
+
+const int64_t * llama_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total) {
+    auto & f = llama_moe_online_resolve();
+    return f.counts ? f.counts(il, sentinel, total) : nullptr;
+}
+
+void llama_moe_online_reset(void) {
+    auto & f = llama_moe_online_resolve();
+    if (f.reset) f.reset();
+}
+
+void llama_moe_online_decay(float keep) {
+    auto & f = llama_moe_online_resolve();
+    if (f.decay) f.decay(keep);
 }
