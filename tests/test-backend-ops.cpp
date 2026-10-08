@@ -5271,6 +5271,51 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// fork (posture M2): the heat split's id contract — an id outside [0, n_mats) is a SENTINEL
+// ("slot not computed on this branch": the shared n_mats, or the per-expert n_mats+1+e) and
+// its output row is exact zeros; a DUPLICATE id within a token (the dummy encoding) is computed
+// as many times as it appears. The CPU op is the reference, so every CUDA path (mmq, mmvq, mmf,
+// mmvf, the cuBLAS fallback) must agree with it on these ids. mode: 1 sentinels, 2 duplicates,
+// 3 both.
+struct test_mul_mat_id_fork_ids : public test_mul_mat_id {
+    const int mode;
+    test_mul_mat_id_fork_ids(ggml_type type_a, ggml_type type_b, int n_mats, int n_used, bool b,
+            int64_t m, int64_t n, int64_t k, int mode)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), mode(mode) {
+        GGML_ASSERT(n_used >= 2);
+    }
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, amax, mode);
+    }
+    void set_ids(ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = (i + (int) r) % n_mats;        // distinct, in range, rotated per token
+                }
+                if (mode & 1) {
+                    data[0] = (r % 2 == 0) ? n_mats : n_mats + 1 + (int) (r % n_mats); // shared / per-expert sentinel
+                }
+                if (mode & 2) {
+                    data[1] = data[(mode & 1) ? 2 % t->ne[0] : 0];  // a duplicate of an in-range slot
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, amax);
+        set_ids(ctx);
+    }
+    void reinit_perf_iter(ggml_context * ctx) override {
+        set_ids(ctx);
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -10205,6 +10250,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         // experts that receive no rows at all
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
+    }
+
+    // fork (posture M2): sentinel / duplicate ids on every CUDA mul_mat_id path — n spans the
+    // mat-vec (<= 8), mmf (<= 16), mmq (>= 32 quantized) and cuBLAS-fallback (F16/F32 at 32+) rows
+    for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0}) {
+        for (int n : {1, 2, 4, 8, 16, 32, 64}) {
+            for (int mode : {1, 2, 3}) {
+                test_cases.emplace_back(new test_mul_mat_id_fork_ids(type_a, GGML_TYPE_F32, 8, 4, false, 512, n, 256, mode));
+            }
+        }
     }
 
     for (ggml_type type_a : other_types) {
