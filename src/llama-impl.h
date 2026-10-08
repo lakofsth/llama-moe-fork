@@ -7,6 +7,28 @@
 #include <vector>
 #include <cstdlib>
 
+// fork (posture L6): the heat-map sidecar is probed and written with POSIX calls; one
+// mapping for every translation unit that touches it (llama-model.cpp, llama-context.cpp)
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#ifndef R_OK
+#define R_OK 4
+#endif
+#ifndef W_OK
+#define W_OK 2
+#endif
+#define LLAMA_FORK_ACCESS(path, mode) _access((path), (mode))
+#define LLAMA_FORK_MKDIR(path)        _mkdir(path)
+#define LLAMA_FORK_UNLINK(path)       _unlink(path)
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#define LLAMA_FORK_ACCESS(path, mode) access((path), (mode))
+#define LLAMA_FORK_MKDIR(path)        mkdir((path), 0755)
+#define LLAMA_FORK_UNLINK(path)       unlink(path)
+#endif
+
 // fork: per-WORKLOAD heat-map sidecar. LLAMA_MOE_HEAT_LABEL (or --moe-heat-label) names
 // the workload; the converged routing map is persisted under that label and reloaded on
 // the next run, so a serve of the same shape does not pay the flat-map bootstrap again.
