@@ -978,8 +978,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // one spare cell per row: a tail slot with no cell names the sentinel n_kv, which lands there and is dropped
     const int64_t n_kv = kq_mask->ne[0];
 
-    ggml_tensor * kq_mask_all = ggml_new_tensor_4d(ctx0, kq_mask->type, n_kv + 1, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-    kq_mask_all = ggml_fill(ctx0, kq_mask_all, -INFINITY);
+    // grown from one -inf element, not from a fresh tensor: a tensor with no op is a graph leaf, which the allocator
+    // keeps for the whole graph, so every QSA layer would hold its own copy (OOM at reserve with a 262144-cell cache)
+    ggml_tensor * mask_seed = ggml_fill(ctx0, ggml_view_1d(ctx0, kq_mask, 1, 0), -INFINITY);
+    ggml_tensor * kq_mask_all = ggml_repeat_4d(ctx0, mask_seed, n_kv + 1, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
 
     // reshape KQ mask into tensor with rows of size 1:
     // [n_kv + 1, n_batch, 1, n_stream] -> [1, n_kv + 1, n_batch, n_stream]
