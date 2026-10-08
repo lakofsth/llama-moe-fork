@@ -1870,6 +1870,26 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
     int n_split_layers = 0;
     for (int il = 0; il < n_layer; il++) if (!sel[il].empty()) n_split_layers++;
 
+    // fork (posture M2): the split's id contract — out-of-range ids are sentinels that a
+    // mul_mat_id kernel skips and zero-fills, duplicate ids within a token are tolerated —
+    // is implemented in the CPU op and in the CUDA kernels (mmvq, mmq, mmf, mmvf, the cuBLAS
+    // fallback, mm_ids_helper). Another backend would read past its expert tensors or abort,
+    // so refuse it. LLAMA_MOE_HEAT_ANY_BACKEND=1 overrides for porting work.
+    {
+        static const bool any_backend = [] { const char * e = getenv("LLAMA_MOE_HEAT_ANY_BACKEND"); return e && atoi(e) != 0; }();
+        for (const auto & p : pd) {
+            if (p.n_split_layers == 0 || !p.dev) continue;
+            const char * reg = ggml_backend_reg_name(ggml_backend_dev_backend_reg(p.dev));
+            const bool cuda_family = reg && (strcmp(reg, "CUDA") == 0 || strcmp(reg, "ROCm") == 0 || strcmp(reg, "MUSA") == 0);
+            if (!cuda_family && !any_backend) {
+                LLAMA_LOG_WARN("moe-heat-split: pack device %s is a %s device; the split's sentinel-id contract is implemented "
+                               "for the CPU op and the CUDA kernels only — ignored (LLAMA_MOE_HEAT_ANY_BACKEND=1 to force)\n",
+                               ggml_backend_dev_name(p.dev), reg ? reg : "?");
+                return;
+            }
+        }
+    }
+
     // one context per pack device that took a layer (legacy form: exactly the one
     // context the single-device packer built, sized the same)
     for (auto & p : pd) {
