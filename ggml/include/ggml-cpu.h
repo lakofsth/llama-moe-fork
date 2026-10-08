@@ -148,6 +148,11 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
     // fork: online MoE expert-heat counters (LLAMA_MOE_HEAT_ONLINE=1) — filled by the
+    // split-graph CPU branch. ONE counter table per process: callers claim it (see
+    // llama_model's moe_online_owner) and a model beyond these bounds is not counted.
+#define GGML_CPU_MOE_ONLINE_MAX_LAYERS  128
+#define GGML_CPU_MOE_ONLINE_MAX_EXPERTS 1024
+    //
     // split-graph CPU branch; cold experts get exact counts, GPU-resident hits land in
     // *sentinel. Returns per-expert counts for layer il, or NULL if il out of range.
     GGML_BACKEND_API const int64_t * ggml_cpu_moe_online_counts(int32_t il, int64_t * sentinel, int64_t * total);
