@@ -274,6 +274,10 @@ struct llama_moe_split {
     ggml_backend_dev_t dev     = nullptr;
     int                dev_idx = -1;
 
+    // fork: true only on the model that owns the process-wide online counters; the graph
+    // names this layer's CPU-branch ids so the counting op sees them only then
+    bool online_counted = false;
+
     bool active() const { return gate_gpu != nullptr || gate_up_gpu != nullptr; }
 };
 
@@ -771,6 +775,15 @@ struct llama_model {
 
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+
+    // fork: this model holds the process-wide online MoE heat counters (ggml-cpu keeps one
+    // table). A second model loaded into the same process runs its split without online
+    // counting or repin instead of sharing — and corrupting — the first one's counters.
+    bool moe_online_owner = false;
+
+    // fork: take ownership of a context and its buffers so they are freed with the model
+    // (the heat split's packed tensors); pimpl is protected, hence a method
+    void adopt_ctx_bufs(ggml_context * ctx, std::vector<ggml_backend_buffer_t> bufs);
 
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;

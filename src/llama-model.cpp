@@ -28,6 +28,7 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -1292,7 +1293,20 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
 
+// fork: the one model per process that owns ggml-cpu's online heat counter table
+static std::atomic<const llama_model *> g_moe_online_owner{nullptr};
+
+void llama_model::adopt_ctx_bufs(ggml_context * ctx, std::vector<ggml_backend_buffer_t> bufs) {
+    std::vector<ggml_backend_buffer_ptr> owned;
+    for (auto * b : bufs) { if (b) owned.emplace_back(b); }
+    pimpl->ctxs_bufs.emplace_back(ggml_context_ptr(ctx), std::move(owned));
+}
+
 llama_model::~llama_model() {
+    if (moe_online_owner) {
+        const llama_model * me = this;
+        g_moe_online_owner.compare_exchange_strong(me, nullptr);
+    }
     for (auto * lora : loras) {
         delete lora;
     }
@@ -2031,18 +2045,36 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         ms.dev_idx = per_dev ? ldev[il] : 0; // legacy form packs on the first GPU = index 0
     }
 
-    // process-lifetime ownership (milestone 1: never freed before exit)
-    static std::vector<ggml_context *>         s_ctx;
-    static std::vector<ggml_backend_buffer_t>  s_buf;
-    static ggml_context * s_ctx_host = nullptr;
-    static ggml_backend_buffer_t s_buf_host = nullptr;
-    for (const auto & p : pd) {
-        if (p.ctx) s_ctx.push_back(p.ctx);
-        if (p.buf) s_buf.push_back(p.buf);
+    // ownership: the packed contexts and buffers live exactly as long as the model (they
+    // join the model's own ctxs_bufs, freed by its destructor). Until 2026-10-08 these were
+    // process-lifetime statics, so every model reload in one process leaked a full pack.
+    for (auto & p : pd) {
+        if (!p.ctx) continue;
+        model.adopt_ctx_bufs(p.ctx, { p.buf });
+        p.ctx = nullptr; p.buf = nullptr;
     }
-    s_ctx_host = ctx_host;
-    s_buf_host = buf_host;
-    (void) s_ctx_host; (void) s_buf_host;
+    model.adopt_ctx_bufs(ctx_host, { buf_host });
+
+    // online counting: one table per process (ggml-cpu), so one owner per process. A model
+    // that cannot claim it, or that exceeds the table's bounds, keeps its split and runs
+    // without counting/repin; its graph names the ids so the counting op ignores them.
+    if (const char * e = getenv("LLAMA_MOE_HEAT_ONLINE"); e && atoi(e) != 0) {
+        if (n_expert > GGML_CPU_MOE_ONLINE_MAX_EXPERTS || n_layer > GGML_CPU_MOE_ONLINE_MAX_LAYERS) {
+            LLAMA_LOG_WARN("moe-heat-online: %d experts x %d layers exceeds the counter table (%d x %d) — online counting/repin disabled for this model\n",
+                    n_expert, n_layer, GGML_CPU_MOE_ONLINE_MAX_EXPERTS, GGML_CPU_MOE_ONLINE_MAX_LAYERS);
+        } else {
+            const llama_model * expected = nullptr;
+            if (g_moe_online_owner.compare_exchange_strong(expected, &model)) {
+                model.moe_online_owner = true;
+                ggml_cpu_moe_online_reset(); // a previous owner's history must not seed this model
+                for (int il = 0; il < n_layer; il++) {
+                    if (model.layers[il].moe_split.active()) model.layers[il].moe_split.online_counted = true;
+                }
+            } else {
+                LLAMA_LOG_WARN("moe-heat-online: another model in this process already owns the online counters — online counting/repin disabled for this model\n");
+            }
+        }
+    }
 
     int gmin = n_expert, gmax = 0;
     for (int il = 0; il < n_layer; il++) {
@@ -2064,7 +2096,7 @@ bool llama_model_base::moe_heat_score(int il, const int64_t * counts, int64_t se
     const auto & ms = layers[il].moe_split;
     if (!ms.active() || ms.cur_experts.empty()) return false;
     const int n_expert = (int) hparams.n_expert;
-    for (int e = 0; e < n_expert; e++) out[e] = (float) counts[e];
+    for (int e = 0; e < n_expert; e++) out[e] = e < GGML_CPU_MOE_ONLINE_MAX_EXPERTS ? (float) counts[e] : 0.0f;
     double hshare_sum = 0.0;
     for (float h : ms.cur_heat) hshare_sum += h;
     const size_t G = ms.cur_experts.size();
@@ -2076,6 +2108,7 @@ bool llama_model_base::moe_heat_score(int il, const int64_t * counts, int64_t se
 }
 
 int llama_model_base::moe_heat_repin() {
+    if (!moe_online_owner) return -1; // the counters are another model's (or nobody's)
     static const bool do_evict = [] { const char * e = getenv("LLAMA_MOE_HEAT_EVICT"); return e && atoi(e) != 0; }();
     static const int max_swaps = [] { const char * e = getenv("LLAMA_MOE_REPIN_MAX_SWAPS"); return e ? atoi(e) : 0; }(); // default OFF: measured 9x384-swap thrash vs one 1403-swap pass (-13% tg) — partial maps make the desired set drift
     // fork/two-card U3: a COMMA LIST gives one cap per pack device (llama_moe_split::dev_idx,
@@ -2119,7 +2152,7 @@ int llama_model_base::moe_heat_repin() {
 
         // score every expert in a common (count) scale
         std::vector<double> score(n_expert, 0.0);
-        for (int e = 0; e < n_expert && e < 1024; e++) score[e] = (double) counts[e];
+        for (int e = 0; e < n_expert && e < GGML_CPU_MOE_ONLINE_MAX_EXPERTS; e++) score[e] = (double) counts[e];
         double hshare_sum = 0.0;
         for (float h : ms.cur_heat) hshare_sum += h;
         for (size_t g = 0; g < G; g++) {
