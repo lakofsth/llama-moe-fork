@@ -5307,12 +5307,44 @@ struct test_mul_mat_id_fork_ids : public test_mul_mat_id {
             }
         }
     }
+    // A duplicate slot's row is UNSPECIFIED but finite: the split graph weight-masks it, and the
+    // kernels differ (mmf/mmvf zero-fill it, mmq/mmvq/cuBLAS compute it again). The graph here
+    // applies the same mask, so both backends compare 0 there — and a NaN/inf left in the row
+    // survives the multiply and still fails. Sentinel rows are compared unmasked: exact zeros.
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        if (mode & 2) {
+            ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+            ggml_set_name(mask, "dupmask");
+            out = ggml_mul(ctx, out, mask);
+            ggml_set_name(out, "out_masked");
+        }
+        return out;
+    }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID";    // the mask's MUL is the comparison's business, not the op under test
+    }
+    void set_mask(ggml_context * ctx) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(ggml_get_name(t), "dupmask") != 0) {
+                continue;
+            }
+            std::vector<float> m(ggml_nelements(t), 1.0f);
+            for (int64_t r = 0; r < n; r++) {
+                m[r * n_used + 1] = 0.0f;   // slot 1 is the duplicate (see set_ids)
+            }
+            ggml_backend_tensor_set(t, m.data(), 0, m.size() * sizeof(float));
+        }
+    }
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, amax);
         set_ids(ctx);
+        set_mask(ctx);
     }
     void reinit_perf_iter(ggml_context * ctx) override {
         set_ids(ctx);
+        set_mask(ctx);
     }
 };
 
@@ -10254,9 +10286,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // fork (posture M2): sentinel / duplicate ids on every CUDA mul_mat_id path — n spans the
     // mat-vec (<= 8), mmf (<= 16), mmq (>= 32 quantized) and cuBLAS-fallback (F16/F32 at 32+) rows
+    // Duplicate ids (the dummy encoding) are a contract of the QUANTIZED kernels only (mmvq, mmq):
+    // mmf keeps one slot per expert per token, so llama routes non-quantized experts through the
+    // sentinel encoding on every batch shape (llama-graph.cpp, dummy_ok). Sentinels: every type.
     for (ggml_type type_a : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_0}) {
         for (int n : {1, 2, 4, 8, 16, 32, 64}) {
             for (int mode : {1, 2, 3}) {
+                if (mode != 1 && !ggml_is_quantized(type_a)) {
+                    continue;
+                }
                 test_cases.emplace_back(new test_mul_mat_id_fork_ids(type_a, GGML_TYPE_F32, 8, 4, false, 512, n, 256, mode));
             }
         }
