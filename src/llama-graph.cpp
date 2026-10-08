@@ -2353,11 +2353,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // GPU branch: dummy 0 for tg (mmvq path, weight-masked, proven); sentinel G for pp —
         // dummy encoding there concentrates >n_tokens rows on packed expert 0 and overflows
         // MMQ's per-expert row bound (the distinct-ids invariant) -> garbage tail rows.
+        // fork (fork-kernel-fusion): LLAMA_MOE_PREFETCH_PP=R — a prompt batch of at least LLAMA_MOE_PREFETCH_PP_MIN
+        // rows (default 1024, never below the 32-row op_offload bound) reads the host branch's experts from the
+        // scheduler's prefetch slot, so its ids are COMPACT (map_cpu_pf, the slot order) and the tensor carries the
+        // name the scheduler keys on. Requires op_offload: on the CPU these ids would select the wrong experts (the
+        // scheduler aborts rather than run them).
+        static const int pf_ring = [] { const char * e = getenv("LLAMA_MOE_PREFETCH_PP"); const int r = e ? atoi(e) : 0; return r > 0 ? r : 0; }();
+        static const int pf_min  = [] { const char * e = getenv("LLAMA_MOE_PREFETCH_PP_MIN"); const int v = e ? atoi(e) : 1024; return v < 32 ? 32 : v; }();
+        const bool use_pf = pf_ring > 0 && msplit->map_cpu_pf != nullptr && cparams.op_offload && n_tokens >= pf_min;
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
-                ggml_get_rows(ctx0, msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
+                ggml_get_rows(ctx0, use_pf ? msplit->map_cpu_pf : msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
         // the counting op matches "ffn_moe_ids_cpu-<il>" by substring: only the model that
         // owns the process-wide counters gets that name (see llama_model::moe_online_owner)
-        cb(ids_cpu, msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc", il);
+        // under the prefetch (LLAMA_MOE_PREFETCH_PP) the ids are compact slot indices, named for the scheduler's plan;
+        // the online counters do not see them (as the stock upload path's prompt traffic is not counted either)
+        cb(ids_cpu, use_pf ? "ffn_moe_ids_pf" : msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc", il);
         // The dummy-0 encoding (a CPU-resident slot re-labelled as packed expert 0, weight-masked)
         // is a contract only the quantized kernels honour: mmvq/mmq compute every (token, slot)
         // pair. mmf — the path for F16/BF16/F32 experts up to 16 tokens — keeps ONE slot per

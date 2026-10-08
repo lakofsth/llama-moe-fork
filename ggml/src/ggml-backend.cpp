@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -819,6 +820,7 @@ struct ggml_backend_sched {
     ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
     ggml_backend_event_t overlap_events[GGML_SCHED_MAX_BACKENDS]; // fork: LLAMA_MOE_OVERLAP eager copies
     ggml_backend_event_t h2d_events[GGML_SCHED_MAX_BACKENDS];     // fork (posture M1): recorded after each async host->device input copy
+    struct ggml_sched_moe_pf * moe_pf; // fork: LLAMA_MOE_PREFETCH_PP slot ring (NULL until first used)
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1720,6 +1722,213 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// fork (fork-kernel-fusion): LLAMA_MOE_PREFETCH_PP=R — copy-stream prefetch of host-resident experts for prompt batches
+// (<design note> §9). The graph addresses a host-branch MUL_MAT_ID's
+// weight through COMPACT ids (tensor "ffn_moe_ids_pf-<il>": index into the layer's plan, the ascending list of its
+// non-resident experts; resident -> out-of-range sentinel). The scheduler never uploads such a weight on the compute
+// stream: a second backend instance of the same device (its own stream) copies entry i's plan into ring slot i % R as
+// soon as entry i-R's matmul has finished reading that slot (event), and entry i's split waits on the upload event
+// and computes with the weight's input copy pointed at the slot. No id readback, no device drain.
+static std::mutex g_moe_pf_mutex;
+static std::unordered_map<const struct ggml_tensor *, std::vector<int32_t>> g_moe_pf_plans;
+
+void ggml_backend_sched_moe_pf_plan(const struct ggml_tensor * host_weight, const int32_t * experts, int n) {
+    std::lock_guard<std::mutex> lock(g_moe_pf_mutex);
+    if (n <= 0) {
+        g_moe_pf_plans.erase(host_weight);
+    } else {
+        g_moe_pf_plans[host_weight].assign(experts, experts + n);
+    }
+}
+
+static int ggml_backend_sched_moe_pf_ring() {
+    static const int v = [] { const char * e = getenv("LLAMA_MOE_PREFETCH_PP"); const int r = e ? atoi(e) : 0; return r > 0 ? r : 0; }();
+    return v;
+}
+
+static bool ggml_backend_sched_moe_pf_ids(const struct ggml_tensor * ids) {
+    return ids != NULL && strstr(ids->name, "ffn_moe_ids_pf") != NULL;
+}
+
+struct ggml_sched_moe_pf {
+    struct entry {
+        int                   split_id;
+        struct ggml_tensor *  input;     // the host weight
+        struct ggml_tensor *  input_cpy; // its copy on the split backend (pointed at the slot while the split computes)
+        std::vector<int32_t>  experts;   // slot order
+        size_t                pad;       // bytes after the last expert the kernels may read (the buffer type's row padding)
+    };
+    int                                 R          = 0;
+    int                                 backend_id = -1;
+    ggml_backend_t                      copy_backend = NULL;
+    std::vector<ggml_backend_buffer_t>  buf;
+    std::vector<struct ggml_context *>  ctx;
+    std::vector<struct ggml_tensor *>   slot;
+    std::vector<size_t>                 size;
+    std::vector<ggml_backend_event_t>   ev_up, ev_read;
+    std::vector<bool>                   read_recorded;
+    std::vector<entry>                  entries;
+    std::vector<int>                    entry_of_split;
+    ggml_backend_buffer_t               zeros = NULL; // pinned host zeros: each upload re-zeroes its entry's pad, which an
+    size_t                              zeros_size = 0; // earlier, longer entry of another tensor type may have overwritten
+
+    void free_slot(int j) {
+        if (buf[j]) { ggml_backend_buffer_free(buf[j]); buf[j] = NULL; }
+        if (ctx[j]) { ggml_free(ctx[j]); ctx[j] = NULL; }
+        slot[j] = NULL; size[j] = 0;
+    }
+    ~ggml_sched_moe_pf() {
+        if (copy_backend) { ggml_backend_synchronize(copy_backend); }
+        for (int j = 0; j < R; j++) {
+            free_slot(j);
+            if (ev_up[j])   { ggml_backend_event_free(ev_up[j]); }
+            if (ev_read[j]) { ggml_backend_event_free(ev_read[j]); }
+        }
+        if (copy_backend) { ggml_backend_free(copy_backend); }
+        if (zeros) { ggml_backend_buffer_free(zeros); }
+    }
+};
+
+// collect this graph's prefetch entries in split order; abort on any compact-id MUL_MAT_ID the slot path cannot serve
+static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
+    ggml_sched_moe_pf * pf = sched->moe_pf;
+    if (pf) { pf->entries.clear(); pf->entry_of_split.assign(sched->n_splits, -1); }
+    for (int s = 0; s < sched->n_splits; s++) {
+        struct ggml_backend_sched_split * split = &sched->splits[s];
+        for (int n = 0; n < split->graph.n_nodes; n++) {
+            struct ggml_tensor * node = split->graph.nodes[n];
+            if (node->op != GGML_OP_MUL_MAT_ID || !ggml_backend_sched_moe_pf_ids(node->src[2])) {
+                continue;
+            }
+            if (n != 0 || ggml_backend_sched_is_host(sched, split->backend_id) || sched->n_copies != 1) {
+                GGML_ABORT("moe-prefetch: %s (compact ids %s) is not the first node of a device split with one copy "
+                           "(node %d of split %d, backend %s, n_copies %d) — its weight would be read by the wrong "
+                           "expert numbering", node->name, node->src[2]->name, n, s,
+                           ggml_backend_name(sched->backends[split->backend_id]), sched->n_copies);
+            }
+            struct ggml_tensor * input = NULL;
+            for (int k = 0; k < split->n_inputs; k++) {
+                if (tensor_copy(split->inputs[k], split->backend_id, sched->cur_copy) == node->src[0]) { input = split->inputs[k]; break; }
+            }
+            if (input == NULL || input->buffer == NULL || !ggml_backend_buffer_is_host(input->buffer) ||
+                    ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                GGML_ABORT("moe-prefetch: %s reads compact ids but its weight %s is not a host weight input of split %d "
+                           "(input %s, buffer %s, host %d, usage %d, split inputs %d)",
+                           node->name, node->src[0]->name, s, input ? input->name : "-",
+                           input && input->buffer ? ggml_backend_buffer_name(input->buffer) : "-",
+                           input && input->buffer ? (int) ggml_backend_buffer_is_host(input->buffer) : -1,
+                           input && input->buffer ? (int) ggml_backend_buffer_get_usage(input->buffer) : -1, split->n_inputs);
+            }
+            std::vector<int32_t> experts;
+            {
+                std::lock_guard<std::mutex> lock(g_moe_pf_mutex);
+                auto it = g_moe_pf_plans.find(input);
+                if (it != g_moe_pf_plans.end()) { experts = it->second; }
+            }
+            if (experts.empty()) {
+                GGML_ABORT("moe-prefetch: no plan registered for %s (compact ids %s)", input->name, node->src[2]->name);
+            }
+            if (sched->moe_pf == NULL) {
+                sched->moe_pf = new ggml_sched_moe_pf();
+                pf = sched->moe_pf;
+                pf->R = ggml_backend_sched_moe_pf_ring();
+                GGML_ASSERT(pf->R > 0 && "compact ids in the graph with LLAMA_MOE_PREFETCH_PP unset");
+                pf->buf.assign(pf->R, NULL); pf->ctx.assign(pf->R, NULL); pf->slot.assign(pf->R, NULL); pf->size.assign(pf->R, 0);
+                pf->ev_up.assign(pf->R, NULL); pf->ev_read.assign(pf->R, NULL); pf->read_recorded.assign(pf->R, false);
+                pf->entry_of_split.assign(sched->n_splits, -1);
+            }
+            if (pf->backend_id < 0) {
+                pf->backend_id = split->backend_id;
+                ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[split->backend_id]);
+                pf->copy_backend = ggml_backend_dev_init(dev, NULL);
+                for (int j = 0; j < pf->R; j++) {
+                    pf->ev_up[j]   = ggml_backend_event_new(dev);
+                    pf->ev_read[j] = ggml_backend_event_new(dev);
+                    if (pf->ev_up[j] == NULL || pf->ev_read[j] == NULL) {
+                        GGML_ABORT("moe-prefetch: %s gives no events", ggml_backend_dev_name(dev));
+                    }
+                }
+                if (pf->copy_backend == NULL) {
+                    GGML_ABORT("moe-prefetch: %s cannot give a second backend instance (copy stream)", ggml_backend_dev_name(dev));
+                }
+            } else if (pf->backend_id != split->backend_id) {
+                GGML_ABORT("moe-prefetch: compact-id splits on two backends (%s, %s) — one streaming device only",
+                           ggml_backend_name(sched->backends[pf->backend_id]), ggml_backend_name(sched->backends[split->backend_id]));
+            }
+            ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(sched->backends[split->backend_id]);
+            const size_t alloc = ggml_backend_buft_get_alloc_size(buft, node->src[0]);
+            const size_t pad   = alloc > ggml_nbytes(node->src[0]) ? alloc - ggml_nbytes(node->src[0]) : 0;
+            pf->entry_of_split[s] = (int) pf->entries.size();
+            pf->entries.push_back({ s, input, node->src[0], std::move(experts), pad });
+        }
+    }
+    if (pf == NULL || pf->entries.empty()) {
+        return;
+    }
+    // the pinned zero source for the pads
+    size_t padmax = 0;
+    for (const auto & e : pf->entries) padmax = std::max(padmax, e.pad);
+    if (padmax > pf->zeros_size) {
+        ggml_backend_synchronize(pf->copy_backend);
+        if (pf->zeros) { ggml_backend_buffer_free(pf->zeros); }
+        ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[pf->backend_id]);
+        ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(dev);
+        pf->zeros = hbt ? ggml_backend_buft_alloc_buffer(hbt, padmax) : NULL;
+        if (pf->zeros == NULL) {
+            GGML_ABORT("moe-prefetch: cannot allocate %zu bytes of pinned host zeros", padmax);
+        }
+        ggml_backend_buffer_clear(pf->zeros, 0);
+        pf->zeros_size = padmax;
+    }
+    // size the ring: slot j holds the largest entry i == j (mod R), its row pad, plus 512 zeroed bytes
+    for (int j = 0; j < pf->R; j++) {
+        size_t need = 0;
+        for (size_t i = j; i < pf->entries.size(); i += pf->R) {
+            const auto & e = pf->entries[i];
+            need = std::max(need, e.experts.size() * e.input->nb[2] + e.pad + 512);
+        }
+        if (need == 0 || need <= pf->size[j]) {
+            continue;
+        }
+        ggml_backend_synchronize(pf->copy_backend);
+        ggml_backend_synchronize(sched->backends[pf->backend_id]);
+        pf->free_slot(j);
+        struct ggml_init_params ip = { ggml_tensor_overhead(), NULL, true };
+        pf->ctx[j]  = ggml_init(ip);
+        pf->slot[j] = ggml_new_tensor_1d(pf->ctx[j], GGML_TYPE_I8, (int64_t) need);
+        ggml_format_name(pf->slot[j], "moe_pf_slot_%d", j);
+        pf->buf[j]  = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(sched->backends[pf->backend_id]), need);
+        if (pf->buf[j] == NULL || ggml_backend_tensor_alloc(pf->buf[j], pf->slot[j], ggml_backend_buffer_get_base(pf->buf[j])) != GGML_STATUS_SUCCESS) {
+            GGML_ABORT("moe-prefetch: cannot allocate slot %d (%.1f MiB) on %s", j, need/1024.0/1024.0, ggml_backend_name(sched->backends[pf->backend_id]));
+        }
+        ggml_backend_buffer_clear(pf->buf[j], 0);
+        pf->size[j] = need;
+        GGML_LOG_WARN("moe-prefetch: slot %d of %d on %s: %.1f MiB\n", j, pf->R, ggml_backend_name(sched->backends[pf->backend_id]), need/1024.0/1024.0);
+    }
+}
+
+// queue entry i's upload on the copy stream: after entry i-R's matmul released the slot, runs of consecutive experts
+static void ggml_backend_sched_moe_pf_upload(ggml_sched_moe_pf * pf, int i) {
+    const auto & e = pf->entries[i];
+    const int j = i % pf->R;
+    if (pf->read_recorded[j]) {
+        ggml_backend_event_wait(pf->copy_backend, pf->ev_read[j]);
+    }
+    const size_t es = e.input->nb[2];
+    const int n = (int) e.experts.size();
+    for (int k = 0; k < n; ) {
+        const int c0 = k;
+        while (k + 1 < n && e.experts[k + 1] == e.experts[k] + 1) { k++; }
+        ggml_backend_tensor_set_async(pf->copy_backend, pf->slot[j], (const uint8_t *) e.input->data + (size_t) e.experts[c0] * es,
+                                      (size_t) c0 * es, (size_t) (k - c0 + 1) * es);
+        k++;
+    }
+    if (e.pad > 0) {
+        ggml_backend_tensor_set_async(pf->copy_backend, pf->slot[j], ggml_backend_buffer_get_base(pf->zeros), (size_t) n * es, e.pad);
+    }
+    ggml_backend_event_record(pf->ev_up[j], pf->copy_backend);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1762,6 +1971,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         return dev == NULL || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
     };
 
+    // fork: LLAMA_MOE_PREFETCH_PP — the first R slot uploads go out before any split runs
+    ggml_sched_moe_pf * pf = NULL;
+    if (ggml_backend_sched_moe_pf_ring() > 0) {
+        ggml_backend_sched_moe_pf_collect(sched);
+        pf = sched->moe_pf;
+        if (pf != NULL && !pf->entries.empty()) {
+            for (int i = 0; i < (int) pf->entries.size() && i < pf->R; i++) {
+                ggml_backend_sched_moe_pf_upload(pf, i);
+            }
+        } else {
+            pf = NULL;
+        }
+    }
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -1801,6 +2024,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (!prefetched.empty() && std::find(prefetched.begin(), prefetched.end(), input) != prefetched.end()) {
                 continue; // copied out when its producing split was queued
+            }
+            if (pf != NULL && pf->entry_of_split[split_id] >= 0 && pf->entries[pf->entry_of_split[split_id]].input == input) {
+                continue; // streamed into a prefetch slot on the copy stream
             }
 
             // fork: async-crossing eligibility (raw byte copy needs identical contiguous layout;
@@ -1996,6 +2222,21 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             prefetched.clear();
         }
 
+        // fork: LLAMA_MOE_PREFETCH_PP — this split's weight is in slot i % R: wait for its upload, read it there
+        const int pf_i = pf != NULL ? pf->entry_of_split[split_id] : -1;
+        void * pf_saved = NULL;
+        ggml_backend_buffer_t pf_saved_buf = NULL;
+        if (pf_i >= 0) {
+            const int j = pf_i % pf->R;
+            ggml_backend_event_wait(split_backend, pf->ev_up[j]);
+            // data AND buffer: the kernels must see the slot as what it is (not a compute-buffer tensor whose
+            // allocation padding they may clear — mmq.cu clears ggml_nbytes(src0).. alloc, past the slot's end)
+            pf_saved     = pf->entries[pf_i].input_cpy->data;
+            pf_saved_buf = pf->entries[pf_i].input_cpy->buffer;
+            pf->entries[pf_i].input_cpy->data   = pf->slot[j]->data;
+            pf->entries[pf_i].input_cpy->buffer = pf->buf[j];
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2070,6 +2311,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 }
 
                 j0 = j1;
+            }
+        }
+
+        if (pf_i >= 0) {
+            const int j = pf_i % pf->R;
+            pf->entries[pf_i].input_cpy->data   = pf_saved; // the launches above captured the slot address
+            pf->entries[pf_i].input_cpy->buffer = pf_saved_buf;
+            ggml_backend_event_record(pf->ev_read[j], split_backend);
+            pf->read_recorded[j] = true;
+            if (pf_i + pf->R < (int) pf->entries.size()) {
+                ggml_backend_sched_moe_pf_upload(pf, pf_i + pf->R);
             }
         }
 
@@ -2175,6 +2427,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
             ggml_backend_event_free(sched->h2d_events[b]);
         }
     }
+    delete sched->moe_pf;
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
