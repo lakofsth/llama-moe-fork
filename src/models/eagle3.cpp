@@ -61,9 +61,21 @@ void llama_model_eagle3::load_arch_tensors(llama_model_loader &) {
     // three captured target hidden states before the fc fusion (absent in plain EAGLE-3).
     // Index lives in the suffix ("fc_norm.K.weight") — the loader classifies fc_norm as an
     // output-layer tensor, which forbids a block id (and n_layer==1 makes one meaningless).
+    // fork (posture L5): each weight normalizes one TARGET-width tap (n_embd_inp/3, the slice
+    // the graph takes), not the draft width; and a checkpoint with some but not all three is
+    // a broken file, not a plain EAGLE-3 one — refuse it here rather than dereference null.
     for (int k = 0; k < 3; ++k) {
         const std::string sfx = std::to_string(k) + ".weight";
-        fc_norm[k] = create_tensor(tn(LLM_TENSOR_FC_NORM, sfx.c_str()), {n_embd}, TENSOR_NOT_REQUIRED);
+        fc_norm[k] = create_tensor(tn(LLM_TENSOR_FC_NORM, sfx.c_str()), {n_embd_inp / 3}, TENSOR_NOT_REQUIRED);
+    }
+    {
+        const int n_fc_norm = (fc_norm[0] != nullptr) + (fc_norm[1] != nullptr) + (fc_norm[2] != nullptr);
+        if (n_fc_norm != 0 && n_fc_norm != 3) {
+            throw std::runtime_error("EAGLE3 checkpoint has " + std::to_string(n_fc_norm) + " of 3 fc_norm tensors");
+        }
+        if (n_fc_norm == 3 && n_embd_inp % 3 != 0) {
+            throw std::runtime_error("EAGLE3 fc_norm needs n_embd_inp (" + std::to_string(n_embd_inp) + ") divisible by 3");
+        }
     }
 
     // upstream b10286 checkpoint family (disjoint from fc_norm.* above): RMSNorm on the
