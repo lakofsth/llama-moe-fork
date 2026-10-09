@@ -1,6 +1,7 @@
 #include "llama-model.h"
 #include "llama-moe-adapt.h"
 #include "llama-moe-heat-select.h"
+#include "llama-mlock-tensors.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1218,6 +1219,9 @@ struct llama_model::impl {
     // under GGML_CUDA_REGISTER_HOST, so their prompt-time uploads run as DMA; unregistered before unmap
     std::vector<void *> pinned_ranges;
 
+    // fork-kernel-fusion (M1): host ranges mlock'ed under LLAMA_MLOCK_TENSORS; unlocked before unmap
+    std::vector<std::pair<uintptr_t, size_t>> mlocked_ranges;
+
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
@@ -1302,6 +1306,8 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // fork-kernel-fusion (M1): unlock the LLAMA_MLOCK_TENSORS ranges before the mappings are unmapped
+    llama_munlock_ranges(pimpl->mlocked_ranges);
     // fork/pin: unpin before the mappings (pimpl members) are unmapped
     if (!pimpl->pinned_ranges.empty()) {
         ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
@@ -1364,6 +1370,40 @@ static void llama_model_pin_host_experts(const std::vector<std::pair<ggml_contex
     }
     LLAMA_LOG_INFO("%s: pinned %.1f MiB of host expert weights in %zu ranges (%zu tensors) in %.1f s; %d ranges (%.1f MiB) failed\n",
                    __func__, ok_bytes / 1048576.0, pinned.size(), ranges.size(), (ggml_time_us() - t0) / 1e6, n_fail, fail_bytes / 1048576.0);
+}
+
+// fork-kernel-fusion (M1, src/llama-mlock-tensors.h): mlock the host bytes of every tensor whose name contains one of
+// the LLAMA_MLOCK_TENSORS substrings, so a tensor read at random on the host (per_layer_token_embd) stays resident
+// instead of being evicted and faulted back from disk by the main thread mid-prompt. No-op when the variable is unset.
+static void llama_model_mlock_host_tensors(const std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> & ctxs_bufs,
+                                           std::vector<std::pair<uintptr_t, size_t>> & locked) {
+    const char * spec = getenv("LLAMA_MLOCK_TENSORS");
+    const auto pats = llama_mlock_patterns(spec);
+    if (pats.empty()) {
+        return;
+    }
+    std::vector<llama_mlock_candidate> cands;
+    for (const auto & [ctx, bufs] : ctxs_bufs) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            cands.push_back({t->name, t->data, ggml_nbytes(t), t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)});
+        }
+    }
+    int n_tensors = 0;
+    const auto ranges = llama_mlock_select(cands, pats, (size_t) sysconf(_SC_PAGESIZE), &n_tensors);
+    const int64_t t0 = ggml_time_us();
+    const auto r = llama_mlock_ranges(ranges);
+    locked = r.locked;
+    // WARN level on purpose: the served default log level hides INFO, and the deploy check reads this line
+    LLAMA_LOG_WARN("%s: LLAMA_MLOCK_TENSORS=%s: locked %.1f MiB in %zu ranges (%d tensors) in %.1f s; %d ranges (%.1f MiB) failed%s%s\n",
+                   __func__, spec, r.locked_bytes / 1048576.0, r.locked.size(), n_tensors, (ggml_time_us() - t0) / 1e6,
+                   r.n_failed, r.failed_bytes / 1048576.0, r.n_failed ? ": " : "", r.n_failed ? strerror(r.first_errno) : "");
+    if (r.n_failed) {
+        LLAMA_LOG_WARN("%s: %d LLAMA_MLOCK_TENSORS ranges were NOT locked (%s) — raise RLIMIT_MEMLOCK (systemd LimitMEMLOCK=)\n",
+                       __func__, r.n_failed, strerror(r.first_errno));
+    }
+    if (n_tensors == 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_MLOCK_TENSORS=%s matched no host tensor\n", __func__, spec);
+    }
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -2893,6 +2933,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     llama_moe_heat_split_init(*this, ml);
 
     llama_model_pin_host_experts(pimpl->ctxs_bufs, pimpl->pinned_ranges);
+    llama_model_mlock_host_tensors(pimpl->ctxs_bufs, pimpl->mlocked_ranges);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
