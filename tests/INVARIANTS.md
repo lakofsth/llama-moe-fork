@@ -24,3 +24,9 @@ One sentence per invariant; each names the test that pins it.
   score passes a relu, so many sit at exactly 0) are taken lowest block first by the CUDA radix-select top-k
   (top_k_radix_ties). Test: tests/test-qsa-select.cpp (llama_qsa_select_cells; case 6, CUDA only, the tie at the
   cut); end to end, prompt passes of 1000-35000 tokens at temperature 0 repeat bit-exact under the deterministic config.
+- **M1 (fork-kernel-fusion, 2026-10-09).** With LLAMA_MLOCK_TENSORS set to a comma-separated list of name substrings,
+  every host-resident model tensor whose name contains one of them has its page-aligned byte range mlock'ed from load
+  until the model is freed, so the kernel never evicts those pages to read them back from disk at prompt time; a
+  tensor matching none, and every tensor when the variable is unset, is left unlocked; a range that fails to lock is
+  reported with its errno, never silently dropped. Pinned by `tests/test-mlock-tensors.cpp` (VmLck rises by exactly
+  the matched ranges; red with the mlock call removed or with the name match inverted).
