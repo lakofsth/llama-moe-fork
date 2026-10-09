@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <thread>
 #include <vector>
 
 #include <sys/mman.h>
@@ -97,22 +98,54 @@ static inline std::vector<std::pair<uintptr_t, uintptr_t>> llama_mlock_select(
 }
 
 // mlock each range; a failure is counted with its errno, never dropped silently.
+// HOW IT IS POPULATED, measured (diag plelock-20261009T175816Z): a lazy tensor's range carries the loader's
+// MADV_RANDOM, so mlock faulting it in from a part-cold page cache read 4 KiB at a time even after MADV_WILLNEED —
+// 27,466 MiB in 101.3 s. So for the lock the range is advised SEQUENTIAL (fault-time readahead), split into chunks
+// of at least 256 MiB locked by up to 16 threads (queue depth on the SSD), then advised RANDOM again, which is what
+// the loader set; the locked pages no longer fault, so the advice only matters if the lock is ever released.
 static inline llama_mlock_result llama_mlock_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>> & ranges) {
     llama_mlock_result r;
     for (const auto & [b, e] : ranges) {
-        // Read the range in with the kernel's readahead first: a lazy tensor's range is advised MADV_RANDOM by the
-        // loader, so mlock populating it from a cold page cache would fault it in one 4 KiB synchronous read at a
-        // time (26.8 GiB = ~7M reads). WILLNEED queues large reads; mlock then finds the pages present.
-        madvise((void *) b, e - b, MADV_WILLNEED);
-        if (mlock((const void *) b, e - b) == 0) {
-            r.locked.emplace_back(b, e - b);
-            r.locked_bytes += e - b;
+        const size_t len = e - b;
+        const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+        const size_t min_chunk = (size_t) 256 << 20;
+        const size_t n_thr = std::max<size_t>(1, std::min<size_t>(16, len / min_chunk));
+        const size_t chunk = ((len / n_thr) + page - 1) / page * page;
+        madvise((void *) b, len, MADV_SEQUENTIAL);
+        std::vector<int> err(n_thr, 0);
+        std::vector<std::thread> th;
+        for (size_t i = 0; i < n_thr; i++) {
+            const uintptr_t cb = b + i * chunk;
+            const uintptr_t ce = std::min<uintptr_t>(e, cb + chunk);
+            if (cb >= ce) {
+                continue;
+            }
+            th.emplace_back([cb, ce, i, &err] {
+                if (mlock((const void *) cb, ce - cb) != 0) {
+                    err[i] = errno;
+                }
+            });
+        }
+        for (auto & t : th) {
+            t.join();
+        }
+        madvise((void *) b, len, MADV_RANDOM);
+        int first = 0;
+        for (int x : err) {
+            if (x != 0 && first == 0) {
+                first = x;
+            }
+        }
+        if (first == 0) {
+            r.locked.emplace_back(b, len);
+            r.locked_bytes += len;
         } else {
+            munlock((const void *) b, len);   // all or nothing per range: a half-locked range reads as neither
             if (r.n_failed == 0) {
-                r.first_errno = errno;
+                r.first_errno = first;
             }
             r.n_failed++;
-            r.failed_bytes += e - b;
+            r.failed_bytes += len;
         }
     }
     return r;
