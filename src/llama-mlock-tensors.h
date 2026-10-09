@@ -100,6 +100,10 @@ static inline std::vector<std::pair<uintptr_t, uintptr_t>> llama_mlock_select(
 static inline llama_mlock_result llama_mlock_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>> & ranges) {
     llama_mlock_result r;
     for (const auto & [b, e] : ranges) {
+        // Read the range in with the kernel's readahead first: a lazy tensor's range is advised MADV_RANDOM by the
+        // loader, so mlock populating it from a cold page cache would fault it in one 4 KiB synchronous read at a
+        // time (26.8 GiB = ~7M reads). WILLNEED queues large reads; mlock then finds the pages present.
+        madvise((void *) b, e - b, MADV_WILLNEED);
         if (mlock((const void *) b, e - b) == 0) {
             r.locked.emplace_back(b, e - b);
             r.locked_bytes += e - b;
