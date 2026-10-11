@@ -30,3 +30,13 @@ One sentence per invariant; each names the test that pins it.
   tensor matching none, and every tensor when the variable is unset, is left unlocked; a range that fails to lock is
   reported with its errno, never silently dropped. Pinned by `tests/test-mlock-tensors.cpp` (VmLck rises by exactly
   the matched ranges; red with the mlock call removed or with the name match inverted).
+
+- **MMQ-PAD (fork-strata-ports, 2026-10-11).** Every MMQ launch's quantized src1 buffer is padded by at least as
+  many `block_q8_1_mmq` as the largest column tile J that `mul_mat_q_switch_J` can select for it, because the last
+  y tile of a launch reads J blocks from its first column. Both allocation sites (`ggml_cuda_mul_mat_q`, its plain
+  and MUL_MAT_ID paths) pad by `ggml_cuda_mmq_get_J_pad`, derived from `MMQ_J_SELECT_MAX`, the same bound the
+  selection loop uses. Sites derived by `grep -n "sizeof(block_q8_1_mmq)" ggml/src/ggml-cuda/mmq.cu` (the two
+  `nbytes_src1_q8_1` terms). Pinned end to end, not by a unit test: crash-repro2/repro-order.sh with order 120
+  faults (Xid 31 FAULT_PDE at the VMM pool's mapping boundary) on the unpadded build and must not on this one;
+  residual — no unit-level pin, because the fault needs the buffer at the top of the pool within J blocks of a
+  2 MiB mapping boundary.

@@ -9,6 +9,9 @@
 #define MMQ_ITER_K             256
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
+// fork (MMQ-PAD): the largest column tile J mul_mat_q_switch_J may select. The src1 buffer padding
+// (ggml_cuda_mmq_get_J_pad) is derived from the same bound, so the two cannot drift apart.
+#define MMQ_J_SELECT_MAX       128
 
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -378,6 +381,16 @@ static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fal
         }
     }
     return ret;
+}
+
+// fork (MMQ-PAD): blocks of tail padding a launch's src1 buffer needs. The last y tile of a launch reads J blocks
+// from its first column, so up to J-1 past the last real column, and mul_mat_q_switch_J picks J (up to
+// MMQ_J_SELECT_MAX) from ncols_opt, NOT from ne11: on MUL_MAT_ID ne11 is 1 (broadcast activations) or
+// n_expert_used, so ggml_cuda_mmq_get_J_max(..., ne11) under-pads by up to J blocks. When that buffer is the top
+// of the VMM pool, the over-read crosses into reserved, unmapped address space: Xid 31 FAULT_PDE at the pool's
+// mapping boundary, surfacing as an illegal memory access in whichever op runs next (fork-strata-ports, 11 Oct 2026).
+static __host__ int ggml_cuda_mmq_get_J_pad(const ggml_type type, const bool fallback, const int cc) {
+    return ggml_cuda_mmq_get_J_max(type, fallback, cc, MMQ_J_SELECT_MAX);
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
@@ -1491,7 +1504,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= MMQ_J_SELECT_MAX && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc, prec_src1);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
