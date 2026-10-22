@@ -66,7 +66,8 @@ One sentence per invariant; each names the test that pins it.
      recorded.
   So no GPU kernel reads a slot while it is being written, and an expert is never resident in one map and absent
   from the other. Rounds run only in the trunk context (LLAMA_CONTEXT_TYPE_DEFAULT), whose compute stream orders
-  every packed-slot read; the MTP drafter (graph_mtp) reads none, and a round run from it would order nothing.
+  every packed-slot read; the MTP drafter (graph_mtp) reads none, and a round run from it would order nothing. This
+  holds for the synchronous tier too: its drain is the calling context's synchronize(), which does not reach the trunk.
   Found by the first A/B (async-ab run-20261022T133456Z), which logged two copy streams on CUDA0, one per context. Design: ~/docs/fork-async-adapt-swaps-design-2026-10-22.md. Pinned by
   `tests/test-moe-adapt-async.cpp`, which replays rounds through a fake IO that checks this ordering and the maps'
   contents.

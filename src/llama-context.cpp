@@ -2279,14 +2279,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 static int since_round = 0;
                 static int64_t win_hits = 0, win_tot = 0, win_swaps = 0;
                 // LLAMA_MOE_ADAPT_ASYNC=1 (ADAPT-ASYNC): copies on a copy stream, no host drain; otherwise the
-                // synchronous round, which writes packed GPU tensors and maps with blocking sets. Under async only the
-                // trunk context runs rounds: its stream is the one every packed-slot read is ordered on, and the MTP
-                // drafter's graph (graph_mtp, the NextN block) reads no packed slot. A round from the drafter would
-                // copy and rewrite maps on its own streams, unordered against the trunk's graphs.
+                // synchronous round, which drains this context and writes packed GPU tensors and maps with blocking
+                // sets. In both modes only the trunk context runs rounds: its stream is the one every packed-slot read
+                // is ordered on, and the MTP drafter's graph (graph_mtp, the NextN block) reads no packed slot. A round
+                // from the drafter would order nothing against the trunk's graphs: async, it copies and rewrites maps on
+                // the drafter's streams; synchronous, its synchronize() drains the drafter and not the trunk, whose
+                // graph may still be reading the slot being overwritten.
                 static const bool async = [] { const char * e = getenv("LLAMA_MOE_ADAPT_ASYNC"); return e && atoi(e) != 0; }();
-                // Every context's decodes still count toward the cadence (as in the synchronous tier, whose counter is
-                // shared too); a round that falls due on a drafter decode runs at the trunk's next one.
-                const bool round_runner = !async || cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+                // Every context's decodes still count toward the cadence (the counter is shared); a round that falls
+                // due on a drafter decode runs at the trunk's next one.
+                const bool round_runner = cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
                 ++since_round;
                 if (round_runner && since_round >= every) {
                     since_round = 0;
