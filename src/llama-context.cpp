@@ -2278,11 +2278,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 static const int every = [] { const char * e = getenv("LLAMA_MOE_ADAPT_EVERY"); const int v = e ? atoi(e) : 4; return v > 0 ? v : 4; }();
                 static int since_round = 0;
                 static int64_t win_hits = 0, win_tot = 0, win_swaps = 0;
-                if (++since_round >= every) {
+                // LLAMA_MOE_ADAPT_ASYNC=1 (ADAPT-ASYNC): copies on a copy stream, no host drain; otherwise the
+                // synchronous round, which writes packed GPU tensors and maps with blocking sets. Under async only the
+                // trunk context runs rounds: its stream is the one every packed-slot read is ordered on, and the MTP
+                // drafter's graph (graph_mtp, the NextN block) reads no packed slot. A round from the drafter would
+                // copy and rewrite maps on its own streams, unordered against the trunk's graphs.
+                static const bool async = [] { const char * e = getenv("LLAMA_MOE_ADAPT_ASYNC"); return e && atoi(e) != 0; }();
+                const bool round_runner = !async || cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
+                if (round_runner && ++since_round >= every) {
                     since_round = 0;
-                    // LLAMA_MOE_ADAPT_ASYNC=1 (ADAPT-ASYNC): copies on a copy stream, no host drain; otherwise the
-                    // synchronous round, which writes packed GPU tensors and maps with blocking sets
-                    static const bool async = [] { const char * e = getenv("LLAMA_MOE_ADAPT_ASYNC"); return e && atoi(e) != 0; }();
                     if (async && !moe_adapt_io) moe_adapt_io = std::make_unique<llama_moe_adapt_io_impl>(backends);
                     if (!async) synchronize();
                     int64_t h = 0, t = 0;
