@@ -31,9 +31,17 @@ One sentence per invariant; each names the test that pins it.
   reported with its errno, never silently dropped. Pinned by `tests/test-mlock-tensors.cpp` (VmLck rises by exactly
   the matched ranges; red with the mlock call removed or with the name match inverted).
 
-- **MMQ-PAD (fork-strata-ports, 2026-10-11).** Every MMQ launch's quantized src1 buffer is padded by at least as
-  many `block_q8_1_mmq` as the largest column tile J that `mul_mat_q_switch_J` can select for it, because the last
-  y tile of a launch reads J blocks from its first column. Both allocation sites (`ggml_cuda_mul_mat_q`, its plain
+- **MMQ-PAD (fork-strata-ports, 2026-10-11; widened 2026-10-22).** Every buffer an MMQ launch's last column tile reads
+  J entries wide is padded by at least the largest column tile J that `mul_mat_q_switch_J` can select
+  (`MMQ_J_SELECT_MAX`), because that tile reads J entries from its first column whatever the real column count.
+  Two buffers are read that way. (a) The quantized src1, padded in `block_q8_1_mmq`. (b) The MUL_MAT_ID `ids_dst`
+  map, padded by `MMQ_J_SELECT_MAX - 1` int32. (b) is loaded into `ids_dst_shared` at the three
+  `ids_dst_shared[j] = ids_dst[col_low + jt*J + j]` sites in mmq.cuh, guarded only by j < J; the last expert's last
+  tile runs past `ne_get_rows`. (b) was found 2026-10-22 by comparing against upstream fc9ce6b9d (#29953), which
+  pads ids_dst by J_best-1. Sites derived by `grep -n 'ids_dst\[' ggml/src/ggml-cuda/mmq.cuh` (the three loads;
+  the write-backs skip j > j_max = col_diff - jt*J - 1, so no store uses a padded entry) and its single allocation
+  in mmq.cu. mmf.cuh reads its compact ids_dst under global_j < ncols_expert and is outside the class. For (a), both
+  allocation sites (`ggml_cuda_mul_mat_q`, its plain
   and MUL_MAT_ID paths) pad by `ggml_cuda_mmq_get_J_pad`, derived from `MMQ_J_SELECT_MAX`, the same bound the
   selection loop uses. Sites derived by `grep -n "sizeof(block_q8_1_mmq)" ggml/src/ggml-cuda/mmq.cu` (the two
   `nbytes_src1_q8_1` terms). Pinned end to end, not by a unit test: crash-repro2/repro-order.sh with order 120
