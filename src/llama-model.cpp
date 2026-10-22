@@ -2391,13 +2391,86 @@ int llama_model_base::moe_heat_repin() {
 // Refused (-1, logged once) with the openai-moe bias copies, which keep the shared sentinel and so
 // cannot count resident experts. `hits` / `tot` return the window's resident hits and routings
 // (sweep units) for the caller's hit-rate line.
-int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out) {
+// ADAPT-ASYNC (io != nullptr, LLAMA_MOE_ADAPT_ASYNC=1): the round first ADMITS the previous round's copies (the
+// compute stream waits on their done event, then their slots' maps are rebuilt), selects, then EVICTS each victim at
+// once (its slot leaves every map) and enqueues the incoming expert's copy on the copy stream after a copy-free event.
+// Nothing blocks the host; the ordering is llama_moe_adapt_admit / llama_moe_adapt_evict_and_copy (tests/INVARIANTS.md
+// ADAPT-ASYNC, tests/test-moe-adapt-async.cpp).
+namespace {
+struct llama_moe_adapt_model_io {
+    std::vector<llama_layer> & layers;
+    llama_moe_adapt_io & io;
+    const std::vector<int> & lay;                  // L index -> model layer
+    const std::vector<ggml_backend_dev_t> & devs;  // dev number -> device
+    int n_expert;
+    void wait_done(int d)    { io.wait_done(devs[d]); }
+    void begin_copies(int d) { io.begin_copies(devs[d]); }
+    void end_copies(int d)   { io.end_copies(devs[d]); }
+    void set_maps(int k) {
+        auto & ms = layers[lay[k]].moe_split;
+        llama_moe_adapt_maps m;
+        llama_moe_adapt_build_maps(m, ms.cur_experts, ms.inflight, n_expert, [&](int e) { return llama_moe_cpu_sentinel(ms, n_expert, e); });
+        io.set_async(ms.map_cpu,    m.mc.data(),   m.mc.size()*sizeof(int32_t));
+        io.set_async(ms.map_gpu,    m.mg.data(),   m.mg.size()*sizeof(int32_t));
+        io.set_async(ms.map_gpu_pp, m.mgpp.data(), m.mgpp.size()*sizeof(int32_t));
+        io.set_async(ms.mask_cpu,   m.kc.data(),   m.kc.size()*sizeof(float));
+        io.set_async(ms.mask_gpu,   m.kg.data(),   m.kg.size()*sizeof(float));
+    }
+    void copy(int k, int g, int e) {
+        auto & L  = layers[lay[k]];
+        auto & ms = L.moe_split;
+        std::vector<const ggml_tensor *> srcs;
+        std::vector<ggml_tensor *> dsts;
+        if (L.ffn_gate_up_exps) { srcs = { L.ffn_gate_up_exps, L.ffn_down_exps };               dsts = { ms.gate_up_gpu, ms.down_gpu }; }
+        else                    { srcs = { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }; dsts = { ms.gate_gpu, ms.up_gpu, ms.down_gpu }; }
+        for (size_t j = 0; j < srcs.size(); j++) {
+            io.copy(dsts[j], (const char *) srcs[j]->data + (size_t) e * srcs[j]->nb[2], (size_t) g * dsts[j]->nb[2], srcs[j]->nb[2]);
+        }
+    }
+};
+// the async view of the given model layers: every one's slot vectors, numbered devices
+void llama_moe_adapt_view(std::vector<llama_layer> & layers, const std::vector<int> & lay,
+                          std::vector<llama_moe_adapt_layer> & L, std::vector<ggml_backend_dev_t> & devs) {
+    for (int il : lay) {
+        auto & ms = layers[il].moe_split;
+        if (ms.inflight.size() != ms.cur_experts.size()) ms.inflight.assign(ms.cur_experts.size(), 0);
+        auto it = std::find(devs.begin(), devs.end(), ms.dev);
+        if (it == devs.end()) { devs.push_back(ms.dev); it = devs.end() - 1; }
+        L.push_back({ &ms.cur_experts, &ms.inflight, (int) (it - devs.begin()) });
+    }
+}
+} // namespace
+
+int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out, llama_moe_adapt_io * io) {
     static const float min_usage = [] { const char * e = getenv("LLAMA_MOE_ADAPT_MIN");    return e ? (float) atof(e) : 2.0f; }();
     static const float margin    = [] { const char * e = getenv("LLAMA_MOE_ADAPT_MARGIN"); return e ? (float) atof(e) : 1.5f; }();
     static const float decay     = [] { const char * e = getenv("LLAMA_MOE_ADAPT_DECAY");  return e ? (float) atof(e) : 0.7f; }();
     static const int   max_swaps = [] { const char * e = getenv("LLAMA_MOE_ADAPT_SWAPS");  return e ? atoi(e) : 96; }();
     const int n_expert = (int) hparams.n_expert;
     int64_t hits_all = 0, tot_all = 0;
+
+    if (io) {
+        // ADAPT-ASYNC step 1: admit every split layer's in-flight slots (any device without one is left alone).
+        // A layer without a device cannot route its copies: the async tier refuses rather than guess.
+        std::vector<int> all;
+        for (size_t il = 0; il < layers.size(); il++) {
+            const auto & ms = layers[il].moe_split;
+            if (!ms.active() || ms.cur_experts.empty()) continue;
+            if (!ms.dev) {
+                static bool warned = false;
+                if (!warned) { LLAMA_LOG_WARN("moe-heat-adapt: a split layer has no device — LLAMA_MOE_ADAPT_ASYNC needs one, the round runs synchronously\n"); warned = true; }
+                io = nullptr;
+                break;
+            }
+            all.push_back((int) il);
+        }
+        if (io) {
+            std::vector<llama_moe_adapt_layer> L; std::vector<ggml_backend_dev_t> devs;
+            llama_moe_adapt_view(layers, all, L, devs);
+            llama_moe_adapt_model_io mio { layers, *io, all, devs, n_expert };
+            llama_moe_adapt_admit(mio, L);
+        }
+    }
 
     std::vector<int> lay;                     // split layers in this round, model layer index
     std::vector<std::vector<uint8_t>> res;
@@ -2432,8 +2505,15 @@ int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out) {
     for (size_t k = 0; k < lay.size(); k++) { up[k] = layers[lay[k]].moe_split.usage.data(); rp[k] = res[k].data(); }
     const auto swaps = llama_moe_adapt_select(up, rp, n_expert, min_usage, margin, max_swaps);
 
+    if (io) {
+        // ADAPT-ASYNC step 3: evict at once, copy on the copy stream; admitted at the next round's step 1
+        std::vector<llama_moe_adapt_layer> L; std::vector<ggml_backend_dev_t> devs;
+        llama_moe_adapt_view(layers, lay, L, devs);
+        llama_moe_adapt_model_io mio { layers, *io, lay, devs, n_expert };
+        llama_moe_adapt_evict_and_copy(mio, L, swaps);
+    }
     std::vector<char> touched(lay.size(), 0);
-    for (const auto & sw : swaps) {
+    for (const auto & sw : io ? std::vector<llama_moe_swap>() : swaps) {
         auto & L  = layers[lay[sw.layer]];
         auto & ms = L.moe_split;
         const auto it = std::find(ms.cur_experts.begin(), ms.cur_experts.end(), sw.out);

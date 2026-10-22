@@ -242,6 +242,17 @@ struct llama_layer_nextn {
 // fork/phase-b: heat-driven expert split — hot experts duplicated into packed
 // GPU tensors; originals stay mmap'd for the CPU branch (GPU-resident experts'
 // pages are simply never touched). Populated post-load from LLAMA_MOE_HEAT_FILE.
+// fork-strata-ports ADAPT-ASYNC: what the adaptive tier needs from the context to copy without blocking. Every call
+// enqueues; none blocks the host. Implemented in llama-context.cpp (one compute backend and one copy backend per device).
+struct llama_moe_adapt_io {
+    virtual ~llama_moe_adapt_io() = default;
+    virtual void set_async(struct ggml_tensor * t, const void * data, size_t size) = 0; // on t's device compute stream
+    virtual void wait_done(ggml_backend_dev_t dev)    = 0; // compute stream waits for dev's last end_copies
+    virtual void begin_copies(ggml_backend_dev_t dev) = 0; // record copy-free on compute; copy stream waits on it
+    virtual void copy(struct ggml_tensor * dst, const void * src, size_t offset, size_t size) = 0; // on dst's copy stream
+    virtual void end_copies(ggml_backend_dev_t dev)   = 0; // record copy-done on the copy stream
+};
+
 struct llama_moe_split {
     struct ggml_tensor * gate_gpu = nullptr; // [n_embd, n_ff,  G_l] packed hot experts (separate-gate/up form)
     struct ggml_tensor * up_gpu   = nullptr;
@@ -273,6 +284,9 @@ struct llama_moe_split {
     // fork-strata-ports: the adaptive tier's decayed usage per expert, in routings
     // (llama_model_base::moe_heat_adapt; empty until its first round)
     std::vector<float>   usage;
+    // fork-strata-ports ADAPT-ASYNC: slot -> its copy has not been admitted yet (the slot is resident in no map);
+    // empty or all-zero under the synchronous tier
+    std::vector<uint8_t> inflight;
 
     // fork/two-card U1: the device holding this layer's packed tensors, and its index
     // among the model's non-meta GPU devices (the index that the list forms of
@@ -846,7 +860,8 @@ struct llama_model {
     virtual int moe_heat_repin() { return -1; }
     // fork-strata-ports: one round of Strata's adaptive tier (see llama_model_base::moe_heat_adapt).
     // Returns the swaps made, -1 when no split is active or the tier cannot run here.
-    virtual int moe_heat_adapt(int64_t * hits, int64_t * tot) { (void) hits; (void) tot; return -1; }
+    // io != nullptr: LLAMA_MOE_ADAPT_ASYNC — copies on a copy stream, admission one round later (ADAPT-ASYNC).
+    virtual int moe_heat_adapt(int64_t * hits, int64_t * tot, struct llama_moe_adapt_io * io) { (void) hits; (void) tot; (void) io; return -1; }
     // fork: the per-expert heat estimate of one layer in routing-count scale, as the repin
     // ranks it: exact counts for host-served experts, and for GPU-packed experts (whose
     // routings reach the CPU op only as sentinels) the sentinel mass shared by their current
@@ -923,7 +938,7 @@ struct llama_model_base : public llama_model {
     // routing counters (LLAMA_MOE_HEAT_ONLINE), swapping only changed slots within the
     // layer's existing quota. Returns number of expert slots swapped, -1 if inactive.
     int moe_heat_repin() override;
-    int moe_heat_adapt(int64_t * hits, int64_t * tot) override;
+    int moe_heat_adapt(int64_t * hits, int64_t * tot, struct llama_moe_adapt_io * io) override;
     bool moe_heat_score(int il, const int64_t * counts, int64_t sent, float * out) const override;
     bool moe_heat_projected_gain(int64_t * gain, int64_t * tot) const override;
 };

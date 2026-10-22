@@ -360,6 +360,10 @@ private:
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
+    // fork-strata-ports ADAPT-ASYNC: the adaptive tier's copy streams and events (LLAMA_MOE_ADAPT_ASYNC=1; created at
+    // the first round, destroyed before `backends`)
+    std::unique_ptr<struct llama_moe_adapt_io> moe_adapt_io;
+
     // training
     ggml_opt_context_t opt_ctx = nullptr;
 
