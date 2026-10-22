@@ -247,7 +247,9 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    // fork (MMQ-PAD): the kernel's ids_dst_shared loads read J entries from each tile's first column, so the last
+    // expert's last tile reads up to J-1 past ne_get_rows; pad by the largest J the launch can select.
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + MMQ_J_SELECT_MAX - 1); // MMQ-PAD
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // upstream b10286: gate/up activations are broadcast across experts (ne11 == 1):
@@ -281,7 +283,8 @@ void ggml_cuda_mul_mat_q(
     } else {
         CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
     }
-    // ids_dst is indexed by compact row in BOTH modes, so its untouched tail is never read.
+    // ids_dst is indexed by compact row in BOTH modes. Its padded tail (MMQ-PAD) is loaded into ids_dst_shared but
+    // never used for a store: both write-backs skip j > j_max (= col_diff - jt*J - 1).
     CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows*sizeof(int32_t), stream));
 
     // fork: LLAMA_DEBUG_IDS=1 — host-side validation that every id is in [0, ne02)
