@@ -2284,8 +2284,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 // drafter's graph (graph_mtp, the NextN block) reads no packed slot. A round from the drafter would
                 // copy and rewrite maps on its own streams, unordered against the trunk's graphs.
                 static const bool async = [] { const char * e = getenv("LLAMA_MOE_ADAPT_ASYNC"); return e && atoi(e) != 0; }();
+                // Every context's decodes still count toward the cadence (as in the synchronous tier, whose counter is
+                // shared too); a round that falls due on a drafter decode runs at the trunk's next one.
                 const bool round_runner = !async || cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT;
-                if (round_runner && ++since_round >= every) {
+                ++since_round;
+                if (round_runner && since_round >= every) {
                     since_round = 0;
                     if (async && !moe_adapt_io) moe_adapt_io = std::make_unique<llama_moe_adapt_io_impl>(backends);
                     if (!async) synchronize();
