@@ -53,3 +53,18 @@ One sentence per invariant; each names the test that pins it.
   faults (Xid 31 FAULT_PDE at the VMM pool's mapping boundary) on the unpadded build and must not on this one;
   residual — no unit-level pin, because the fault needs the buffer at the top of the pool within J blocks of a
   2 MiB mapping boundary.
+
+- **ADAPT-ASYNC (fork-strata-ports, 2026-10-22).** With LLAMA_MOE_ADAPT_ASYNC=1 the adaptive tier's expert copies
+  run on a copy stream, and a packed slot is GPU-resident in NO map (map_cpu, map_gpu, map_gpu_pp, mask_cpu,
+  mask_gpu) from the round that evicts its occupant until the round that admits its new occupant. Each round runs in
+  three steps, in this order:
+  1. **Admit.** The compute stream waits on the previous round's copy-done event, then that round's in-flight slots
+     are cleared and their maps rebuilt.
+  2. **Select.**
+  3. **Evict + copy.** The new swaps' slots are marked in flight and their maps rebuilt. The copy-free event is
+     recorded on the compute stream, the copy stream waits on it, then the copies run and the copy-done event is
+     recorded.
+  So no GPU kernel reads a slot while it is being written, and an expert is never resident in one map and absent
+  from the other. Design: ~/docs/fork-async-adapt-swaps-design-2026-10-22.md. Pinned by
+  `tests/test-moe-adapt-async.cpp`, which replays rounds through a fake IO that checks this ordering and the maps'
+  contents.

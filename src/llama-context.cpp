@@ -17,6 +17,7 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <map>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -516,6 +517,65 @@ llama_context::llama_context(
         }
     }
 }
+
+// fork-strata-ports ADAPT-ASYNC: per device, the context's own backend (whose stream every graph runs on) and a second
+// backend instance of the same device whose stream carries the adaptive tier's expert copies, ordered by two events
+// (the pattern fork-prefetch uses). Nothing here blocks the host except the destructor's drain.
+struct llama_moe_adapt_io_impl : llama_moe_adapt_io {
+    struct per_dev {
+        ggml_backend_t compute = nullptr, copy = nullptr;
+        ggml_backend_event_t ev_free = nullptr, ev_done = nullptr;
+        bool done_recorded = false;
+    };
+    const std::vector<ggml_backend_ptr> & backends;
+    std::map<ggml_backend_dev_t, per_dev> devs;
+    explicit llama_moe_adapt_io_impl(const std::vector<ggml_backend_ptr> & b) : backends(b) {}
+    ~llama_moe_adapt_io_impl() override {
+        for (auto & [dev, p] : devs) {
+            if (p.copy) ggml_backend_synchronize(p.copy);
+            if (p.ev_free) ggml_backend_event_free(p.ev_free);
+            if (p.ev_done) ggml_backend_event_free(p.ev_done);
+            if (p.copy) ggml_backend_free(p.copy);
+        }
+    }
+    per_dev & get(ggml_backend_dev_t dev) {
+        auto it = devs.find(dev);
+        if (it != devs.end()) return it->second;
+        per_dev p;
+        for (const auto & b : backends) if (ggml_backend_get_device(b.get()) == dev) { p.compute = b.get(); break; }
+        p.copy    = ggml_backend_dev_init(dev, nullptr);
+        p.ev_free = ggml_backend_event_new(dev);
+        p.ev_done = ggml_backend_event_new(dev);
+        if (!p.compute || !p.copy || !p.ev_free || !p.ev_done) {
+            GGML_ABORT("moe-heat-adapt: LLAMA_MOE_ADAPT_ASYNC needs a compute backend, a second backend instance and events on %s", ggml_backend_dev_name(dev));
+        }
+        LLAMA_LOG_WARN("moe-heat-adapt: async copies on a second %s stream\n", ggml_backend_dev_name(dev));
+        return devs.emplace(dev, p).first->second;
+    }
+    static ggml_backend_dev_t dev_of(const ggml_tensor * t) {
+        return ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+    }
+    void set_async(ggml_tensor * t, const void * data, size_t size) override {
+        ggml_backend_tensor_set_async(get(dev_of(t)).compute, t, data, 0, size);
+    }
+    void wait_done(ggml_backend_dev_t dev) override {
+        auto & p = get(dev);
+        if (p.done_recorded) ggml_backend_event_wait(p.compute, p.ev_done);
+    }
+    void begin_copies(ggml_backend_dev_t dev) override {
+        auto & p = get(dev);
+        ggml_backend_event_record(p.ev_free, p.compute);
+        ggml_backend_event_wait(p.copy, p.ev_free);
+    }
+    void copy(ggml_tensor * dst, const void * src, size_t offset, size_t size) override {
+        ggml_backend_tensor_set_async(get(dev_of(dst)).copy, dst, src, offset, size);
+    }
+    void end_copies(ggml_backend_dev_t dev) override {
+        auto & p = get(dev);
+        ggml_backend_event_record(p.ev_done, p.copy);
+        p.done_recorded = true;
+    }
+};
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
@@ -2220,9 +2280,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 static int64_t win_hits = 0, win_tot = 0, win_swaps = 0;
                 if (++since_round >= every) {
                     since_round = 0;
-                    synchronize(); // the swaps write packed GPU tensors and the maps
+                    // LLAMA_MOE_ADAPT_ASYNC=1 (ADAPT-ASYNC): copies on a copy stream, no host drain; otherwise the
+                    // synchronous round, which writes packed GPU tensors and maps with blocking sets
+                    static const bool async = [] { const char * e = getenv("LLAMA_MOE_ADAPT_ASYNC"); return e && atoi(e) != 0; }();
+                    if (async && !moe_adapt_io) moe_adapt_io = std::make_unique<llama_moe_adapt_io_impl>(backends);
+                    if (!async) synchronize();
                     int64_t h = 0, t = 0;
-                    const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t);
+                    const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t, async ? moe_adapt_io.get() : nullptr);
                     if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; }
                 }
                 if (++since_check >= 64) {
