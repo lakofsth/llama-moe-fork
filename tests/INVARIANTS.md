@@ -40,7 +40,12 @@ One sentence per invariant; each names the test that pins it.
   tile runs past `ne_get_rows`. (b) was found 2026-10-22 by comparing against upstream fc9ce6b9d (#29953), which
   pads ids_dst by J_best-1. Sites derived by `grep -n 'ids_dst\[' ggml/src/ggml-cuda/mmq.cuh` (the three loads;
   the write-backs skip j > j_max = col_diff - jt*J - 1, so no store uses a padded entry) and its single allocation
-  in mmq.cu. mmf.cuh reads its compact ids_dst under global_j < ncols_expert and is outside the class. For (a), both
+  in mmq.cu. mmf.cuh reads its compact ids_dst under global_j < ncols_expert and is outside the class. (b) is pinned
+  by compute-sanitizer memcheck over `test-backend-ops test -o MUL_MAT_ID` on a GGML_CUDA_NO_VMM=ON build (the
+  legacy pool makes each buffer its own allocation, which memcheck tracks; VMM sub-allocations it cannot see):
+  llm-config eval/fork-kernel-fusion/diag/memcheck-ids.sh + build-novmm.sh. Red on the parent f24965e3c: 1,235
+  errors, invalid 4-byte reads in mul_mat_q 1-5 bytes past a 256-byte allocation. Green on fbd98f26e: 929/929
+  MUL_MAT_ID OK, 0 invalid reads (/data/two-card-bench/mmq-pad/memcheck-20261022T130106Z). For (a), both
   allocation sites (`ggml_cuda_mul_mat_q`, its plain
   and MUL_MAT_ID paths) pad by `ggml_cuda_mmq_get_J_pad`, derived from `MMQ_J_SELECT_MAX`, the same bound the
   selection loop uses. Sites derived by `grep -n "sizeof(block_q8_1_mmq)" ggml/src/ggml-cuda/mmq.cu` (the two
