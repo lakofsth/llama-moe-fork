@@ -2653,6 +2653,18 @@ struct ggml_cuda_graph_stats {
 };
 static ggml_cuda_graph_stats g_cuda_graph_stats;
 
+// with GGML_CUDA_GRAPH_STATS set, every property change is tallied by its FIRST changed node: "<op>/<field>"
+// (field: shape, strides, data, params, src-ptr, src-shape, src-strides, other), printed with the stats line
+static std::mutex                          g_cuda_graph_change_mutex;
+static std::map<std::string, uint64_t>     g_cuda_graph_changes;
+
+static int64_t ggml_cuda_graph_stats_period_us();
+
+static void ggml_cuda_graph_note_change(const ggml_tensor * node, const char * field) {
+    std::lock_guard<std::mutex> lock(g_cuda_graph_change_mutex);
+    g_cuda_graph_changes[std::string(ggml_op_desc(node)) + "/" + field]++;
+}
+
 static int64_t ggml_cuda_graph_stats_period_us() {
     static const int64_t period = [] {
         const char * env = getenv("GGML_CUDA_GRAPH_STATS");
@@ -2684,6 +2696,18 @@ static void ggml_cuda_graph_stats_tick() {
                   (unsigned long long) st.captures.exchange(0), (unsigned long long) st.instantiates.exchange(0),
                   (unsigned long long) st.update_fails.exchange(0), (unsigned long long) st.launches.exchange(0),
                   st.keys.load());
+    std::string top;
+    {
+        std::lock_guard<std::mutex> lock(g_cuda_graph_change_mutex);
+        std::vector<std::pair<uint64_t, std::string>> v;
+        for (auto & kv : g_cuda_graph_changes) v.emplace_back(kv.second, kv.first);
+        std::sort(v.rbegin(), v.rend());
+        for (size_t i = 0; i < v.size() && i < 6; ++i) top += " " + v[i].second + "=" + std::to_string(v[i].first);
+        g_cuda_graph_changes.clear();
+    }
+    if (!top.empty()) {
+        GGML_LOG_WARN("cuda-graph-stats: first changed node by op/field:%s\n", top.c_str());
+    }
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2703,6 +2727,9 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
+        if (!graph->node_props.empty() && ggml_cuda_graph_stats_period_us() > 0) {
+            ggml_cuda_graph_note_change(cgraph->nodes[0], "n_nodes");
+        }
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -2720,6 +2747,22 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            if (!res && ggml_cuda_graph_stats_period_us() > 0) {
+                const ggml_tensor & a = graph->node_props[i].node; const ggml_tensor & b = prop.node;
+                const char * f = "other";
+                if (memcmp(a.ne, b.ne, sizeof(a.ne)))                     f = "shape";
+                else if (memcmp(a.nb, b.nb, sizeof(a.nb)))                f = "strides";
+                else if (a.data != b.data)                                f = "data";
+                else if (memcmp(a.op_params, b.op_params, sizeof(a.op_params))) f = "params";
+                else if (memcmp(graph->node_props[i].node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs))) f = "src-ptr";
+                else if (memcmp(graph->node_props[i].node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne))) f = "src-shape";
+                else if (memcmp(graph->node_props[i].node_src_nb, prop.node_src_nb, sizeof(prop.node_src_nb))) f = "src-strides";
+                else if (memcmp(a.src, b.src, sizeof(a.src)))             f = "src-tensor";
+                else if (a.view_src != b.view_src || a.view_offs != b.view_offs) f = "view";
+                else if (a.extra != b.extra)                              f = "extra";
+                else if (memcmp(a.name, b.name, sizeof(a.name)))          f = "name";
+                ggml_cuda_graph_note_change(cgraph->nodes[i], f);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
