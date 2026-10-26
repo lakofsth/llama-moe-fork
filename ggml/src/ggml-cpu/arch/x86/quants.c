@@ -3394,7 +3394,53 @@ void ggml_vec_dot_iq3_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     const int nb = n / QK_K;
 
-#if defined(__AVX2__)
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+
+    // IQ3S-512 (tests/INVARIANTS.md): 64 elements a step, the AVX2 path's arithmetic exactly. Lane l of the 512-bit
+    // sum holds what AVX2's sumi1 (l < 8) or sumi2 (l >= 8) holds, so the 8-lane fmadd and the hsum below are its own.
+    // The sign bytes are the negate mask for q8, qh's bits the mask for the index's ninth bit, and vpdpwssd is the
+    // scale multiply-add.
+    const __m512i k256 = _mm512_set1_epi32(256);
+
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d;
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const uint8_t * GGML_RESTRICT sg = x[i].signs;
+        const int8_t  * GGML_RESTRICT q8 = y[i].qs;
+        uint32_t sc32;
+        memcpy(&sc32, x[i].scales, sizeof(sc32));
+        __m512i acc0 = _mm512_setzero_si512();
+        __m512i acc1 = _mm512_setzero_si512();
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
+            __m512i dot[2];
+            __m512i scv[2];
+            for (int k = 0; k < 2; ++k) {
+                const int ib = ib32 + 2*k;
+                __m512i idx = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(qs + 8*ib)));
+                idx = _mm512_mask_or_epi32(idx, (__mmask16)(qh[ib] | (qh[ib+1] << 8)), idx, k256);
+                const __m512i q3 = _mm512_i32gather_epi32(idx, (const int *)iq3s_grid, 4);
+                uint64_t sm;
+                memcpy(&sm, sg + 4*ib, sizeof(sm));
+                __m512i q8s = _mm512_loadu_si512((const void *)(q8 + 32*ib));
+                q8s = _mm512_mask_sub_epi8(q8s, (__mmask64)sm, _mm512_setzero_si512(), q8s);
+                dot[k] = _mm512_maddubs_epi16(q3, q8s);
+                const short ls1 = 2*((sc32 >> (4*ib    )) & 0xf) + 1;
+                const short ls2 = 2*((sc32 >> (4*ib + 4)) & 0xf) + 1;
+                scv[k] = _mm512_mask_blend_epi16(0xFFFF0000u, _mm512_set1_epi16(ls1), _mm512_set1_epi16(ls2));
+            }
+            acc0 = _mm512_dpwssd_epi32(acc0, dot[0], scv[0]);
+            acc1 = _mm512_dpwssd_epi32(acc1, dot[1], scv[1]);
+        }
+        const __m512i sumi = _mm512_add_epi32(acc0, acc1);
+        const __m256i sumi8 = _mm256_add_epi32(_mm512_castsi512_si256(sumi), _mm512_extracti64x4_epi64(sumi, 1));
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi8), accumf);
+    }
+
+    *s = hsum_float_8(accumf);
+
+#elif defined(__AVX2__)
 
    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
                                        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03
