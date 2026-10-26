@@ -78,3 +78,11 @@ One sentence per invariant; each names the test that pins it.
   it is compiled for AVX2 or for AVX-512 (F+BW+VNNI), so the AVX-512 kernel changes speed and never a result.
   Pinned by `tests/test-iq3s-dot.cpp` (that lane-structured scalar reference over random blocks, q8 = -128 included;
   red on a wrong scale nibble, high index bit or sign mask in the AVX-512 kernel).
+
+- **KV-SEQRM (fork-strata-ports, 2026-10-26).** `llama_kv_cache::seq_rm` for one sequence removes it from exactly
+  the cells a scan of every cell would (those holding it at a position in [p0, p1)) and moves the head to the same
+  cell, found through the sequence's (pos, cell) index `seq_pos` in time proportional to the cells removed, not to
+  the cache's size (262,144 cells on the served recipe, scanned per MTP rollback: 1.3% of the decode thread in
+  decode-pace-20261024T233039Z). Pinned by `tests/test-kv-seqrm.cpp` (random caches under every cell mutator,
+  duplicate positions included, against the old scan; red on an inclusive p1, a p0 off by one, or the last
+  emptied cell in position order taken as the head).

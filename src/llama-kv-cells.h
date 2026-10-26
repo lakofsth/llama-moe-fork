@@ -386,6 +386,30 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // remove seq_id from every cell that holds it at a position in [p0, p1)
+    // return the lowest index of a cell that became empty, or size() if none did
+    // KV-SEQRM (tests/INVARIANTS.md): the cells come from seq_pos[seq_id], so the cost is the number removed and not
+    // the size of the cache, and the cells, seq_pos and used end as a scan of every cell would leave them
+    uint32_t seq_rm_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        std::vector<uint32_t> idxs;
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            idxs.push_back(it->second);
+        }
+
+        uint32_t new_head = size();
+        for (const uint32_t i : idxs) {
+            if (seq_rm(i, seq_id) && i < new_head) {
+                new_head = i;
+            }
+        }
+
+        return new_head;
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());
