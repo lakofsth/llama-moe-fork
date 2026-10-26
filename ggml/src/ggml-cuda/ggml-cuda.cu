@@ -2609,8 +2609,81 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     return use_cuda_graph;
 }
 
+// GRAPH-KEY (tests/INVARIANTS.md): the cache key of a split's CUDA graph. By default the address of its first node.
+// llama reuses one ggml context for every batch shape, so with MTP the target's verify batches and the drafter's
+// batches of different sizes all start at the same node address and one cached graph is re-captured, and half the
+// time re-instantiated, at every change of shape. GGML_CUDA_GRAPH_SHAPE_KEY=1 mixes the split's node count and the
+// shapes of its first and last nodes into the key, so each shape keeps its own warm executable graph. The key only
+// chooses the cache entry: whether an entry's graph may be reused is still ggml_cuda_graph_update_required's full
+// comparison of every node, so a collision costs a re-capture and never a wrong graph.
+static bool ggml_cuda_graph_shape_key_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_SHAPE_KEY");
+        return env != nullptr && atoi(env) == 1;
+    }();
+    return enabled;
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    if (!ggml_cuda_graph_shape_key_enabled()) {
+        return cgraph->nodes[0];
+    }
+    uint64_t h = (uint64_t)(uintptr_t) cgraph->nodes[0];
+    auto mix = [&h](uint64_t v) {
+        h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix((uint64_t) cgraph->n_nodes);
+    const ggml_tensor * ends[2] = { cgraph->nodes[0], cgraph->nodes[cgraph->n_nodes - 1] };
+    for (const ggml_tensor * t : ends) {
+        mix((uint64_t) t->op);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) t->ne[d]);
+        }
+    }
+    return (const void *)(uintptr_t) h;
+}
+
+// GGML_CUDA_GRAPH_STATS=<seconds>: one WARN line per period with what the CUDA graph path did to each split it was
+// handed, so the cost of re-capture can be read from a served log. Counts are per process, all devices.
+struct ggml_cuda_graph_stats {
+    std::atomic<uint64_t> computes{0}, incompatible{0}, eager{0}, resets{0}, captures{0}, instantiates{0},
+                          update_fails{0}, launches{0};
+    std::atomic<int64_t>  last_print_us{0};
+    std::atomic<size_t>   keys{0};
+};
+static ggml_cuda_graph_stats g_cuda_graph_stats;
+
+static int64_t ggml_cuda_graph_stats_period_us() {
+    static const int64_t period = [] {
+        const char * env = getenv("GGML_CUDA_GRAPH_STATS");
+        return env != nullptr ? (int64_t) atoi(env) * 1000000 : (int64_t) 0;
+    }();
+    return period;
+}
+
+static void ggml_cuda_graph_stats_tick() {
+    const int64_t period = ggml_cuda_graph_stats_period_us();
+    if (period <= 0) {
+        return;
+    }
+    const int64_t now  = ggml_time_us();
+    int64_t       last = g_cuda_graph_stats.last_print_us.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_cuda_graph_stats.last_print_us.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < period || !g_cuda_graph_stats.last_print_us.compare_exchange_strong(last, now)) {
+        return;
+    }
+    auto & st = g_cuda_graph_stats;
+    GGML_LOG_WARN("cuda-graph-stats: %.0f s, shape key %d: computes %llu, incompatible %llu, eager %llu, resets %llu, "
+                  "captures %llu, instantiates %llu, update fails %llu, launches %llu, keys %zu\n",
+                  (now - last) / 1e6, (int) ggml_cuda_graph_shape_key_enabled(),
+                  (unsigned long long) st.computes.exchange(0), (unsigned long long) st.incompatible.exchange(0),
+                  (unsigned long long) st.eager.exchange(0), (unsigned long long) st.resets.exchange(0),
+                  (unsigned long long) st.captures.exchange(0), (unsigned long long) st.instantiates.exchange(0),
+                  (unsigned long long) st.update_fails.exchange(0), (unsigned long long) st.launches.exchange(0),
+                  st.keys.load());
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2668,6 +2741,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
 #endif // CUDART_VERSION >= 12000
 
     if (stat == cudaErrorGraphExecUpdateFailure) {
+        g_cuda_graph_stats.update_fails.fetch_add(1, std::memory_order_relaxed);
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
@@ -4486,12 +4560,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            g_cuda_graph_stats.instantiates.fetch_add(1, std::memory_order_relaxed);
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        g_cuda_graph_stats.launches.fetch_add(1, std::memory_order_relaxed);
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -4531,8 +4607,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    g_cuda_graph_stats.computes.fetch_add(1, std::memory_order_relaxed);
+    g_cuda_graph_stats.keys.store(cuda_ctx->cuda_graphs.size(), std::memory_order_relaxed);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (!graph_compatible) {
+            g_cuda_graph_stats.incompatible.fetch_add(1, std::memory_order_relaxed);
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
@@ -4550,6 +4631,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    g_cuda_graph_stats.resets.fetch_add(1, std::memory_order_relaxed);
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -4559,6 +4641,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (!use_cuda_graph) {
+        g_cuda_graph_stats.eager.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (use_cuda_graph && cuda_graph_update_required) {
+        g_cuda_graph_stats.captures.fetch_add(1, std::memory_order_relaxed);
+    }
+    ggml_cuda_graph_stats_tick();
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
