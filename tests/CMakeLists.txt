@@ -266,6 +266,7 @@ llama_build_and_test(test-hc-mix-composition.cpp) # fork-kernel-fusion: HC_MIX a
 llama_build_and_test(test-qsa-select.cpp) # fork-kernel-fusion: QSA attends whole blocks plus the tail (S1)
 llama_build_and_test(test-mlock-tensors.cpp) # fork-kernel-fusion: LLAMA_MLOCK_TENSORS locks named host tensors (M1)
 llama_build_and_test(test-iq3s-dot.cpp) # fork-strata-ports: iq3_s CPU dot bit-identical across x86 SIMD paths (IQ3S-512)
+llama_build_and_test(test-kv-seqrm.cpp) # fork-strata-ports: seq_rm of one sequence via its position index equals the full scan (KV-SEQRM)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
