@@ -277,3 +277,11 @@ One sentence per invariant; each names the test that pins it.
   identical: a graph larger than the reserve is still allocated on demand (ggml_backend_sched_alloc_splits grows
   the buffers), so a missed reserve costs time, not output; only the node budget (graph_max_nodes, sized at the
   reserve) is hard, and exceeding it aborts rather than computes wrong.
+- **GRAPH-KEY (fork-strata-ports, 2026-10-26).** With GGML_CUDA_GRAPH_SHAPE_KEY=1 the CUDA backend caches a split's
+  graph under its first node's address mixed with its node count and its first and last nodes' op and shape, so
+  batches of different sizes built in one reused context keep one warm executable graph each instead of re-capturing
+  one; the key only chooses the cache entry, and whether that entry's graph is reused is still decided by comparing
+  every node (ggml_cuda_graph_update_required), so the key never changes a result. Without the variable the key is
+  the first node's address, as upstream. Pinned by `tests/test-cuda-graph-key.cpp` (alternating shapes and
+  alternating data buffers at the same node addresses, every round against the CPU backend, key off and on; more
+  rounds served by a launched graph with the key on; red with the key ignoring shape, and with the comparison skipped).
