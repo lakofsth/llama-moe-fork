@@ -71,3 +71,10 @@ One sentence per invariant; each names the test that pins it.
   Found by the first A/B (async-ab run-20261022T133456Z), which logged two copy streams on CUDA0, one per context. Design: ~/docs/fork-async-adapt-swaps-design-2026-10-22.md. Pinned by
   `tests/test-moe-adapt-async.cpp`, which replays rounds through a fake IO that checks this ordering and the maps'
   contents.
+
+- **IQ3S-512 (fork-strata-ports, 2026-10-26).** On x86, `ggml_vec_dot_iq3_s_q8_K` returns bit for bit the value of
+  the AVX2 kernel's arithmetic — exact int32 lane sums (lane l of sub-block b = (2·scale_b+1) · Σ of its 4 signed
+  grid·q8 products), one fused multiply-add of `d` per block into 8 float lanes, and `hsum_float_8`'s order — whether
+  it is compiled for AVX2 or for AVX-512 (F+BW+VNNI), so the AVX-512 kernel changes speed and never a result.
+  Pinned by `tests/test-iq3s-dot.cpp` (that lane-structured scalar reference over random blocks, q8 = -128 included;
+  red on a wrong scale nibble, high index bit or sign mask in the AVX-512 kernel).
