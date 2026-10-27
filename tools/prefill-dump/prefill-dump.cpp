@@ -2,9 +2,11 @@
 // output on the last prompt token only, h_nextn on every row as the draft-mtp drafter asks), then write the bytes a
 // bit-identity gate compares: every h_nextn row and every output logits row in token order (PREFIX.bin), the slot's
 // memory state (PREFIX.state), and a summary with a digest per decode and the LLAMA_PREFILL_CHUNK counters (PREFIX.txt).
-// Backend samplers are turned off: LLAMA_PREFILL_CHUNK refuses a context that has them.
+// Backend samplers are turned off unless --sample N: then the served sampler chain stays on the backend with a fixed
+// seed, no logits are read, and after the prefill N tokens are sampled and fed back one at a time (decode batches,
+// so the micro-batch path); the tokens go to PREFIX.bin after the h_nextn rows and to the summary.
 //
-// usage: llama-prefill-dump --prompt-file F --out PREFIX [--n-tokens N] [--all-logits] <llama-server args>
+// usage: llama-prefill-dump --prompt-file F --out PREFIX [--n-tokens N] [--all-logits] [--sample N] <llama-server args>
 //   --all-logits: every row but each batch's first requests output (more rows compared; not the server's pattern)
 #include "arg.h"
 #include "common.h"
@@ -37,6 +39,7 @@ int main(int argc, char ** argv) {
     std::string prompt_path, out_prefix;
     int  n_tokens_max = 20000;
     bool all_logits   = false;
+    int  n_sample     = 0;
 
     std::vector<char *> rest = { argv[0] };
     for (int i = 1; i < argc; i++) {
@@ -44,6 +47,7 @@ int main(int argc, char ** argv) {
         if (!strcmp(argv[i], "--out")         && i + 1 < argc) { out_prefix   = argv[++i]; continue; }
         if (!strcmp(argv[i], "--n-tokens")    && i + 1 < argc) { n_tokens_max = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--all-logits"))                  { all_logits   = true; continue; }
+        if (!strcmp(argv[i], "--sample")      && i + 1 < argc) { n_sample     = atoi(argv[++i]); continue; }
         rest.push_back(argv[i]);
     }
     if (prompt_path.empty() || out_prefix.empty()) {
@@ -55,7 +59,12 @@ int main(int argc, char ** argv) {
     if (!common_params_parse((int) rest.size(), rest.data(), params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
-    params.sampling.backend_sampling = false;
+    if (n_sample > 0) {
+        params.sampling.backend_sampling = true;
+        params.sampling.seed = 1234;
+    } else {
+        params.sampling.backend_sampling = false;
+    }
 
     common_init();
     llama_backend_init();
@@ -124,7 +133,7 @@ int main(int argc, char ** argv) {
         uint64_t hd = fnv1a(h, n_h*sizeof(float));
 
         int n_out = 0;
-        for (int i = 0; i < n; ++i) {
+        for (int i = 0; i < n && n_sample == 0; ++i) {
             if (!batch.logits[i]) continue;
             const float * l = llama_get_logits_ith(ctx, i);
             fwrite(l, sizeof(float), n_vocab, fbin);
@@ -138,6 +147,27 @@ int main(int argc, char ** argv) {
         LOG_INF("decode %d..%d: %.3f s, %.0f t/s\n", i0, i0 + n, dt, n/dt);
     }
 
+    const double t_prefill = t_all;
+
+    if (n_sample > 0) {
+        // the prompt's last row was sampled on the backend; feed each token back as a decode of one
+        std::vector<llama_token> gen;
+        llama_token tok = llama_get_sampled_token_ith(ctx, (n_tok - 1) % n_batch);
+        for (int g = 0; g < n_sample; ++g) {
+            gen.push_back(tok);
+            if (g + 1 == n_sample) break;
+            common_batch_clear(batch);
+            common_batch_add(batch, tok, n_tok + g, { 0 }, true);
+            if (llama_decode(ctx, batch) != 0) { LOG_ERR("decode failed at generated token %d\n", g); return 1; }
+            tok = llama_get_sampled_token_ith(ctx, 0);
+        }
+        fwrite(gen.data(), sizeof(llama_token), gen.size(), fbin);
+        h_all = fnv1a(gen.data(), gen.size()*sizeof(llama_token), h_all);
+        fprintf(ftxt, "sampled");
+        for (auto t : gen) fprintf(ftxt, " %d", t);
+        fprintf(ftxt, "\n");
+    }
+
     {
         std::vector<uint8_t> st(llama_state_seq_get_size(ctx, 0));
         st.resize(llama_state_seq_get_data(ctx, st.data(), st.size(), 0));
@@ -148,8 +178,10 @@ int main(int argc, char ** argv) {
         fprintf(ftxt, "state %zu bytes digest %016" PRIx64 "\n", st.size(), fnv1a(st.data(), st.size()));
     }
 
-    fprintf(ftxt, "all digest %016" PRIx64 " prefill %.3f s %.0f t/s chunk_passes %" PRId64 " applies %" PRId64 "\n",
-            h_all, t_all, n_tok/t_all, ctx->prefill_chunk_n_passes, ctx->prefill_chunk_n_apply);
+    fprintf(ftxt, "all digest %016" PRIx64 " prefill %.3f s %.0f t/s chunk_passes %" PRId64 " applies %" PRId64
+            " pf_uploads %" PRId64 " pf_reads %" PRId64 " pf_MiB %.0f\n",
+            h_all, t_prefill, n_tok/t_prefill, ctx->prefill_chunk_n_passes, ctx->prefill_chunk_n_apply,
+            ctx->prefill_pf_n_upload, ctx->prefill_pf_n_read, ctx->prefill_pf_n_bytes/1024.0/1024.0);
 
     fclose(fbin);
     fclose(ftxt);

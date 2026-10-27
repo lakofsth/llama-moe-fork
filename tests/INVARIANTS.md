@@ -93,8 +93,11 @@ One sentence per invariant; each names the test that pins it.
   (attention and indexer cells and heads, recurrent cells, head, n, rs_z, used and the rollback index rs_idx), with
   each ubatch applied exactly once; so its logits, h_nextn rows and memory state are bit for bit those of the
   micro-batch-major path. Unset or C < 2 is the micro-batch path unchanged; a batch in which a sequence's first token
-  requests output (a generating sequence), or with pooling, embeddings, per-layer input embeddings or backend
-  samplers, takes the micro-batch path. Pinned by `tests/test-prefill-chunk.cpp` (a random 12-layer qwen4exp MoE
+  requests output (a generating sequence), or with pooling, embeddings or per-layer input embeddings, takes the
+  micro-batch path. Backend samplers take the chunk path since P2 (28 Oct; amended): the last group's pass builds the
+  sampler graph once per ubatch in token order and the dist sampler draws in set_input only for a sequence with an
+  output in the ubatch, so the sampled tokens are the micro-batch path's (scenario `sampling`; red with the old
+  refusal put back, and with one extra set_inputs on the last group, 7/63 on the sampled tokens). Pinned by `tests/test-prefill-chunk.cpp` (a random 12-layer qwen4exp MoE
   with PLE and QSA on the CPU: 7 (C, G) configurations x 8 scenarios, incl. 3 sequences per batch, an MTP-style
   rollback with rs_idx != 0 on entry, and a reused recurrent cell; it compares the logits, h_nextn, the
   llama_state_get_data bytes, the apply() count and every named graph input each pass saw; 8 scenarios incl. one
@@ -114,3 +117,19 @@ One sentence per invariant; each names the test that pins it.
   writes map_cpu_pf and the plan from the same values (llama_moe_split_set_pf). Pinned by `tests/test-moe-prefetch.cpp`
   (R = 1..4; red with the upload's source offset taken from the slot index, with the compute stream's wait on the
   upload removed, and with the copy stream's wait on the earlier read removed).
+
+- **PREFILL-CHUNK-PF (fork-chunk-loop P2, 2026-10-28).** Under LLAMA_PREFILL_CHUNK with LLAMA_MOE_PREFETCH_PP=R, every
+  compact-id MUL_MAT_ID reads a ring slot holding its weight's plan at the current plan generation (bumped by every
+  ggml_backend_sched_moe_pf_plan: load, repin, adaptive swap), and a slot is written only after the last read of
+  what it held, so the outputs are the stock prefetch's (P1) bit for bit. With G = 1 and R >= a host layer's entries,
+  the chunk uploads each host layer once (not once per pass); the chunk's m-th distinct weight takes slot m % R, the
+  stock layout, so the slots are the stock prefetch's size when R is a multiple of a layer's entries; the next
+  layer's entries go up as soon as the ring frees a slot (at a pass's start into slots it does not read; on the
+  group's last pass, after each read). A pass with more entries than R keeps the per-graph ring. Pinned by
+  `tests/test-moe-pf-ring.cpp` (the planner, ggml/src/ggml-moe-pf-ring.h, replayed in the scheduler's issue order:
+  1052 checks over E = 2, 3; R = 1..6; C = 2, 4, 8; G = 1, 4; short last ubatches; plan changes inside chunks).
+  Each mechanism reverted alone is red (tests/prefill-chunk-mutate.py R1-R6, on bcd9ba22f): slot reuse 68,
+  generation in the match 94, after-read hints only on the last pass 30, start-of-pass hints only into unread slots
+  120, hints capped at R 18, the m % R layout 25 (of 1052). Residual: the planner-to-compute_splits seam (events, the
+  slot pointer swap, the copy stream) runs only on CUDA; gated by <bench>/chunk-loop/gate-bits-p2.sh
+  (copy tests/prefill-chunk-gate-bits-p2.sh): bits vs base and uploads < reads on the chunk arms.
