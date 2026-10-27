@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <mutex>
+#include <string>
 
 #include "ggml-moe-pf-ring.h"
 #include <unordered_map>
@@ -1811,6 +1812,8 @@ struct ggml_sched_moe_pf {
     }
 };
 
+static void ggml_backend_sched_moe_pf_trace(const ggml_sched_moe_pf * pf, uint64_t gen, bool last, const char * mode);
+
 static ggml_sched_moe_pf * ggml_backend_sched_moe_pf_get(ggml_backend_sched_t sched) {
     if (sched->moe_pf == NULL) {
         ggml_sched_moe_pf * pf = new ggml_sched_moe_pf();
@@ -1833,6 +1836,7 @@ void ggml_backend_sched_moe_pf_chunk(ggml_backend_sched_t sched, bool on) {
     pf->chunk = on;
     pf->ring.invalidate();
     pf->next.clear();
+    ggml_backend_sched_moe_pf_trace(pf, 0, on, nullptr);
 }
 
 void ggml_backend_sched_moe_pf_next(ggml_backend_sched_t sched, const struct ggml_tensor * const * weights, int n, bool last) {
@@ -1867,6 +1871,35 @@ static void ggml_backend_sched_moe_pf_grow(ggml_backend_sched_t sched, ggml_sche
     ggml_backend_buffer_clear(pf->buf[j], 0);
     pf->size[j] = need;
     GGML_LOG_WARN("moe-prefetch: slot %d of %d on %s: %.1f MiB\n", j, pf->R, ggml_backend_name(sched->backends[pf->backend_id]), need/1024.0/1024.0);
+}
+
+// LLAMA_MOE_PF_TRACE=1: one WARN line per planned chunk graph, for the first LLAMA_MOE_PF_TRACE_N (default 400):
+// the generation, the pass (last or not), and per entry its tensor, slot, hit or upload (when), and size; per hint the same
+static void ggml_backend_sched_moe_pf_trace(const ggml_sched_moe_pf * pf, uint64_t gen, bool last, const char * mode) {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_PF_TRACE"); return e && atoi(e) != 0; }();
+    static const int  cap = [] { const char * e = getenv("LLAMA_MOE_PF_TRACE_N"); return e ? atoi(e) : 400; }();
+    static int n_lines = 0;
+    if (!on || n_lines >= cap) return;
+    n_lines++;
+    std::string line;
+    char buf[256];
+    if (mode == nullptr) { // chunk mode switched (pf_chunk)
+        GGML_LOG_WARN("moe-prefetch trace: chunk %s, uploads so far %lld\n", last ? "on" : "off", (long long) pf->n_upload);
+        return;
+    }
+    snprintf(buf, sizeof(buf), "moe-prefetch trace: %s graph gen %llu %s uploads so far %lld:", mode, (unsigned long long) gen,
+             last ? "last-pass" : "pass", (long long) pf->n_upload);
+    line += buf;
+    for (const auto & e : pf->entries) {
+        snprintf(buf, sizeof(buf), " [%s s%d %s %.0fMiB]", e.input->name, e.slot,
+                 !e.upload ? "hit" : e.after < 0 ? "up@start" : ("up@" + std::to_string(e.after)).c_str(), e.need()/1048576.0);
+        line += buf;
+    }
+    for (const auto & h : pf->hints) {
+        snprintf(buf, sizeof(buf), " hint[%s s%d %s]", h.input->name, h.slot, h.after < 0 ? "@start" : ("@" + std::to_string(h.after)).c_str());
+        line += buf;
+    }
+    GGML_LOG_WARN("%s\n", line.c_str());
 }
 
 // collect this graph's prefetch entries in split order; abort on any compact-id MUL_MAT_ID the slot path cannot serve
@@ -2003,11 +2036,14 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
         pf->zeros_size = padmax;
     }
 
-    if (pf->chunk && (int) pf->entries.size() <= pf->R) {
+    ggml_moe_pf_ring::decision d;
+    if (pf->chunk) {
         std::vector<ggml_moe_pf_ring::item> it_e, it_h;
         for (const auto & e : pf->entries) it_e.push_back({ e.input, e.gen, e.need() });
         for (const auto & e : hints)       it_h.push_back({ e.input, e.gen, e.need() });
-        const ggml_moe_pf_ring::decision d = pf->ring.plan(it_e, it_h, last);
+        d = pf->ring.plan(it_e, it_h, last);
+    }
+    if (pf->chunk && d.grow.size() == (size_t) pf->R) {
         for (int j = 0; j < pf->R; j++) {
             if (d.grow[j] > pf->size[j]) {
                 ggml_backend_sched_moe_pf_grow(sched, pf, j, d.grow[j]);
@@ -2016,6 +2052,7 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
         for (size_t i = 0; i < pf->entries.size(); i++) {
             pf->entries[i].slot   = d.slot[i];
             pf->entries[i].upload = d.upload[i];
+            pf->entries[i].after  = d.after[i];
         }
         for (size_t t = 0; t < hints.size(); t++) {
             if (d.hint_slot[t] < 0) continue;
@@ -2024,13 +2061,14 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
             pf->hints.push_back(std::move(hints[t]));
         }
         pf->chunk_ring = true;
+        ggml_backend_sched_moe_pf_trace(pf, gen, last, "ring");
         return;
     }
 
     if (pf->chunk && !pf->warned_wide) {
         pf->warned_wide = true;
-        GGML_LOG_WARN("moe-prefetch: a chunk pass holds %zu prefetch entries, more than the ring's %d: each pass uploads its own "
-                      "(LLAMA_PREFILL_CHUNK_GROUP=1 keeps a layer's entries in the ring for the whole chunk)\n", pf->entries.size(), pf->R);
+        GGML_LOG_WARN("moe-prefetch: a chunk pass of %zu prefetch entries cannot be planned in the ring's %d slots without "
+                      "growing a slot it reads: this pass and any like it upload every entry\n", pf->entries.size(), pf->R);
     }
     pf->ring.invalidate();
     // size the ring: slot j holds the largest entry i == j (mod R), its row pad, plus 512 zeroed bytes
@@ -2048,6 +2086,10 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
     for (size_t i = 0; i < pf->entries.size(); i++) {
         pf->entries[i].slot   = (int) i % pf->R;
         pf->entries[i].upload = true;
+        pf->entries[i].after  = (int) i - pf->R;
+    }
+    if (pf->chunk) {
+        ggml_backend_sched_moe_pf_trace(pf, gen, last, "per-graph");
     }
 }
 
@@ -2124,7 +2166,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         pf = sched->moe_pf;
         if (pf != NULL && pf->chunk_ring) {
             for (const auto & e : pf->entries) {
-                if (e.upload) ggml_backend_sched_moe_pf_upload(pf, e);
+                if (e.upload && e.after < 0) ggml_backend_sched_moe_pf_upload(pf, e);
             }
             for (const auto & h : pf->hints) {
                 if (h.after < 0) ggml_backend_sched_moe_pf_upload(pf, h);
@@ -2476,6 +2518,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             pf->read_recorded[j] = true;
             pf->n_read++;
             if (pf->chunk_ring) {
+                for (const auto & e : pf->entries) {
+                    if (e.upload && e.after == pf_i) ggml_backend_sched_moe_pf_upload(pf, e);
+                }
                 for (const auto & h : pf->hints) {
                     if (h.after == pf_i) ggml_backend_sched_moe_pf_upload(pf, h);
                 }

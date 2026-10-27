@@ -1935,8 +1935,8 @@ void llama_context::prefill_chunk_init() {
         prefill_chunk_pf_min = e_pf && atoi(e_pf) > 0 ? std::max(pf_min, 32) : 0;
         if (prefill_chunk_pf_min > 0) {
             LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK with LLAMA_MOE_PREFETCH_PP=%s: %s\n", __func__, e_pf,
-                    g == 1 ? "a host layer's prefetch slots are uploaded once per chunk and the next layer's as soon as the ring frees a slot"
-                           : "LLAMA_PREFILL_CHUNK_GROUP > 1: a pass holds several host layers, so the ring is uploaded per pass unless it holds them all");
+                    g == 1 ? "a host layer's prefetch slots are kept across the chunk's passes (a layer with more entries than slots keeps all but one) and the next layer's go up as soon as the ring frees a slot"
+                           : "LLAMA_PREFILL_CHUNK_GROUP > 1: a pass holds several host layers, so each pass uploads its own (the stock per-graph ring)");
         }
     }
 
@@ -2362,8 +2362,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             ggml_status status = applied ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 
-            // LLAMA_MOE_PREFETCH_PP: within the chunk a layer's prefetch slots are uploaded once and read by every pass
-            ggml_backend_sched_moe_pf_chunk(sched.get(), true);
+            // LLAMA_MOE_PREFETCH_PP: within a chunk of one-layer passes a layer's prefetch slots are kept for every pass
+            // (a pass of several layers, or a chunk of one ubatch, has nothing to keep: the stock per-graph ring)
+            const bool pf_chunk = group == 1;
+            ggml_backend_sched_moe_pf_chunk(sched.get(), pf_chunk);
             std::vector<const ggml_tensor *> pf_next;
 
             for (int32_t il0 = 0; applied && il0 < n_layer && status == GGML_STATUS_SUCCESS; il0 += group) {
@@ -2387,7 +2389,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     // the host expert weights the next group reads, for the prefetch ring to fetch early
                     // (only if that group's first ubatch is wide enough to read them through the prefetch)
                     pf_next.clear();
-                    if (il1 < n_layer && prefill_chunk_pf_min > 0) {
+                    if (pf_chunk && il1 < n_layer && prefill_chunk_pf_min > 0) {
                         if (n_tokens_k[0] >= (uint32_t) prefill_chunk_pf_min) {
                             for (int32_t il = il1; il < std::min(il1 + group, n_layer); ++il) {
                                 const auto & L = model.layers[il];
@@ -2400,7 +2402,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                             }
                         }
                     }
-                    ggml_backend_sched_moe_pf_next(sched.get(), pf_next.data(), (int) pf_next.size(), k + 1 == n_chunk);
+                    if (pf_chunk) {
+                        ggml_backend_sched_moe_pf_next(sched.get(), pf_next.data(), (int) pf_next.size(), k + 1 == n_chunk);
+                    }
 
                     prefill_chunk_n_passes++;
                     const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status, &range);
@@ -2417,7 +2421,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 }
             }
 
-            ggml_backend_sched_moe_pf_chunk(sched.get(), false);
+            if (pf_chunk) {
+                ggml_backend_sched_moe_pf_chunk(sched.get(), false);
+            }
 
             if (status != GGML_STATUS_SUCCESS) {
                 // no ubatch of the chunk is complete -> remove the whole chunk from the memory module
