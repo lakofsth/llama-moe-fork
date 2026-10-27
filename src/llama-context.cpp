@@ -499,6 +499,8 @@ llama_context::llama_context(
 
         sched_reserve();
 
+        prefill_chunk_init();
+
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -1488,11 +1490,14 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
-        ret = GGML_STATUS_FAILED;
-        return nullptr;
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, const chunk_range * range) {
+    if (mctx && !range) {
+        prefill_chunk_n_apply++;
+        if (!mctx->apply()) {
+            LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -1500,7 +1505,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, range);
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1547,6 +1552,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        if (prefill_chunk_trace) {
+            prefill_chunk_trace_inputs(res->get_gf(), prefill_chunk_n_ubatch + (range ? range->k : 0));
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1826,6 +1835,161 @@ static std::string llama_moe_all_layer_tally(const llama_model & model, int64_t 
             n_counted, n_gpu_whole, n_cpu_whole);
 }
 
+void llama_context::prefill_chunk_init() {
+    const char * env_c = getenv("LLAMA_PREFILL_CHUNK");
+    const char * env_g = getenv("LLAMA_PREFILL_CHUNK_GROUP");
+
+    const int c = env_c ? atoi(env_c) : 0;
+    const int g = env_g ? atoi(env_g) : 4;
+
+    if (env_c == nullptr || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return;
+    }
+
+    auto off = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK=%s: off, %s\n", __func__, env_c, why);
+    };
+
+    if (c < 2) {
+        off("C < 2 is the micro-batch path");
+        return;
+    }
+    if (model.arch != LLM_ARCH_QWEN4EXP || !memory) {
+        off("only the qwen4exp graph builds a layer range");
+        return;
+    }
+    if (cparams.pipeline_parallel) {
+        off("not with pipeline parallelism");
+        return;
+    }
+
+    const auto & hparams = model.hparams;
+    const uint32_t n_layer = hparams.n_layer();
+
+    // the period of the layer-type pattern (full_attention_interval for qwen4exp)
+    uint32_t period = n_layer;
+    for (uint32_t p = 1; p <= n_layer; ++p) {
+        bool ok = true;
+        for (uint32_t il = p; il < n_layer && ok; ++il) {
+            ok = hparams.is_recr(il) == hparams.is_recr(il % p);
+        }
+        if (ok) {
+            period = p;
+            break;
+        }
+    }
+
+    if (g < 1 || (g != 1 && g % (int) period != 0)) {
+        LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK=%d: off, LLAMA_PREFILL_CHUNK_GROUP=%d is neither 1 nor a multiple of the layer pattern %u\n",
+                __func__, c, g, period);
+        return;
+    }
+
+    // one residual buffer per device that holds a layer
+    const int64_t n_embd_res = hparams.n_embd * hparams.dsv4_hc_mult;
+    const int64_t n_rows     = (int64_t) cparams.n_ubatch * c;
+
+    std::map<ggml_backend_buffer_type_t, ggml_tensor *> by_buft;
+    std::vector<ggml_tensor *> res(n_layer, nullptr);
+    std::string devs;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+        auto it = by_buft.find(buft);
+        if (it == by_buft.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx(ggml_init(params));
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd_res, n_rows);
+            ggml_format_name(t, "prefill_chunk_res.%s", ggml_backend_dev_name(dev));
+
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                prefill_chunk_bufs.clear();
+                off("could not allocate the residual buffer");
+                return;
+            }
+            ggml_backend_buffer_clear(buf.get(), 0);
+
+            devs += std::string(devs.empty() ? "" : ", ") + ggml_backend_dev_name(dev);
+            prefill_chunk_bufs.emplace_back(std::move(ctx), std::move(buf));
+            it = by_buft.emplace(buft, t).first;
+        }
+        res[il] = it->second;
+    }
+
+    prefill_chunk     = (uint32_t) c;
+    prefill_chunk_g   = (uint32_t) g;
+    prefill_chunk_res = std::move(res);
+
+    LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK=%u LLAMA_PREFILL_CHUNK_GROUP=%u: prompt-only batches of more than one ubatch run layer-major, "
+            "%u ubatches x %u layers per pass; residual %.1f MiB on each of %s\n", __func__,
+            prefill_chunk, prefill_chunk_g, prefill_chunk, prefill_chunk_g,
+            n_embd_res*n_rows*sizeof(float)/1024.0/1024.0, devs.c_str());
+}
+
+void llama_context::prefill_chunk_trace_inputs(ggml_cgraph * gf, int64_t ubatch) {
+    std::set<const ggml_tensor *> seen;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * t = node->src[j];
+            if (!t || !(t->flags & GGML_TENSOR_FLAG_INPUT) || !t->buffer || !seen.insert(t).second) {
+                continue;
+            }
+            input_record r;
+            r.ubatch = ubatch;
+            r.name   = t->name;
+            r.data.resize(sizeof(t->ne) + ggml_nbytes(t));
+            memcpy(r.data.data(), t->ne, sizeof(t->ne));
+            ggml_backend_tensor_get(t, r.data.data() + sizeof(t->ne), 0, ggml_nbytes(t));
+            prefill_chunk_inputs.push_back(std::move(r));
+        }
+    }
+}
+
+const char * llama_context::prefill_chunk_refusal(const llama_batch_ext & batch_inp, const llama_memory_context_i * mctx, bool output_all) const {
+    if (output_all || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+        return "embeddings or pooling are on";
+    }
+    for (bool on : cparams.embeddings_layer_inp) {
+        if (on) {
+            return "per-layer input embeddings are on";
+        }
+    }
+    if (!sampling.samplers.empty()) {
+        return "backend samplers are set";
+    }
+    if (!mctx->chunk_supported()) {
+        return "the memory does not support chunks";
+    }
+
+    // policy: prompt-only batches. A generating sequence's tokens all request output (its sampled token, then any
+    // draft tokens), while a prompt's tokens request none but its last. So a sequence whose first token in this
+    // batch requests output is generating, and the whole batch takes the micro-batch path.
+    // A prompt whose final slice is a single token counts as generating: both paths give the same result.
+    std::vector<bool> seen(LLAMA_MAX_SEQ, false);
+
+    for (const auto & tok : batch_inp.tokens) {
+        for (auto seq_id : tok.seq_ids) {
+            if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || seen[seq_id]) {
+                continue;
+            }
+            seen[seq_id] = true;
+            if (tok.output) {
+                return "the batch holds a generating sequence";
+            }
+        }
+    }
+
+    return nullptr;
+}
+
 int llama_context::decode(const llama_batch_ext & batch_inp) {
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2000,65 +2164,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
-
-        // count the outputs in this ubatch
-        {
-            int32_t n_outputs_new = 0;
-
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                }
-            }
-
-            // needs to happen before the graph is built
-            n_outputs = n_outputs_new;
-        }
-
-        ggml_status status;
-
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
-
-        if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
-                }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
-            }
-
-            switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
-                case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
-                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
-            }
-        }
-
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
-
+    // copy the outputs of one ubatch out of its graph, at the offsets the ubatches before it in token order left
+    auto extract_outputs = [&](const llm_graph_result * res, const llama_ubatch & ubatch) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2172,9 +2279,200 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
-
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
+    };
+
+    // fork: LLAMA_PREFILL_CHUNK. A prompt batch of several ubatches runs layer-major over chunks of C ubatches: for each
+    // group of layers, ubatches k = 0..C-1 in token order, then the next group. Each ubatch is applied to the memory once
+    // and its metadata saved; every pass swaps that metadata back in, so each layer sees what it sees today, in the same
+    // order. Outputs are taken in the last group's pass, in token order, so their offsets are today's.
+    const char * chunk_refusal = nullptr;
+    const bool use_chunk = prefill_chunk >= 2 && n_tokens_all > cparams.n_ubatch &&
+        (chunk_refusal = prefill_chunk_refusal(batch_inp, mctx.get(), output_all)) == nullptr;
+
+    if (prefill_chunk >= 2 && chunk_refusal && prefill_chunk_warned.insert(chunk_refusal).second) {
+        LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK: %s, so the batch takes the micro-batch path (logged once)\n", __func__, chunk_refusal);
+    }
+
+    if (use_chunk) {
+        const int32_t n_layer = (int32_t) hparams.n_layer();
+        const llm_graph_type gtype = ctx_type_to_graph_type(cparams.ctx_type);
+
+        auto count_outputs = [&](const llama_ubatch & ubatch) {
+            int32_t n = 0;
+            if (n_outputs_all == n_tokens_all) {
+                n = ubatch.n_tokens;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                    n += (int32_t) (ubatch.output[i] != 0);
+                }
+            }
+            return n;
+        };
+
+        uint32_t i_first = 0; // index of the chunk's first ubatch
+        bool more = true;
+
+        while (more) {
+            llama_pos pos_min[LLAMA_MAX_SEQ];
+            std::fill(pos_min, pos_min + LLAMA_MAX_SEQ, std::numeric_limits<llama_pos>::max());
+
+            // apply each ubatch of the chunk once and keep the metadata it leaves
+            uint32_t n_chunk = 0;
+            bool applied = true;
+            while (true) {
+                const auto & ubatch = mctx->get_ubatch();
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    const auto & seq_id = ubatch.seq_id[i][0];
+                    pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+                }
+
+                prefill_chunk_n_apply++;
+                if (!mctx->apply()) {
+                    LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+                    applied = false;
+                    break;
+                }
+                mctx->chunk_save(n_chunk++);
+
+                if (n_chunk == prefill_chunk) {
+                    break;
+                }
+                if (!mctx->next()) {
+                    more = false;
+                    break;
+                }
+            }
+
+            // a chunk of one ubatch runs the whole graph, as today
+            const int32_t group = n_chunk > 1 ? (int32_t) prefill_chunk_g : n_layer;
+
+            ggml_status status = applied ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
+
+            for (int32_t il0 = 0; applied && il0 < n_layer && status == GGML_STATUS_SUCCESS; il0 += group) {
+                const int32_t il1 = std::min(il0 + group, n_layer);
+
+                for (uint32_t k = 0; k < n_chunk; ++k) {
+                    mctx->chunk_swap_in(k, i_first + k);
+
+                    const auto & ubatch = mctx->get_ubatch();
+
+                    // needs to happen before the graph is built
+                    n_outputs = count_outputs(ubatch);
+
+                    chunk_range range;
+                    range.il_begin = il0;
+                    range.il_end   = il1 == n_layer ? -1 : il1;
+                    range.k        = k;
+                    range.res_in   = il0 > 0       ? prefill_chunk_res[il0 - 1] : nullptr;
+                    range.res_out  = il1 < n_layer ? prefill_chunk_res[il1 - 1] : nullptr;
+
+                    prefill_chunk_n_passes++;
+                    const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status, &range);
+
+                    mctx->chunk_swap_out(k);
+
+                    if (!res) {
+                        break;
+                    }
+
+                    if (il1 == n_layer) {
+                        extract_outputs(res, ubatch);
+                    }
+                }
+            }
+
+            if (status != GGML_STATUS_SUCCESS) {
+                // no ubatch of the chunk is complete -> remove the whole chunk from the memory module
+                for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                    if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                        continue;
+                    }
+
+                    LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                    memory->seq_rm(s, pos_min[s], -1);
+                }
+
+                switch (status) {
+                    case GGML_STATUS_ABORTED:      return  2;
+                    case GGML_STATUS_ALLOC_FAILED: return -2;
+                    case GGML_STATUS_FAILED:       return -3;
+                    case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+                }
+            }
+
+            i_first += n_chunk;
+            prefill_chunk_n_ubatch += n_chunk;
+
+            if (more && n_chunk == prefill_chunk) {
+                more = mctx->next();
+            }
+        }
+    } else
+    // the micro-batch-major path
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        // count the outputs in this ubatch
+        {
+            int32_t n_outputs_new = 0;
+
+            if (n_outputs_all == n_tokens_all) {
+                n_outputs_new = ubatch.n_tokens;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+                }
+            }
+
+            // needs to happen before the graph is built
+            n_outputs = n_outputs_new;
+        }
+
+        ggml_status status;
+
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (!res) {
+            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+            llama_pos pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+
+                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                memory->seq_rm(s, pos_min[s], -1);
+            }
+
+            switch (status) {
+                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ALLOC_FAILED: return -2;
+                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+
+        extract_outputs(res, ubatch);
+        prefill_chunk_n_ubatch++;
     } while (mctx->next());
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
@@ -2933,8 +3231,9 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
-    return {
+                          llm_graph_type   gtype,
+                       const chunk_range * range) const {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -2952,6 +3251,16 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
+
+    if (range) {
+        params.il_begin      = range->il_begin;
+        params.il_end        = range->il_end;
+        params.chunk_k       = range->k;
+        params.chunk_res_in  = range->res_in;
+        params.chunk_res_out = range->res_out;
+    }
+
+    return params;
 }
 
 ggml_status llama_context::graph_compute(

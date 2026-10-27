@@ -222,6 +222,12 @@ public:
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
+    // fork: layer-major prefill chunks (see llama_memory_context_i::chunk_save)
+    // chunk_save copies the cells and heads into slot k; chunk_swap exchanges them with slot k (call it again to undo)
+    // a cache that shares the cells of another one does nothing: the owner of the cells saves them
+    void chunk_save(uint32_t k);
+    void chunk_swap(uint32_t k);
+
     //
     // input API
     //
@@ -316,6 +322,13 @@ private:
 
     llama_kv_cells_vec & v_cells;
 
+    struct chunk_meta {
+        llama_kv_cells_vec    cells;
+        std::vector<uint32_t> heads;
+    };
+
+    std::vector<chunk_meta> chunk_metas;
+
     // maps from a sequence id to a stream id
     std::vector<uint32_t> seq_to_stream;
 
@@ -398,6 +411,11 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool chunk_supported() const override;
+    void chunk_save(uint32_t k) override;
+    void chunk_swap_in(uint32_t k, uint32_t i) override;
+    void chunk_swap_out(uint32_t k) override;
 
     //
     // llama_kv_cache_context specific API

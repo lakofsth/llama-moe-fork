@@ -132,6 +132,11 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool chunk_supported() const override;
+    void chunk_save(uint32_t k) override;
+    void chunk_swap_in(uint32_t k, uint32_t i) override;
+    void chunk_swap_out(uint32_t k) override;
+
     //
     // llama_memory_hybrid_idx_context specific API
     //

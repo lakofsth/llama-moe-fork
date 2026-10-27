@@ -14,6 +14,8 @@
 
 #include <array>
 #include <map>
+#include <set>
+#include <string>
 #include <vector>
 
 struct llama_model;
@@ -132,15 +134,26 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
+    // fork: one pass of a layer-major prefill chunk (LLAMA_PREFILL_CHUNK), see llm_graph_params::il_begin
+    struct chunk_range {
+        int32_t       il_begin = 0;
+        int32_t       il_end   = -1;
+        uint32_t      k        = 0;
+        ggml_tensor * res_in   = nullptr;
+        ggml_tensor * res_out  = nullptr;
+    };
+
     // process a single ubatch with a specific graph type
     // if memory_context is provided, it will be applied first to the context's memory
+    //   (not with a chunk range: the chunk loop has applied it and swapped its metadata in)
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                 const chunk_range * range = nullptr);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -266,7 +279,14 @@ private:
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                       const chunk_range * range = nullptr) const;
+
+    // fork: LLAMA_PREFILL_CHUNK. allocate the residual buffers; log the config, or why it is off
+    void prefill_chunk_init();
+
+    // fork: LLAMA_PREFILL_CHUNK. why this batch takes the micro-batch-major path, or nullptr if it may take the chunk path
+    const char * prefill_chunk_refusal(const llama_batch_ext & batch_inp, const llama_memory_context_i * mctx, bool output_all) const;
 
     llm_graph_cb graph_get_cb() const;
 
@@ -399,6 +419,35 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // fork: env LLAMA_PREFILL_CHUNK=C (0 = off) and LLAMA_PREFILL_CHUNK_GROUP=G (layers per pass)
+    uint32_t prefill_chunk   = 0;
+    uint32_t prefill_chunk_g = 0;
+
+    // per layer, the residual buffer [n_embd*hc, n_ubatch*C] on that layer's device
+    std::vector<ggml_tensor *> prefill_chunk_res;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> prefill_chunk_bufs;
+
+    // the refusal reasons already logged, one WARN line each
+    std::set<std::string> prefill_chunk_warned;
+
+public:
+    // fork: test instruments (tests/test-prefill-chunk.cpp). memory apply() calls made by decode(), chunk passes run,
+    // and with prefill_chunk_trace set, every named graph input each graph saw: (ubatch number, name, shape and bytes)
+    int64_t prefill_chunk_n_apply  = 0;
+    int64_t prefill_chunk_n_passes = 0;
+    int64_t prefill_chunk_n_ubatch = 0;
+
+    struct input_record {
+        int64_t              ubatch;
+        std::string          name;
+        std::vector<uint8_t> data;
+    };
+
+    bool prefill_chunk_trace = false;
+    std::vector<input_record> prefill_chunk_inputs;
+private:
+    void prefill_chunk_trace_inputs(ggml_cgraph * gf, int64_t ubatch);
 
     // perf
     mutable int64_t t_start_us  = 0;

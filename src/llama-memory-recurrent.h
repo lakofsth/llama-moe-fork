@@ -108,6 +108,13 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // fork: layer-major prefill chunks (see llama_memory_context_i::chunk_save)
+    // chunk_swap_in(k) makes slot k live, chunk_swap_out(k) undoes it. rs_idx is copied in, not swapped:
+    // set_inputs() resets it, and every pass over slot k must see the value it had after apply()
+    void chunk_save(uint32_t k);
+    void chunk_swap_in(uint32_t k);
+    void chunk_swap_out(uint32_t k);
+
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
@@ -119,6 +126,22 @@ private:
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
+
+    struct chunk_meta {
+        std::vector<mem_cell> cells;
+
+        uint32_t head = 0;
+        uint32_t used = 0;
+        uint32_t n    = 0;
+        int32_t  rs_z = -1;
+
+        std::vector<uint32_t> rs_idx;
+    };
+
+    std::vector<chunk_meta> chunk_metas;
+
+    // the live rs_idx while a slot is swapped in
+    std::vector<uint32_t> chunk_rs_idx_live;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -161,6 +184,11 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+
+    bool chunk_supported() const override;
+    void chunk_save(uint32_t k) override;
+    void chunk_swap_in(uint32_t k, uint32_t i) override;
+    void chunk_swap_out(uint32_t k) override;
 
     //
     // llama_memory_recurrent_context specific API

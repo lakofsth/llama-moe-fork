@@ -64,6 +64,16 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // fork: layer-major prefill chunks (LLAMA_PREFILL_CHUNK, see llama_context::decode)
+    // apply() is not idempotent, so a chunk applies each of its ubatches once and keeps the metadata each one left:
+    //   chunk_save(k)       after apply(): copy the memory metadata into slot k, then advance the live metadata as set_inputs() does
+    //   chunk_swap_in(k, i) make slot k the live metadata and point the context at ubatch i, without apply()
+    //   chunk_swap_out(k)   undo chunk_swap_in(k)
+    virtual bool chunk_supported() const { return false; }
+    virtual void chunk_save(uint32_t /*k*/) { GGML_ABORT("chunk_save not supported"); }
+    virtual void chunk_swap_in(uint32_t /*k*/, uint32_t /*i*/) { GGML_ABORT("chunk_swap_in not supported"); }
+    virtual void chunk_swap_out(uint32_t /*k*/) { GGML_ABORT("chunk_swap_out not supported"); }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

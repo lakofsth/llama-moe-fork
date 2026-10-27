@@ -721,6 +721,42 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
+void llama_memory_recurrent::chunk_save(uint32_t k) {
+    if (chunk_metas.size() <= k) {
+        chunk_metas.resize(k + 1);
+    }
+    auto & m = chunk_metas[k];
+    m.cells  = cells;
+    m.head   = head;
+    m.used   = used;
+    m.n      = n;
+    m.rs_z   = rs_z;
+    m.rs_idx = rs_idx;
+}
+
+void llama_memory_recurrent::chunk_swap_in(uint32_t k) {
+    GGML_ASSERT(k < chunk_metas.size());
+    auto & m = chunk_metas[k];
+    cells.swap(m.cells);
+    std::swap(head, m.head);
+    std::swap(used, m.used);
+    std::swap(n,    m.n);
+    std::swap(rs_z, m.rs_z);
+    chunk_rs_idx_live = rs_idx;
+    rs_idx = m.rs_idx;
+}
+
+void llama_memory_recurrent::chunk_swap_out(uint32_t k) {
+    GGML_ASSERT(k < chunk_metas.size());
+    auto & m = chunk_metas[k];
+    cells.swap(m.cells);
+    std::swap(head, m.head);
+    std::swap(used, m.used);
+    std::swap(n,    m.n);
+    std::swap(rs_z, m.rs_z);
+    rs_idx = chunk_rs_idx_live;
+}
+
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
@@ -1275,6 +1311,31 @@ bool llama_memory_recurrent_context::apply() {
 
 llama_memory_status llama_memory_recurrent_context::get_status() const {
     return status;
+}
+
+bool llama_memory_recurrent_context::chunk_supported() const {
+    return !ubatches.empty() && !is_full;
+}
+
+void llama_memory_recurrent_context::chunk_save(uint32_t k) {
+    GGML_ASSERT(!ubatches.empty());
+    mem->chunk_save(k);
+
+    // set_inputs() fills s_copy, which resets the rollback index of each sequence it reads (s_copy())
+    // the next apply() must see that reset whether or not a graph of this chunk reads s_copy
+    for (uint32_t i = 0; i < get_n_rs(); ++i) {
+        s_copy(i);
+    }
+}
+
+void llama_memory_recurrent_context::chunk_swap_in(uint32_t k, uint32_t i) {
+    GGML_ASSERT(i < ubatches.size());
+    mem->chunk_swap_in(k);
+    i_next = i;
+}
+
+void llama_memory_recurrent_context::chunk_swap_out(uint32_t k) {
+    mem->chunk_swap_out(k);
 }
 
 const llama_ubatch & llama_memory_recurrent_context::get_ubatch() const {

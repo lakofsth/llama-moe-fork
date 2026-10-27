@@ -349,6 +349,30 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }
 
+bool llama_memory_hybrid_context::chunk_supported() const {
+    return ctx_attn->chunk_supported() && ctx_recr->chunk_supported() && (!ctx_idx || ctx_idx->chunk_supported());
+}
+
+void llama_memory_hybrid_context::chunk_save(uint32_t k) {
+    ctx_attn->chunk_save(k);
+    ctx_recr->chunk_save(k);
+    if (ctx_idx) ctx_idx->chunk_save(k);
+}
+
+void llama_memory_hybrid_context::chunk_swap_in(uint32_t k, uint32_t i) {
+    GGML_ASSERT(i < ubatches.size());
+    ctx_attn->chunk_swap_in(k, i);
+    ctx_recr->chunk_swap_in(k, i);
+    if (ctx_idx) ctx_idx->chunk_swap_in(k, i);
+    i_next = i;
+}
+
+void llama_memory_hybrid_context::chunk_swap_out(uint32_t k) {
+    ctx_attn->chunk_swap_out(k);
+    ctx_recr->chunk_swap_out(k);
+    if (ctx_idx) ctx_idx->chunk_swap_out(k);
+}
+
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];

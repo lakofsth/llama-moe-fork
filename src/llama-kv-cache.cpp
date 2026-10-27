@@ -1174,6 +1174,26 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 }
 
+void llama_kv_cache::chunk_save(uint32_t k) {
+    if (other) {
+        return;
+    }
+    if (chunk_metas.size() <= k) {
+        chunk_metas.resize(k + 1);
+    }
+    chunk_metas[k].cells = v_cells;
+    chunk_metas[k].heads = v_heads;
+}
+
+void llama_kv_cache::chunk_swap(uint32_t k) {
+    if (other) {
+        return;
+    }
+    GGML_ASSERT(k < chunk_metas.size());
+    v_cells.swap(chunk_metas[k].cells);
+    v_heads.swap(chunk_metas[k].heads);
+}
+
 bool llama_kv_cache::get_can_shift() const {
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
@@ -2757,6 +2777,27 @@ bool llama_kv_cache_context::apply() {
 
 llama_memory_status llama_kv_cache_context::get_status() const {
     return status;
+}
+
+bool llama_kv_cache_context::chunk_supported() const {
+    return !ubatches.empty();
+}
+
+void llama_kv_cache_context::chunk_save(uint32_t k) {
+    GGML_ASSERT(!ubatches.empty());
+    kv->chunk_save(k);
+}
+
+void llama_kv_cache_context::chunk_swap_in(uint32_t k, uint32_t i) {
+    GGML_ASSERT(i < ubatches.size());
+    kv->chunk_swap(k);
+    i_cur = i;
+    // the cells of slot k are the ones apply() left, so this is the n_kv apply() computed
+    n_kv = kv->get_n_kv(sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::chunk_swap_out(uint32_t k) {
+    kv->chunk_swap(k);
 }
 
 const llama_ubatch & llama_kv_cache_context::get_ubatch() const {

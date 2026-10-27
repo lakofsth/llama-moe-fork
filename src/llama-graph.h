@@ -816,6 +816,15 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // fork: layer-major prefill chunks (LLAMA_PREFILL_CHUNK). Build layers [il_begin, il_end) only (il_end < 0: to the last).
+    // A range that does not start at layer 0 reads its ubatch's residual from slot chunk_k of chunk_res_in; one that
+    // does not end at the last layer writes it to slot chunk_k of chunk_res_out and builds no output.
+    int32_t       il_begin      = 0;
+    int32_t       il_end        = -1;
+    uint32_t      chunk_k       = 0;
+    ggml_tensor * chunk_res_in  = nullptr;
+    ggml_tensor * chunk_res_out = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -874,6 +883,14 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (il_begin      != other.il_begin      ||
+            il_end        != other.il_end        ||
+            chunk_k       != other.chunk_k       ||
+            chunk_res_in  != other.chunk_res_in  ||
+            chunk_res_out != other.chunk_res_out) {
             return false;
         }
 

@@ -86,3 +86,16 @@ One sentence per invariant; each names the test that pins it.
   decode-pace-20261024T233039Z). Pinned by `tests/test-kv-seqrm.cpp` (random caches under every cell mutator,
   duplicate positions included, against the old scan; red on an inclusive p1, a p0 off by one, or the last
   emptied cell in position order taken as the head).
+
+- **PREFILL-CHUNK (fork-chunk-loop, 2026-10-27).** With LLAMA_PREFILL_CHUNK=C (C >= 2) a prompt-only batch of more than
+  one ubatch runs layer-major over chunks of C ubatches (LLAMA_PREFILL_CHUNK_GROUP=G layers per pass, G = 1 or a
+  multiple of the layer-type period), and every pass over ubatch k sees the memory metadata apply() left for k
+  (attention and indexer cells and heads, recurrent cells, head, n, rs_z, used and the rollback index rs_idx), with
+  each ubatch applied exactly once; so its logits, h_nextn rows and memory state are bit for bit those of the
+  micro-batch-major path. Unset or C < 2 is the micro-batch path unchanged; a batch in which a sequence's first token
+  requests output (a generating sequence), or with pooling, embeddings, per-layer input embeddings or backend
+  samplers, takes the micro-batch path. Pinned by `tests/test-prefill-chunk.cpp` (a random 12-layer qwen4exp MoE
+  with PLE and QSA on the CPU: 7 (C, G) configurations x 7 scenarios, incl. 3 sequences per batch, an MTP-style
+  rollback with rs_idx != 0 on entry, and a reused recurrent cell; it compares the logits, h_nextn, the
+  llama_state_get_data bytes, the apply() count and every named graph input each pass saw). GPU bit identity is
+  gated separately by <bench>/chunk-loop/gate-bits.sh (tools/prefill-dump).

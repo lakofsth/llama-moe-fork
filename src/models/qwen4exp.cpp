@@ -440,9 +440,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
+    // fork: LLAMA_PREFILL_CHUNK builds a range of layers per graph (llm_graph_params::il_begin/il_end)
+    const int il_begin = params.il_begin;
+    const int il_end   = params.il_end < 0 ? (int) n_layer : params.il_end;
+    GGML_ASSERT(0 <= il_begin && il_begin < il_end && il_end <= n_layer);
+
+    const bool range_first = il_begin == 0;
+    const bool range_last  = il_end   == n_layer;
+
+    bool range_attn = false;
+    bool range_ple  = false;
+    for (int il = il_begin; il < il_end; ++il) {
+        range_attn |= !hparams.is_recr(il);
+        range_ple  |=  hparams.is_ple(il);
+    }
+
+    // slot chunk_k of a residual buffer [n_embd*hc, n_ubatch*C]
+    auto chunk_res_view = [&](ggml_tensor * buf) {
+        GGML_ASSERT(buf != nullptr && buf->type == GGML_TYPE_F32 && buf->ne[0] == n_embd*hc);
+        GGML_ASSERT((int64_t) params.chunk_k*cparams.n_ubatch + n_tokens <= buf->ne[1]);
+        return ggml_view_3d(ctx0, buf, n_embd, hc, n_tokens,
+                buf->nb[0]*n_embd, buf->nb[1], (size_t) params.chunk_k*cparams.n_ubatch*buf->nb[1]);
+    };
+
+    ggml_tensor * inpL = nullptr;
+    if (range_first) {
+        inpL = build_inp_embd(model.tok_embd);
+        cb(inpL, "model.input_embed", -1);
+        ggml_build_forward_expand(gf, inpL);
+    }
 
     auto * inp = build_inp_mem_hybrid();
 
@@ -456,28 +482,35 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 "the indexer cache must track the attention cache cell for cell");
     }
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // an input no op reads is never allocated, so a layer range builds only the inputs its layers read
+    ggml_tensor * inp_pos     = range_attn ? build_inp_pos()     : nullptr;
+    ggml_tensor * inp_out_ids = range_last ? build_inp_out_ids() : nullptr;
 
     ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
+    if (hparams.ple_n_heads > 0 && range_ple) {
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
         ggml_build_forward_expand(gf, ple_emb);
     }
 
-    // the wide residual starts as hc identical copies of the embedding
-    ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
-            ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
-            n_embd, hc, n_tokens, 1);
-    cb(res_hc, "hc_init", -1);
+    ggml_tensor * res_hc = nullptr;
+    if (range_first) {
+        // the wide residual starts as hc identical copies of the embedding
+        res_hc = ggml_repeat_4d(ctx0,
+                ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
+                n_embd, hc, n_tokens, 1);
+        cb(res_hc, "hc_init", -1);
+    } else {
+        res_hc = chunk_res_view(params.chunk_res_in);
+        ggml_format_name(res_hc, "chunk_res_in-%d", il_begin);
+    }
 
     // fork (MTP): the drafter asks for the final residual of EVERY row (llama_set_embeddings_nextn(ctx, true,
     // false)), so the last layer cannot prune to the output rows first; it prunes after h_nextn is taken instead
     // (as glm5next.cpp's mask_early). Off, or masked, the graph is the one it always was.
     const bool mask_early = !cparams.embeddings_nextn || cparams.embeddings_nextn_masked;
 
-    for (int il = 0; il < n_layer; ++il) {
+    for (int il = il_begin; il < il_end; ++il) {
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
@@ -527,6 +560,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    if (!range_last) {
+        // the next range reads this; f32 to f32 is an exact copy
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, res_hc, chunk_res_view(params.chunk_res_out)));
+        return;
     }
 
     // fork (MTP): the NextN block reads the final multi-stream residual, before the head mixer: hc*n_embd per row

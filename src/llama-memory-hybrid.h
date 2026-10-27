@@ -128,6 +128,11 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    bool chunk_supported() const override;
+    void chunk_save(uint32_t k) override;
+    void chunk_swap_in(uint32_t k, uint32_t i) override;
+    void chunk_swap_out(uint32_t k) override;
+
     //
     // llama_memory_hybrid_context
     //
