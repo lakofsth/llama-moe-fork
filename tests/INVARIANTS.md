@@ -118,18 +118,26 @@ One sentence per invariant; each names the test that pins it.
   (R = 1..4; red with the upload's source offset taken from the slot index, with the compute stream's wait on the
   upload removed, and with the copy stream's wait on the earlier read removed).
 
-- **PREFILL-CHUNK-PF (fork-chunk-loop P2, 2026-10-28).** Under LLAMA_PREFILL_CHUNK with LLAMA_MOE_PREFETCH_PP=R, every
-  compact-id MUL_MAT_ID reads a ring slot holding its weight's plan at the current plan generation (bumped by every
-  ggml_backend_sched_moe_pf_plan: load, repin, adaptive swap), and a slot is written only after the last read of
-  what it held, so the outputs are the stock prefetch's (P1) bit for bit. With G = 1 and R >= a host layer's entries,
-  the chunk uploads each host layer once (not once per pass); the chunk's m-th distinct weight takes slot m % R, the
-  stock layout, so the slots are the stock prefetch's size when R is a multiple of a layer's entries; the next
-  layer's entries go up as soon as the ring frees a slot (at a pass's start into slots it does not read; on the
-  group's last pass, after each read). A pass with more entries than R keeps the per-graph ring. Pinned by
-  `tests/test-moe-pf-ring.cpp` (the planner, ggml/src/ggml-moe-pf-ring.h, replayed in the scheduler's issue order:
-  1052 checks over E = 2, 3; R = 1..6; C = 2, 4, 8; G = 1, 4; short last ubatches; plan changes inside chunks).
-  Each mechanism reverted alone is red (tests/prefill-chunk-mutate.py R1-R6, on bcd9ba22f): slot reuse 68,
-  generation in the match 94, after-read hints only on the last pass 30, start-of-pass hints only into unread slots
-  120, hints capped at R 18, the m % R layout 25 (of 1052). Residual: the planner-to-compute_splits seam (events, the
-  slot pointer swap, the copy stream) runs only on CUDA; gated by <bench>/chunk-loop/gate-bits-p2.sh
-  (copy tests/prefill-chunk-gate-bits-p2.sh): bits vs base and uploads < reads on the chunk arms.
+- **PREFILL-CHUNK-PF (fork-chunk-loop P2, 2026-10-28; amended 28 Oct after the first GPU gate).** Under
+  LLAMA_PREFILL_CHUNK with LLAMA_MOE_PREFETCH_PP=R, every compact-id MUL_MAT_ID reads a ring slot holding its weight's
+  plan at the current plan generation (bumped by every ggml_backend_sched_moe_pf_plan: load, repin, adaptive swap),
+  and a slot is written only after the last read of what it held, so the outputs are the stock prefetch's (P1) bit
+  for bit. Chunk mode is on only for one-layer passes (G = 1) of chunks of several ubatches; across a layer's passes:
+  with R >= its entries the layer is uploaded once per chunk in the stock layout (the chunk's m-th weight in slot
+  m % R, the stock slot sizes); with fewer (the served separate gate/up/down at R = 2) its R - 1 largest entries keep
+  slots 0..R-2 by size rank and the rest stream through slot R-1, so it is uploaded at most E + (E - R + 1) times per
+  chunk of passes, never more than the stock count, and each slot is its size rank's largest entry. The next layer's
+  entries go up as soon as the ring frees a slot. Pinned by `tests/test-moe-pf-ring.cpp` (the planner,
+  ggml/src/ggml-moe-pf-ring.h, replayed in the scheduler's issue order over E = 2, 3 (sizes by kind and per-layer plan),
+  R = 1..6, C = 2, 4, 8, G = 1, 4, short last ubatches, plan changes inside chunks and several decodes in one ring:
+  1385 checks; it prints the gate's expected counters, 1767 slot reads (the measured stock count) and 1271 uploads at
+  C = 8, R = 2). Each mechanism reverted alone is red (tests/prefill-chunk-mutate.py, on 9be98cb22; of 1385): the
+  n <= R layout's slot reuse 232, generation in the match 90, after-read hints only on the last pass 82,
+  start-of-pass hints only into unread slots 214, the m % R layout 17; the wide layout's slot reuse 33, no growing a
+  slot the graph reads 21, hints only on the last pass 33, uploads after the slot's last read 21, slots by size rank
+  7. Found by the GPU gate of 27 Oct (gate-p2-20261027T221645Z: uploads 1767 = reads 1767): the first planner took a
+  pass only if all its entries fit, and its test asserted that E = 3, R = 2 falls back; the served-shape check (C = 8,
+  R = 2, E = 3: uploads <= 80% of reads, no fallback) is the one it fails. Residual: the planner-to-compute_splits
+  seam (events, the slot pointer swap, the copy stream) runs only on CUDA; gated by
+  <bench>/chunk-loop/gate-bits-p2.sh (copy tests/prefill-chunk-gate-bits-p2.sh), with a
+  LLAMA_MOE_PF_TRACE=1 arm.
