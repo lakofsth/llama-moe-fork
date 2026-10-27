@@ -123,9 +123,13 @@ struct ggml_moe_pf_ring {
             s[j].gen    = entries[i].gen;
         }
 
-        // 3. hints, in order, into the next ring slots. A slot this graph does not read is uploaded at the start (it may grow); one it
+        // 3. hints, in order, into the next ring slots (none if there are more than R: the graph that reads them is
+        //    planned by the wide layout, which would not find them where this one puts them). A slot this graph does not read is uploaded at the start (it may grow); one it
         //    reads, only if this graph is its last reader, right after that read (no growing). The first hint that
         //    cannot go yet stops the rest, so a later pass places them in the same slots.
+        if ((int) hints.size() > R) {
+            return d;
+        }
         for (size_t t = 0; t < hints.size(); ++t) {
             const item & h = hints[t];
             bool done = false;

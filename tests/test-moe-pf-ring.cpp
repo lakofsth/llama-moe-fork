@@ -7,7 +7,8 @@
 //   every read finds its slot holding its weight at the current plan generation;
 //   with G=1 and R >= the entries of a layer, each host layer is uploaded once per chunk (per plan generation);
 //   with 2 <= R < a layer's entries (the served gate/up/down at R = 2), slots are still reused across passes;
-//   with G=1 and R >= 2 a chunk graph is always planned (never handed to the per-graph ring);
+//   with G=1 and R >= 2 a chunk graph is always planned (never handed to the per-graph ring), and no upload is
+//   overwritten before it is read;
 //   with R >= 2x a layer's entries, the next layer's upload is issued at the start of the current layer's first pass;
 //   with G=1 and R a multiple of a layer's entries, the ring is the size the stock prefetch gives it (every host entry in
 //   layer order, slot m % R); always at most R slots of the largest entry.
@@ -25,15 +26,18 @@ struct sim {
     ggml_moe_pf_ring ring;
     int R;
     std::vector<std::pair<int, uint64_t>> content; // per slot: (weight id, gen) last uploaded; (-1, 0) = garbage
+    std::vector<bool> unread;                      // per slot: uploaded and not read yet
     std::vector<size_t> size;
-    long uploads = 0, reads = 0, bad = 0, early = 0, fallback = 0;
+    long uploads = 0, reads = 0, bad = 0, early = 0, fallback = 0, wasted = 0;
     std::string first_bad;
 
-    explicit sim(int R) : ring(R), R(R), content(R, { -1, 0 }), size(R, 0) {}
+    explicit sim(int R) : ring(R), R(R), content(R, { -1, 0 }), unread(R, false), size(R, 0) {}
 
-    void upload(int j, int w, uint64_t gen) { content[j] = { w, gen }; uploads++; }
+    // an upload over content nobody read was wasted
+    void upload(int j, int w, uint64_t gen) { if (unread[j]) wasted++; content[j] = { w, gen }; unread[j] = true; uploads++; }
     void read(int j, int w, uint64_t gen, const std::string & where) {
         reads++;
+        unread[j] = false;
         if (content[j].first != w || content[j].second != gen) {
             if (bad++ == 0) first_bad = where;
         }
@@ -96,7 +100,7 @@ struct model {
 };
 
 // one prompt: n_ub ubatches (the last `short_last` tokens-short: no compact ids), chunks of C, groups of G
-struct result { long uploads, reads, bad, early, fallback; size_t ring_bytes, per_graph_bytes; std::string first_bad; std::vector<size_t> per_slot; };
+struct result { long uploads, reads, bad, early, fallback, wasted; size_t ring_bytes, per_graph_bytes; std::string first_bad; std::vector<size_t> per_slot; };
 
 // decodes: the ubatches of each llama_decode in turn (one scheduler, so one ring, across them); short_last: the last
 // decode's last ubatch is narrower than LLAMA_MOE_PREFETCH_PP_MIN
@@ -135,7 +139,7 @@ static result run(const model & m, int R, int C, int G, const std::vector<int> &
         int mm = 0;
         for (int il = 0; il < m.n_layer; il++) for (auto & x : m.w[il]) { per_graph_need[mm % R] = std::max(per_graph_need[mm % R], x.need); mm++; }
     }
-    result r{ s.uploads, s.reads, s.bad, s.early, s.fallback, 0, 0, s.first_bad, {} };
+    result r{ s.uploads, s.reads, s.bad, s.early, s.fallback, s.wasted, 0, 0, s.first_bad, {} };
     for (int j = 0; j < R; j++) { r.ring_bytes += s.size[j]; r.per_graph_bytes += per_graph_need[j]; r.per_slot.push_back(per_graph_need[j]); }
     return r;
 }
@@ -197,6 +201,7 @@ int main() {
                                 check(r.uploads <= r.reads, std::string(tag) + ": uploads " + std::to_string(r.uploads) + " > reads " + std::to_string(r.reads));
                             }
                             if (R >= 2 && bump < 0 && G == 1) {
+                                check(r.wasted == 0, std::string(tag) + ": " + std::to_string(r.wasted) + " uploads overwritten before any read");
                                 check(r.fallback == 0, std::string(tag) + ": " + std::to_string(r.fallback) + " chunk graphs fell back to the per-graph ring");
                             }
                             if (G == 1 && R >= 2 && R < E && bump < 0) {
@@ -236,6 +241,7 @@ int main() {
                 const result r = run(served, R, C, 1, { 8, 8, 4 }, true, -1, true);
                 check(r.bad == 0 && r.reads == 1767, "served prediction: a wrong read, or not the gate's 1767 slot reads");
                 check(r.uploads < r.reads, "served prediction: no slot reuse");
+                check(r.wasted == 0, "served prediction: " + std::to_string(r.wasted) + " uploads overwritten before any read");
                 printf("served prediction (C=%d G=1 R=%d): %ld uploads for %ld slot reads (the stock prefetch uploads %ld)\n", C, R, r.uploads, r.reads, r.reads);
             }
         }
