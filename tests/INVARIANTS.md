@@ -129,13 +129,14 @@ One sentence per invariant; each names the test that pins it.
   chunk of passes, never more than the stock count, and each slot is its size rank's largest entry. The next layer's
   entries go up as soon as the ring frees a slot. Pinned by `tests/test-moe-pf-ring.cpp` (the planner,
   ggml/src/ggml-moe-pf-ring.h, replayed in the scheduler's issue order over E = 2, 3 (sizes by kind and per-layer plan),
-  R = 1..6, C = 2, 4, 8, G = 1, 4, short last ubatches, plan changes inside chunks and several decodes in one ring:
-  1385 checks; it prints the gate's expected counters, 1767 slot reads (the measured stock count) and 1271 uploads at
-  C = 8, R = 2). Each mechanism reverted alone is red (tests/prefill-chunk-mutate.py, on 9be98cb22; of 1385): the
-  n <= R layout's slot reuse 232, generation in the match 90, after-read hints only on the last pass 82,
-  start-of-pass hints only into unread slots 214, the m % R layout 17; the wide layout's slot reuse 33, no growing a
-  slot the graph reads 21, hints only on the last pass 33, uploads after the slot's last read 21, slots by size rank
-  7. Found by the GPU gate of 27 Oct (gate-p2-20261027T221645Z: uploads 1767 = reads 1767): the first planner took a
+  R = 1..6, C = 2, 4, 8, G = 1, 4, short last ubatches, plan changes inside chunks and several decodes in one ring,
+  no upload overwritten before it is read: 1449 checks; it prints the gate's expected counters, 1767 slot reads (the
+  measured stock count) and 1271 uploads at C = 8, R = 2). Each mechanism reverted alone is red
+  (tests/prefill-chunk-mutate.py, on the commit after 8eeee074a; of 1449): the n <= R layout's slot reuse 288,
+  generation in the match 90, after-read hints only on the last pass 114, start-of-pass hints only into unread slots
+  246, its hint cap (hints for a wider graph would sit where the wide layout does not look: 75 wasted uploads in the
+  served prediction) 3, the m % R layout 17; the wide layout's slot reuse 41, no growing a slot the graph reads 21,
+  hints only on the last pass 41, uploads after the slot's last read 29, slots by size rank 15. Found by the GPU gate of 27 Oct (gate-p2-20261027T221645Z: uploads 1767 = reads 1767): the first planner took a
   pass only if all its entries fit, and its test asserted that E = 3, R = 2 falls back; the served-shape check (C = 8,
   R = 2, E = 3: uploads <= 80% of reads, no fallback) is the one it fails. Residual: the planner-to-compute_splits
   seam (events, the slot pointer swap, the copy stream) runs only on CUDA; gated by
