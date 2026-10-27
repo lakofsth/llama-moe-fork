@@ -164,6 +164,7 @@ struct scenario {
     std::vector<uint32_t> steps; // tokens per sequence in each decode call
     int      rollback;   // after step 0, remove this many tokens from the end of every sequence (MTP rejection); -1: all of them
     bool     first_out;  // the first token of each sequence requests output: a generating sequence, so no chunk path
+    bool     unified = false; // one KV stream for all sequences (the served -kvu)
 };
 
 struct run_out {
@@ -190,7 +191,7 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     cp.n_batch         = N_CTX;
     cp.n_ubatch        = 16;
     cp.n_seq_max       = sc.n_seq;
-    cp.kv_unified      = false;
+    cp.kv_unified      = sc.unified;
     cp.n_threads       = 4;
     cp.n_threads_batch = 4;
     cp.n_rs_seq        = sc.n_rs_seq;
@@ -310,6 +311,8 @@ int main(int argc, char ** argv) {
         // three sequences per batch, split_equal ubatches holding all three
         { "three-seq",        3, 0, false, { 70, 40 },  0, false },
         { "three-seq-rollbk", 3, 2, false, { 70, 40 },  1, false },
+        // as served: one KV stream (-kvu), so split_equal fills ubatches across sequences
+        { "three-seq-kvu",    3, 2, false, { 70, 40 },  1, false, true },
         // the sequence is cleared and its recurrent cell taken again by a new prompt: stale state in the cell
         { "reuse",            1, 0, false, { 100, 150 }, -1, false },
         // every token requests output, as a generating sequence's do: the micro-batch path, and the same result
