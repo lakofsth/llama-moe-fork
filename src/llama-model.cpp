@@ -1711,6 +1711,26 @@ static int32_t llama_moe_cpu_sentinel(const llama_moe_split & ms, int n_expert, 
     return n_expert + 1 + e;
 }
 
+// fork (fork-kernel-fusion, LLAMA_MOE_PREFETCH_PP): from map_cpu's host values mc (own id = host-resident, else the
+// sentinel), set map_cpu_pf (non-resident e -> its index in the ascending non-resident list; resident -> the same
+// sentinel) and register that list as the scheduler's prefetch plan for each of the layer's host expert tensors.
+// Every site that writes map_cpu calls this with the same mc, so the compact ids and the slot order never disagree.
+static void llama_moe_split_set_pf(const llama_layer & L, llama_moe_split & ms, const std::vector<int32_t> & mc) {
+    if (!ms.map_cpu_pf) return;
+    const int n_expert = (int) mc.size();
+    std::vector<int32_t> pf(n_expert), list;
+    for (int e = 0; e < n_expert; e++) {
+        if (mc[e] == e) { pf[e] = (int32_t) list.size(); list.push_back(e); }
+        else            { pf[e] = mc[e]; }
+    }
+    ggml_backend_tensor_set(ms.map_cpu_pf, pf.data(), 0, pf.size()*sizeof(int32_t));
+    const ggml_tensor * ts[3] = { L.ffn_gate_up_exps ? L.ffn_gate_up_exps : L.ffn_gate_exps,
+                                  L.ffn_gate_up_exps ? nullptr : L.ffn_up_exps, L.ffn_down_exps };
+    for (const ggml_tensor * t : ts) {
+        if (t) ggml_backend_sched_moe_pf_plan(t, list.data(), (int) list.size());
+    }
+}
+
 static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
     const char * hf = getenv("LLAMA_MOE_HEAT_FILE");
     // fork: with no explicit map, fall back to this workload's persisted sidecar. An
@@ -2057,6 +2077,8 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
         }
         ms.down_gpu = ggml_new_tensor_3d(ctx, L.ffn_down_exps->type, L.ffn_down_exps->ne[0], L.ffn_down_exps->ne[1], G);
         ms.map_cpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ms.map_cpu_pf = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        ggml_format_name(ms.map_cpu_pf, "blk.%d.ffn_moe_map_cpu_pf", il);
         ms.map_gpu    = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.map_gpu_pp = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ms.mask_cpu = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_expert);
@@ -2156,6 +2178,7 @@ static void llama_moe_heat_split_init(llama_model_base & model, llama_model_load
             kg[e] = 1.0f;
         }
         ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+        llama_moe_split_set_pf(L, ms, mc);
         ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
 
@@ -2448,6 +2471,7 @@ int llama_model_base::moe_heat_repin() {
             kc[e] = 0.0f; kg[e] = 1.0f;
         }
         ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+        llama_moe_split_set_pf(L, ms, mc);
         ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
         ggml_backend_tensor_set(ms.mask_cpu,   kc.data(),   0, kc.size()*sizeof(float));
@@ -2628,6 +2652,7 @@ int llama_model_base::moe_heat_adapt(int64_t * hits_out, int64_t * tot_out, llam
                 kc[e] = 0.0f; kg[e] = 1.0f;
             }
             ggml_backend_tensor_set(ms.map_cpu,    mc.data(),   0, mc.size()*sizeof(int32_t));
+            llama_moe_split_set_pf(layers[lay[k]], ms, mc);
             ggml_backend_tensor_set(ms.map_gpu,    mg.data(),   0, mg.size()*sizeof(int32_t));
             ggml_backend_tensor_set(ms.map_gpu_pp, mgpp.data(), 0, mgpp.size()*sizeof(int32_t));
             ggml_backend_tensor_set(ms.mask_cpu,   kc.data(),   0, kc.size()*sizeof(float));

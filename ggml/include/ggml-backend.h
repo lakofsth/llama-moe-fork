@@ -353,6 +353,11 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // fork (fork-kernel-fusion, LLAMA_MOE_PREFETCH_PP): the experts of a host-resident MUL_MAT_ID weight that the
+    // scheduler streams into a prefetch slot, in slot order (index c of the slot holds expert experts[c]); a
+    // MUL_MAT_ID whose ids tensor is named "ffn_moe_ids_pf..." addresses that slot by c. n == 0 removes the plan.
+    GGML_API void                 ggml_backend_sched_moe_pf_plan(const struct ggml_tensor * host_weight, const int32_t * experts, int n);
+
     //
     // Meta backend
     //

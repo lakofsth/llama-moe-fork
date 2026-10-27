@@ -105,3 +105,12 @@ One sentence per invariant; each names the test that pins it.
   n_kv recomputed in chunk_swap_in 12/56, the residual write 42/56, the generating-batch policy 7/56, and the
   mem_hybrid kq_mask ->buffer guard aborts (GGML_ASSERT(buffer)). GPU bit identity is gated separately by
   <bench>/chunk-loop/gate-bits.sh (copy tests/prefill-chunk-gate-bits.sh; dumps with tools/prefill-dump).
+
+- **P1 (fork-kernel-fusion, 2026-10-08).** Under LLAMA_MOE_PREFETCH_PP=R a MUL_MAT_ID whose ids are compact
+  (`ffn_moe_ids_pf`, built from map_cpu_pf) reads exactly the experts the stock partial upload would give it for
+  the original ids: the scheduler's slot holds the registered plan in plan order, the slot is uploaded only after the
+  matmul R entries earlier has finished reading it, and the matmul runs only after its own upload — so outputs equal
+  the stock path's bit for bit, across new graphs, reused graphs and plan changes. Every site that writes map_cpu
+  writes map_cpu_pf and the plan from the same values (llama_moe_split_set_pf). Pinned by `tests/test-moe-prefetch.cpp`
+  (R = 1..4; red with the upload's source offset taken from the slot index, with the compute stream's wait on the
+  upload removed, and with the copy stream's wait on the earlier read removed).
