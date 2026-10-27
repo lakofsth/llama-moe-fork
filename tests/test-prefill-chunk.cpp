@@ -165,6 +165,7 @@ struct scenario {
     int      rollback;   // after step 0, remove this many tokens from the end of every sequence (MTP rejection); -1: all of them
     bool     first_out;  // the first token of each sequence requests output: a generating sequence, so no chunk path
     bool     unified = false; // one KV stream for all sequences (the served -kvu)
+    bool     sampling = false; // backend samplers (the served --backend-sampling): output on each sequence's last token only
 };
 
 struct run_out {
@@ -172,6 +173,7 @@ struct run_out {
     std::vector<std::vector<float>>   nextn;   // per decode call, the h_nextn rows
     std::vector<std::vector<uint8_t>> state;   // per decode call, llama_state_get_data
     std::vector<llama_context::input_record> inputs;
+    std::vector<llama_token> sampled; // backend-sampled tokens, per decode call and output row
     int64_t n_apply  = 0;
     int64_t n_passes = 0;
     bool    ok = true;
@@ -197,6 +199,23 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     cp.n_rs_seq        = sc.n_rs_seq;
     cp.no_perf         = true;
 
+    // the served sampler chain, one per sequence, each with its own seed
+    std::vector<llama_sampler *> chains;
+    std::vector<llama_sampler_seq_config> sconf;
+    if (sc.sampling) {
+        for (uint32_t s = 0; s < sc.n_seq; ++s) {
+            llama_sampler * ch = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(ch, llama_sampler_init_top_k(20));
+            llama_sampler_chain_add(ch, llama_sampler_init_top_p(0.95f, 1));
+            llama_sampler_chain_add(ch, llama_sampler_init_temp(0.6f));
+            llama_sampler_chain_add(ch, llama_sampler_init_dist(1234 + s));
+            chains.push_back(ch);
+            sconf.push_back({ (llama_seq_id) s, ch });
+        }
+        cp.samplers   = sconf.data();
+        cp.n_samplers = sconf.size();
+    }
+
     llama_context * ctx = llama_init_from_model(model, cp);
     GGML_ASSERT(ctx);
     llama_set_embeddings_nextn(ctx, true, sc.nextn_masked);
@@ -216,7 +235,8 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
         // every other row requests output, so every logits row is compared
         for (uint32_t s = 0; s < sc.n_seq; ++s) {
             for (uint32_t i = 0; i < n; ++i) {
-                common_batch_add(batch, toks[it++ % toks.size()], pos[s]++, { (llama_seq_id) s }, i > 0 || sc.first_out);
+                const bool out = sc.sampling ? i + 1 == n : (i > 0 || sc.first_out);
+                common_batch_add(batch, toks[it++ % toks.size()], pos[s]++, { (llama_seq_id) s }, out);
             }
         }
         if (llama_decode(ctx, batch) != 0) {
@@ -230,6 +250,11 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
         int n_out = 0;
         for (int i = 0; i < batch.n_tokens; ++i) {
             if (!batch.logits[i]) continue;
+            if (sc.sampling) {
+                out.sampled.push_back(llama_get_sampled_token_ith(ctx, i));
+                n_out++;
+                continue;
+            }
             const float * l = llama_get_logits_ith(ctx, i);
             lg.insert(lg.end(), l, l + n_vocab);
             n_out++;
@@ -263,6 +288,7 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     out.n_passes = ctx->prefill_chunk_n_passes;
 
     llama_free(ctx);
+    for (auto * ch : chains) llama_sampler_free(ch);
     return out;
 }
 
@@ -317,6 +343,8 @@ int main(int argc, char ** argv) {
         { "reuse",            1, 0, false, { 100, 150 }, -1, false },
         // every token requests output, as a generating sequence's do: the micro-batch path, and the same result
         { "generating",       2, 0, false, { 60, 40 },  0, true },
+        // backend sampling, as served: the tokens drawn must be the same (the dist sampler draws once per ubatch graph)
+        { "sampling",         3, 2, false, { 70, 50, 40 }, 0, false, true, true },
     };
 
     const std::vector<run_cfg> cfgs = {
@@ -347,17 +375,23 @@ int main(int argc, char ** argv) {
             // every input a pass saw is the one the ubatch's single graph saw on the micro-batch path:
             // the memory metadata seen for (layer, ubatch) is the metadata apply() left for that ubatch
             {
-                // ggml names an unnamed leaf by its place in the graph (leaf_<n>), which differs between graphs
+                // ggml names an unnamed leaf by its place in the graph (leaf_<n>), which differs between graphs.
+                // A backend sampler's uniform_<n> is written only for a sequence with an output in the ubatch (an
+                // inactive sampler runs on a dummy row and its result is dropped): on either path the others hold
+                // whatever the compute buffer held, so they are not compared; the sampled tokens are.
+                auto skip  = [](const std::string & n) { return n.rfind("uniform_", 0) == 0; };
                 auto named = [](const std::string & n) { return !n.empty() && n.rfind("leaf_", 0) != 0; };
                 std::map<std::pair<int64_t, std::string>, const std::vector<uint8_t> *> by_name;
                 std::multiset<std::pair<int64_t, std::vector<uint8_t>>> unnamed;
                 for (const auto & r : base.inputs) {
+                    if (skip(r.name)) continue;
                     if (!named(r.name)) unnamed.insert({ r.ubatch, r.data });
                     else by_name[{ r.ubatch, r.name }] = &r.data;
                 }
                 int n_named = 0, n_bad = 0;
                 std::string first_bad;
                 for (const auto & r : cur.inputs) {
+                    if (skip(r.name)) continue;
                     bool match;
                     if (!named(r.name)) {
                         match = unnamed.count({ r.ubatch, r.data }) > 0;
@@ -382,6 +416,8 @@ int main(int argc, char ** argv) {
                 if (!same_bytes(base.nextn[s],  cur.nextn[s]))  { ok = false; why += " nextn@"  + std::to_string(s); }
                 if (base.state[s] != cur.state[s])              { ok = false; why += " state@"  + std::to_string(s); }
             }
+            if (base.sampled != cur.sampled) { ok = false; why += " sampled-tokens"; }
+            if (sc.sampling && base.sampled.size() != 3*sc.steps.size()) { ok = false; why += " sampled-count " + std::to_string(base.sampled.size()); }
 
             printf("%-4s %-17s C=%u G=%-2u passes=%-4" PRId64 " applies=%" PRId64 "%s\n",
                     ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cur.n_passes, cur.n_apply, why.c_str());

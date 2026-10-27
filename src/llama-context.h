@@ -423,6 +423,7 @@ private:
     // fork: env LLAMA_PREFILL_CHUNK=C (0 = off) and LLAMA_PREFILL_CHUNK_GROUP=G (layers per pass)
     uint32_t prefill_chunk   = 0;
     uint32_t prefill_chunk_g = 0;
+    int32_t  prefill_chunk_pf_min = 0; // LLAMA_MOE_PREFETCH_PP_MIN when the prefetch is on, else 0
 
     // per layer, the residual buffer [n_embd*hc, n_ubatch*C] on that layer's device
     std::vector<ggml_tensor *> prefill_chunk_res;
@@ -437,6 +438,10 @@ public:
     int64_t prefill_chunk_n_apply  = 0;
     int64_t prefill_chunk_n_passes = 0;
     int64_t prefill_chunk_n_ubatch = 0;
+    // LLAMA_MOE_PREFETCH_PP, from the scheduler after each decode: slot uploads, slot reads, bytes uploaded
+    int64_t prefill_pf_n_upload = 0;
+    int64_t prefill_pf_n_read   = 0;
+    int64_t prefill_pf_n_bytes  = 0;
 
     struct input_record {
         int64_t              ubatch;

@@ -1927,6 +1927,19 @@ void llama_context::prefill_chunk_init() {
     prefill_chunk_g   = (uint32_t) g;
     prefill_chunk_res = std::move(res);
 
+    // LLAMA_MOE_PREFETCH_PP: the graph reads compact (prefetched) ids for ubatches of at least this many tokens
+    {
+        const char * e_pf  = getenv("LLAMA_MOE_PREFETCH_PP");
+        const char * e_min = getenv("LLAMA_MOE_PREFETCH_PP_MIN");
+        const int pf_min = e_min ? atoi(e_min) : 1024;
+        prefill_chunk_pf_min = e_pf && atoi(e_pf) > 0 ? std::max(pf_min, 32) : 0;
+        if (prefill_chunk_pf_min > 0) {
+            LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK with LLAMA_MOE_PREFETCH_PP=%s: %s\n", __func__, e_pf,
+                    g == 1 ? "a host layer's prefetch slots are uploaded once per chunk and the next layer's as soon as the ring frees a slot"
+                           : "LLAMA_PREFILL_CHUNK_GROUP > 1: a pass holds several host layers, so the ring is uploaded per pass unless it holds them all");
+        }
+    }
+
     LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK=%u LLAMA_PREFILL_CHUNK_GROUP=%u: prompt-only batches of more than one ubatch run layer-major, "
             "%u ubatches x %u layers per pass; residual %.1f MiB on each of %s\n", __func__,
             prefill_chunk, prefill_chunk_g, prefill_chunk, prefill_chunk_g,
@@ -1961,9 +1974,6 @@ const char * llama_context::prefill_chunk_refusal(const llama_batch_ext & batch_
         if (on) {
             return "per-layer input embeddings are on";
         }
-    }
-    if (!sampling.samplers.empty()) {
-        return "backend samplers are set";
     }
     if (!mctx->chunk_supported()) {
         return "the memory does not support chunks";
@@ -2321,8 +2331,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // apply each ubatch of the chunk once and keep the metadata it leaves
             uint32_t n_chunk = 0;
             bool applied = true;
+            std::vector<uint32_t> n_tokens_k;
             while (true) {
                 const auto & ubatch = mctx->get_ubatch();
+                n_tokens_k.push_back(ubatch.n_tokens);
                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                     const auto & seq_id = ubatch.seq_id[i][0];
                     pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
@@ -2350,6 +2362,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             ggml_status status = applied ? GGML_STATUS_SUCCESS : GGML_STATUS_FAILED;
 
+            // LLAMA_MOE_PREFETCH_PP: within the chunk a layer's prefetch slots are uploaded once and read by every pass
+            ggml_backend_sched_moe_pf_chunk(sched.get(), true);
+            std::vector<const ggml_tensor *> pf_next;
+
             for (int32_t il0 = 0; applied && il0 < n_layer && status == GGML_STATUS_SUCCESS; il0 += group) {
                 const int32_t il1 = std::min(il0 + group, n_layer);
 
@@ -2368,6 +2384,24 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     range.res_in   = il0 > 0       ? prefill_chunk_res[il0 - 1] : nullptr;
                     range.res_out  = il1 < n_layer ? prefill_chunk_res[il1 - 1] : nullptr;
 
+                    // the host expert weights the next group reads, for the prefetch ring to fetch early
+                    // (only if that group's first ubatch is wide enough to read them through the prefetch)
+                    pf_next.clear();
+                    if (il1 < n_layer && prefill_chunk_pf_min > 0) {
+                        if (n_tokens_k[0] >= (uint32_t) prefill_chunk_pf_min) {
+                            for (int32_t il = il1; il < std::min(il1 + group, n_layer); ++il) {
+                                const auto & L = model.layers[il];
+                                if (!L.moe_split.map_cpu_pf) {
+                                    continue;
+                                }
+                                for (const ggml_tensor * w : { L.ffn_gate_up_exps, L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps }) {
+                                    if (w) pf_next.push_back(w);
+                                }
+                            }
+                        }
+                    }
+                    ggml_backend_sched_moe_pf_next(sched.get(), pf_next.data(), (int) pf_next.size(), k + 1 == n_chunk);
+
                     prefill_chunk_n_passes++;
                     const auto * res = process_ubatch(ubatch, gtype, mctx.get(), status, &range);
 
@@ -2382,6 +2416,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     }
                 }
             }
+
+            ggml_backend_sched_moe_pf_chunk(sched.get(), false);
 
             if (status != GGML_STATUS_SUCCESS) {
                 // no ubatch of the chunk is complete -> remove the whole chunk from the memory module
@@ -2474,6 +2510,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         extract_outputs(res, ubatch);
         prefill_chunk_n_ubatch++;
     } while (mctx->next());
+
+    ggml_backend_sched_moe_pf_stats(sched.get(), &prefill_pf_n_upload, &prefill_pf_n_read, &prefill_pf_n_bytes);
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;

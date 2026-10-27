@@ -358,6 +358,16 @@ extern "C" {
     // MUL_MAT_ID whose ids tensor is named "ffn_moe_ids_pf..." addresses that slot by c. n == 0 removes the plan.
     GGML_API void                 ggml_backend_sched_moe_pf_plan(const struct ggml_tensor * host_weight, const int32_t * experts, int n);
 
+    // fork (fork-chunk-loop P2, LLAMA_PREFILL_CHUNK): while chunk mode is on, a prefetch slot that holds a weight's plan
+    // at the current plan generation is read again without an upload. _next, called before a graph is computed and
+    // consumed by it, names the host weights the graph after it reads: they are uploaded as soon as the ring frees a
+    // slot (last: no later graph reads this graph's own weights, so its slots may take them after its reads).
+    // Turning chunk mode on or off forgets what the slots hold.
+    GGML_API void                 ggml_backend_sched_moe_pf_chunk(ggml_backend_sched_t sched, bool on);
+    GGML_API void                 ggml_backend_sched_moe_pf_next(ggml_backend_sched_t sched, const struct ggml_tensor * const * weights, int n, bool last);
+    // uploads issued, entries read from a slot, bytes uploaded, since the scheduler was created
+    GGML_API void                 ggml_backend_sched_moe_pf_stats(ggml_backend_sched_t sched, int64_t * n_upload, int64_t * n_read, int64_t * n_bytes);
+
     //
     // Meta backend
     //
