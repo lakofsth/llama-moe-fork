@@ -135,7 +135,7 @@ static result run(const model & m, int R, int C, int G, const std::vector<int> &
         int mm = 0;
         for (int il = 0; il < m.n_layer; il++) for (auto & x : m.w[il]) { per_graph_need[mm % R] = std::max(per_graph_need[mm % R], x.need); mm++; }
     }
-    result r{ s.uploads, s.reads, s.bad, s.early, s.fallback, 0, 0, s.first_bad };
+    result r{ s.uploads, s.reads, s.bad, s.early, s.fallback, 0, 0, s.first_bad, {} };
     for (int j = 0; j < R; j++) { r.ring_bytes += s.size[j]; r.per_graph_bytes += per_graph_need[j]; r.per_slot.push_back(per_graph_need[j]); }
     return r;
 }
