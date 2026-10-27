@@ -95,7 +95,13 @@ One sentence per invariant; each names the test that pins it.
   micro-batch-major path. Unset or C < 2 is the micro-batch path unchanged; a batch in which a sequence's first token
   requests output (a generating sequence), or with pooling, embeddings, per-layer input embeddings or backend
   samplers, takes the micro-batch path. Pinned by `tests/test-prefill-chunk.cpp` (a random 12-layer qwen4exp MoE
-  with PLE and QSA on the CPU: 7 (C, G) configurations x 7 scenarios, incl. 3 sequences per batch, an MTP-style
+  with PLE and QSA on the CPU: 7 (C, G) configurations x 8 scenarios, incl. 3 sequences per batch, an MTP-style
   rollback with rs_idx != 0 on entry, and a reused recurrent cell; it compares the logits, h_nextn, the
-  llama_state_get_data bytes, the apply() count and every named graph input each pass saw). GPU bit identity is
-  gated separately by <bench>/chunk-loop/gate-bits.sh (tools/prefill-dump).
+  llama_state_get_data bytes, the apply() count and every named graph input each pass saw; 8 scenarios incl. one
+  KV stream, 56 checks). Each mechanism reverted alone turns it red (tests/prefill-chunk-mutate.py, 27 Oct, on
+  25225562c): KV cells/heads swap 49/56 (inputs only: on the CPU the logits do not see a wider n_kv, so the input
+  trace is what pins this seam), recurrent cells/head/n/used/rs_z swap 28/56, rs_idx copied in rather than swapped
+  18/56, rs_idx advanced in chunk_save 21/56, apply() per pass instead of the swap 49/56 (apply count 74 != 19),
+  n_kv recomputed in chunk_swap_in 12/56, the residual write 42/56, the generating-batch policy 7/56, and the
+  mem_hybrid kq_mask ->buffer guard aborts (GGML_ASSERT(buffer)). GPU bit identity is gated separately by
+  <bench>/chunk-loop/gate-bits.sh (copy tests/prefill-chunk-gate-bits.sh; dumps with tools/prefill-dump).
