@@ -1,5 +1,6 @@
 // PREFILL-CHUNK-MIXED (tests/INVARIANTS.md): under LLAMA_PREFILL_CHUNK a server batch that carries a generating token
-// holds at most LLAMA_PREFILL_CHUNK_MIXED_BATCH tokens (default 2048, the served -b); one without fills to n_batch;
+// holds at most LLAMA_PREFILL_CHUNK_MIXED_BATCH tokens (default 2048, the served -b), and so does the rest of a batch
+// in which a slot reaches its prompt's last n_ubatch + 4 tokens; any other batch fills to n_batch;
 // without LLAMA_PREFILL_CHUNK (or C < 2) nothing changes. The cap is tools/server/server-batch-policy.h, applied by
 // update_slots after the generating slots' tokens are in the batch and before any prompt token is added.
 #include "../tools/server/server-batch-policy.h"
@@ -36,6 +37,15 @@ int main() {
         check(p.cap(8192, 1) == 2048, "one generating token: the served 2048");
         check(p.cap(8192, 3) == 2048, "a sampled token and two drafts: the served 2048");
         check(p.cap(1024, 1) == 1024, "n_batch below the cap: n_batch");
+    }
+    // a slot that reaches its prompt's tail (n_ubatch + 4 left, or none) caps what the slots after it add
+    {
+        const auto p = with("8", nullptr);
+        check(p.cap_tail(8192, 1028, 1024) == 2048, "1028 left at -ub 1024 (the first checkpoint break): the served 2048");
+        check(p.cap_tail(8192, 4, 1024) == 2048 && p.cap_tail(8192, 0, 1024) == 2048, "4 left, or the prompt done: 2048");
+        check(p.cap_tail(8192, 1029, 1024) == 8192, "1029 left: not the tail, fill to n_batch");
+        const auto q = with(nullptr, nullptr);
+        check(q.cap_tail(8192, 0, 1024) == 8192, "chunk unset: the tail changes nothing");
     }
     {
         const auto p = with("4", "4096");

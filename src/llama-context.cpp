@@ -2001,6 +2001,11 @@ const char * llama_context::prefill_chunk_refusal(const llama_batch_ext & batch_
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    // fork: LLAMA_PREFILL_CHUNK_TRACE=1 logs one WARN line per decode (the path, its passes, the time)
+    static const bool chunk_trace = [] { const char * e = getenv("LLAMA_PREFILL_CHUNK_TRACE"); return e && atoi(e) != 0; }();
+    const int64_t t_decode_start_us = chunk_trace ? ggml_time_us() : 0;
+    const int64_t n_passes_start    = prefill_chunk_n_passes;
+    int64_t t_reserve_us = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -2108,7 +2113,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     output_swaps.clear();
 
-    sched_reserve();
+    {
+        const int64_t t0 = chunk_trace ? ggml_time_us() : 0;
+        sched_reserve();
+        t_reserve_us = chunk_trace ? ggml_time_us() - t0 : 0;
+    }
 
     bool did_optimize = false;
 
@@ -2517,7 +2526,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         prefill_chunk_n_ubatch++;
     } while (mctx->next());
 
-    ggml_backend_sched_moe_pf_stats(sched.get(), &prefill_pf_n_upload, &prefill_pf_n_read, &prefill_pf_n_bytes);
+    {
+        const int64_t up0 = prefill_pf_n_upload, rd0 = prefill_pf_n_read;
+        ggml_backend_sched_moe_pf_stats(sched.get(), &prefill_pf_n_upload, &prefill_pf_n_read, &prefill_pf_n_bytes);
+        if (chunk_trace) {
+            // a reserve recreates the scheduler, and its counters start again from 0
+            const int64_t d_up = prefill_pf_n_upload >= up0 ? prefill_pf_n_upload - up0 : prefill_pf_n_upload;
+            const int64_t d_rd = prefill_pf_n_read   >= rd0 ? prefill_pf_n_read   - rd0 : prefill_pf_n_read;
+            std::set<llama_seq_id> seqs;
+            for (const auto & t : batch_inp.tokens) seqs.insert(t.seq_ids.begin(), t.seq_ids.end());
+            LLAMA_LOG_WARN("%s: chunk-trace: %u tokens of %zu sequences, %u outputs, %s%s (%lld passes); reserve %.0f ms; prefetch uploads %lld reads %lld; %.0f ms\n",
+                    __func__, n_tokens_all, seqs.size(), n_outputs_all,
+                    use_chunk ? "chunk path" : prefill_chunk < 2 ? "micro-batch path (chunk off)" :
+                        n_tokens_all <= cparams.n_ubatch ? "micro-batch path (one ubatch)" : "micro-batch path: ",
+                    !use_chunk && chunk_refusal ? chunk_refusal : "", (long long) (prefill_chunk_n_passes - n_passes_start),
+                    t_reserve_us/1000.0, (long long) d_up, (long long) d_rd, (ggml_time_us() - t_decode_start_us)/1000.0);
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;

@@ -1,5 +1,8 @@
 #include "server-context.h"
 #include "server-batch-policy.h"
+
+#include <array>
+#include <map>
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -2875,7 +2878,34 @@ private:
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
 
                 batch_view = batch.get_view(off, n_tokens);
+
+                // fork (fork-chunk-loop P3a): LLAMA_SERVER_BATCH_TRACE=1, one WARN line per decode: per slot its prompt
+                // and generated tokens in the view, the decode's time and the host time since the previous decode ended
+                static const bool batch_trace = [] { const char * e = getenv("LLAMA_SERVER_BATCH_TRACE"); return e && atoi(e) != 0; }();
+                static int64_t t_prev_end_us = 0;
+                std::string trace;
+                if (batch_trace) {
+                    std::map<int32_t, std::array<int32_t, 3>> per; // slot -> prompt tokens, generated tokens, outputs
+                    for (int32_t i = off; i < off + n_tokens; ++i) {
+                        const auto & t = batch.tokens[i];
+                        per[t.id_slot][t.is_prompt ? 0 : 1]++;
+                        per[t.id_slot][2] += t.output;
+                    }
+                    for (const auto & [id, c] : per) {
+                        trace += string_format(" s%d:%dp+%dg/%do", id, c[0], c[1], c[2]);
+                    }
+                }
+                const int64_t t_dec0 = batch_trace ? ggml_time_us() : 0;
+
                 bool ok = decode(n_batch, off, batch_view);
+
+                if (batch_trace) {
+                    llama_synchronize(ctx_tgt); // the trace times the compute, not the launch
+                    const int64_t t_dec1 = ggml_time_us();
+                    SRV_WRN("batch-trace: %d tokens%s; decode %.0f ms, host %.0f ms before it\n", n_tokens, trace.c_str(),
+                            (t_dec1 - t_dec0)/1000.0, t_prev_end_us ? (t_dec0 - t_prev_end_us)/1000.0 : 0.0);
+                    t_prev_end_us = t_dec1;
+                }
 #ifdef DEBUG_TIMINGS
                 llama_synchronize(ctx_tgt);
 #endif
@@ -3121,16 +3151,15 @@ private:
 
         // fork (fork-chunk-loop P3a, PREFILL-CHUNK-MIXED): under LLAMA_PREFILL_CHUNK a batch carrying a generating
         // token is held to the served -b, so its step, and the generating slots' per-token latency, stay the served ones
-        {
-            static const server_batch_policy batch_policy = [] {
-                const server_batch_policy p = server_batch_policy::from_env();
-                if (p.mixed_cap > 0) {
-                    SRV_WRN("LLAMA_PREFILL_CHUNK: a batch that carries a generating token holds at most %d tokens (LLAMA_PREFILL_CHUNK_MIXED_BATCH)\n", p.mixed_cap);
-                }
-                return p;
-            }();
-            n_batch = batch_policy.cap(n_batch, batch.size());
-        }
+        static const server_batch_policy batch_policy = [] {
+            const server_batch_policy p = server_batch_policy::from_env();
+            if (p.mixed_cap > 0) {
+                SRV_WRN("LLAMA_PREFILL_CHUNK: a batch that carries a generating token, or a prompt's last n_ubatch + 4 tokens, "
+                        "holds at most %d tokens (LLAMA_PREFILL_CHUNK_MIXED_BATCH)\n", p.mixed_cap);
+            }
+            return p;
+        }();
+        n_batch = batch_policy.cap(n_batch, batch.size());
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3608,6 +3637,12 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+
+                    // fork (P3a, PREFILL-CHUNK-MIXED): this slot's first token waits for the batch that reaches its
+                    // prompt's tail, so the slots after it add only up to the served batch
+                    if (n_tokens_cur > 0) {
+                        n_batch = batch_policy.cap_tail(n_batch, slot.task->n_tokens() - slot.prompt.n_tokens(), n_ubatch);
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 

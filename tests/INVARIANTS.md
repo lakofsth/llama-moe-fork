@@ -146,7 +146,10 @@ One sentence per invariant; each names the test that pins it.
 - **PREFILL-CHUNK-MIXED (fork-chunk-loop P3a, 2026-10-28).** With LLAMA_PREFILL_CHUNK set (C >= 2), a server batch that
   carries any generating slot's token (sampled or draft) holds at most LLAMA_PREFILL_CHUNK_MIXED_BATCH tokens in all
   (default 2048, the served -b; 0 = no cap), so while a slot generates, every batch is the one the served recipe
-  builds and its step time, hence the generating slots' per-token latency, is the served one; a batch with no
-  generating token fills to n_batch (the -b 8192 that lets a chunk hold 8 ubatches). Unset (or C < 2), the batch is
-  filled as before. Pinned by `tests/test-server-batch-policy.cpp` (tools/server/server-batch-policy.h, the cap the
-  server's update_slots applies before it adds prompt tokens).
+  builds and its step time, hence the generating slots' per-token latency, is the served one. Amended 28 Oct after the
+  server gate (server-20261028T000433Z, peak-a +14 s TTFT): likewise, once a slot's tokens bring it to its prompt's
+  last n_ubatch + 4 tokens (the tail the server's checkpoints split off into their own batches) or to its end, the
+  slots after it add only up to the cap, since that slot's first token waits for those batches. Any other batch fills
+  to n_batch (the -b 8192 that lets a chunk hold 8 ubatches). Unset (or C < 2), the batch is filled as before. Pinned
+  by `tests/test-server-batch-policy.cpp` (tools/server/server-batch-policy.h, the caps the server's update_slots
+  applies; red with either cap reverted or the default off: tests/prefill-chunk-mutate.py B1-B3).
