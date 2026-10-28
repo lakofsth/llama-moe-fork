@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_HC_MIX,
+        GGML_OP_MASK_FROM_META,
 
         GGML_OP_UNARY,
 
@@ -2738,6 +2739,29 @@ extern "C" {
     //   w[h, t]     = 2*sigmoid(scale*(w_inject . xn)[h])
     // scale is 1/hc. Rows of x must be contiguous.
     //
+    // fork (fork-chunk-loop, PREFILL-CHUNK-GPU-MASK): an attention mask from per-cell and per-token metadata.
+    //   cells: I32 [4, n_cells, n_stream]: value, sequence bits, ext x, ext y
+    //   toks:  I32 [4, n_tps,   n_stream]: threshold, sequence bit index (0..31), ext x, ext y
+    // result `type` (F16 or F32) [n_cells, n_tps, 1, n_stream]: element (j, i, s) is 0 if the cell's sequence bits hold
+    // the token's bit and the mode's position rule keeps it, else -INFINITY:
+    //   ANY       always
+    //   CAUSAL    value <= threshold
+    //   CAUSAL_2D value < threshold, or value == threshold and not (cell y > token y, or y equal and cell x > token x)
+    //   STRICT    value < threshold
+    enum ggml_mask_meta_mode {
+        GGML_MASK_META_ANY       = 0,
+        GGML_MASK_META_CAUSAL    = 1,
+        GGML_MASK_META_CAUSAL_2D = 2,
+        GGML_MASK_META_STRICT    = 3,
+    };
+
+    GGML_API struct ggml_tensor * ggml_mask_from_meta(
+            struct ggml_context    * ctx,
+            struct ggml_tensor     * cells,
+            struct ggml_tensor     * toks,
+            enum ggml_type           type,
+            enum ggml_mask_meta_mode mode);
+
     GGML_API struct ggml_tensor * ggml_hc_mix(
             struct ggml_context * ctx,
             struct ggml_tensor  * x,

@@ -350,6 +350,11 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // fork: PREFILL-CHUNK-GPU-MASK. When set, self_kq_mask is GGML_OP_MASK_FROM_META's result, not an input, and these
+    // are the inputs: I32 [4, n_kv, n_stream] and I32 [4, n_batch/n_stream, n_stream]
+    ggml_tensor * self_kq_meta_cells = nullptr;
+    ggml_tensor * self_kq_meta_toks  = nullptr;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -663,12 +668,17 @@ public:
     const llama_cross * cross = nullptr;
 };
 
+// fork (fork-chunk-loop, PREFILL-CHUNK-GPU-MASK): LLAMA_PREFILL_CHUNK_GPU_MASK=1, read per graph build
+bool llama_prefill_chunk_gpu_mask();
+
 // fork (fork-chunk-loop P3a, PREFILL-CHUNK-INPUTS): the inputs a chunk computes once per ubatch and copies into that
 // ubatch's later passes. Owned by llama_context, cleared at every chunk's start and end; nullptr outside the chunk loop.
 struct llm_graph_input_cache {
     enum kind : int32_t {
-        KQ_MASK = 0,
-        QSA     = 16, // + 8*ratio + the tensor's index in the set
+        KQ_MASK       = 0,
+        KQ_META_CELLS = 1, // PREFILL-CHUNK-GPU-MASK
+        KQ_META_TOKS  = 2,
+        QSA           = 16, // + 8*ratio + the tensor's index in the set
     };
 
     std::map<std::pair<uint32_t, int32_t>, std::vector<uint8_t>> data; // (ubatch in the chunk, kind) -> bytes

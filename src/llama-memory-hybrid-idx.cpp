@@ -279,8 +279,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
-        int64_t n_kv_cur) const {
+        int64_t n_kv_cur,
+        ggml_tensor * blk_meta,
+        ggml_tensor * tok_meta) const {
     GGML_ASSERT(ratio > 0);
+    // PREFILL-CHUNK-GPU-MASK: with blk_meta the device builds the block bias; bias is then not an input
+    GGML_ASSERT(blk_meta == nullptr || (blk_bias && tok_meta != nullptr && ggml_backend_buffer_is_host(blk_meta->buffer) &&
+                ggml_backend_buffer_is_host(tok_meta->buffer)));
     GGML_ASSERT(get_mem_idx() != nullptr);
 
     GGML_ASSERT(blk_bias ? (ratio == 1 || tail_idxs != nullptr) : cell_blk != nullptr);
@@ -300,7 +305,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_tail      = tail_idxs ? (int32_t *) tail_idxs->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
-    float   * dst_bias      = (float   *) bias->data;
+    float   * dst_bias      = blk_meta ? nullptr : (float *) bias->data;
+    int32_t * dst_blk_meta  = blk_meta ? (int32_t *) blk_meta->data : nullptr;
+    int32_t * dst_tok_meta  = tok_meta ? (int32_t *) tok_meta->data : nullptr;
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -523,6 +530,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
+        std::vector<int64_t>      tok_tail(n_tps, 0);
+        std::vector<llama_seq_id> tok_seq(n_tps);
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            tok_seq[ii] = ubatch->seq_id[s*n_tps + ii][0];
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t      i      = s*n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
@@ -558,13 +571,8 @@ void llama_memory_hybrid_idx::set_input_qsa(
             if (blk_bias) {
                 // a query selects among the whole blocks wholly before its tail; everything else is -inf, and
                 // the tail is named apart, so it never competes for a slot and a block is never taken in part
-                float * cur_blk_bias = dst_bias + i*n_blocks;
-
-                for (int64_t b = 0; b < n_blocks; ++b) {
-                    const bool sel = b < n_bid && bid_idx[b] < tail_start && cells.seq_has((uint32_t) bid_cell[b], seq_id);
-
-                    cur_blk_bias[b] = sel ? 0.0f : -INFINITY;
-                }
+                // (llama_qsa_fill_blk_bias, after this loop, or its metadata for the device)
+                tok_tail[ii] = tail_start;
 
                 if (dst_tail) {
                     // the tail cells [tail_start, q] of this sequence, then the sentinel n_kv, which the
@@ -613,7 +621,59 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_bias[j] = v;
             }
         }
+
+        if (blk_bias) {
+            const auto blk_has = [&](int32_t b, llama_seq_id sq) { return cells.seq_has((uint32_t) bid_cell[b], sq); };
+            if (dst_blk_meta) {
+                const bool ok = llama_qsa_fill_blk_meta(dst_blk_meta + s*n_blocks*4, dst_tok_meta + s*n_tps*4, n_blocks, n_bid,
+                        bid_idx.data(), n_tps, tok_seq.data(), tok_tail.data(), blk_has);
+                GGML_ASSERT(ok && "qsa meta: more than 32 sequences in a stream (the graph should have kept the host bias)");
+            } else {
+                llama_qsa_fill_blk_bias(dst_bias + s*n_tps*n_blocks, n_blocks, n_bid, bid_idx.data(), n_tps, tok_seq.data(),
+                        tok_tail.data(), blk_has);
+            }
+        }
     }
+}
+
+void llama_qsa_fill_blk_bias(float * bias, int64_t n_blocks, int32_t n_bid, const int32_t * bid_idx, int64_t n_tps,
+        const llama_seq_id * tok_seq, const int64_t * tok_tail, const std::function<bool(int32_t, llama_seq_id)> & blk_has) {
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        float * cur = bias + ii*n_blocks;
+        for (int64_t b = 0; b < n_blocks; ++b) {
+            const bool sel = b < n_bid && bid_idx[b] < tok_tail[ii] && blk_has((int32_t) b, tok_seq[ii]);
+            cur[b] = sel ? 0.0f : -INFINITY;
+        }
+    }
+}
+
+bool llama_qsa_fill_blk_meta(int32_t * blk_meta, int32_t * tok_meta, int64_t n_blocks, int32_t n_bid, const int32_t * bid_idx,
+        int64_t n_tps, const llama_seq_id * tok_seq, const int64_t * tok_tail, const std::function<bool(int32_t, llama_seq_id)> & blk_has) {
+    llama_seq_bit_map map;
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        if (!map.add(tok_seq[ii])) {
+            return false;
+        }
+    }
+    for (int64_t b = 0; b < n_blocks; ++b) {
+        int32_t * m = blk_meta + b*4;
+        uint32_t bits = 0;
+        if (b < n_bid) {
+            for (size_t k = 0; k < map.seqs.size(); ++k) {
+                if (blk_has((int32_t) b, map.seqs[k])) bits |= 1u << k;
+            }
+        }
+        m[0] = b < n_bid ? bid_idx[b] : 0;
+        m[1] = (int32_t) bits;
+        m[2] = m[3] = 0;
+    }
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        int32_t * t = tok_meta + ii*4;
+        t[0] = (int32_t) tok_tail[ii];
+        t[1] = map.bit(tok_seq[ii]);
+        t[2] = t[3] = 0;
+    }
+    return true;
 }
 
 //
@@ -732,9 +792,11 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * tail_idxs,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        ggml_tensor * blk_meta,
+        ggml_tensor * tok_meta) const {
     GGML_ASSERT(mem != nullptr);
 
     // the graph was built for this many cells; cell_blk, which used to carry it, exists only with the per-cell bias
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, blk_bias, get_idx()->get_n_kv());
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, blk_bias, get_idx()->get_n_kv(), blk_meta, tok_meta);
 }

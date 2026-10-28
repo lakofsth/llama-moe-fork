@@ -756,16 +756,17 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         // PREFILL-CHUNK-INPUTS: the set of ubatch k is computed once per chunk and copied into k's later passes
-        ggml_tensor * ts[6] = { k_idxs, cell_blk, blk_cells, blk_pos, bias, tail_idxs };
+        // with the device-built bias (blk_meta), the bias is no input: its metadata is
+        ggml_tensor * ts[7] = { k_idxs, cell_blk, blk_cells, blk_pos, blk_meta ? blk_meta : bias, tail_idxs, tok_meta };
         const int32_t kind0 = llm_graph_input_cache::QSA + 8*(int32_t) ratio;
         if (cache) {
             bool all = true;
-            for (int i = 0; i < 6 && all; ++i) {
+            for (int i = 0; i < 7 && all; ++i) {
                 all = ts[i] == nullptr || cache->data.count({ cache_k, kind0 + i }) > 0;
             }
             if (all) {
                 bool ok = true;
-                for (int i = 0; i < 6 && ok; ++i) {
+                for (int i = 0; i < 7 && ok; ++i) {
                     ok = ts[i] == nullptr || cache->get(cache_k, kind0 + i, ts[i]);
                 }
                 if (ok) {
@@ -775,9 +776,9 @@ public:
             }
         }
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, blk_meta ? nullptr : bias, tail_idxs, ubatch, ratio, blk_bias, blk_meta, tok_meta);
         if (cache) {
-            for (int i = 0; i < 6; ++i) {
+            for (int i = 0; i < 7; ++i) {
                 if (ts[i]) cache->put(cache_k, kind0 + i, ts[i]);
             }
             cache->n_fill++;
@@ -822,6 +823,8 @@ public:
     ggml_tensor * blk_pos   = nullptr;   // I32 [4*n_blocks*n_stream]
     ggml_tensor * bias      = nullptr;   // F32 [n_blocks or n_kv, n_tokens/n_stream, n_stream]
     ggml_tensor * tail_idxs = nullptr;   // I32 [ratio - 1, n_tokens/n_stream, n_stream], per-block bias with ratio > 1 only
+    ggml_tensor * blk_meta  = nullptr;   // PREFILL-CHUNK-GPU-MASK: I32 [4, n_blocks, n_stream]; bias is then built from it
+    ggml_tensor * tok_meta  = nullptr;   //                         I32 [4, n_tokens/n_stream, n_stream]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -878,7 +881,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
-        qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+
+        // PREFILL-CHUNK-GPU-MASK: in a chunk pass the per-block bias is built on the device from 16 bytes per block and token
+        const bool gpu_bias = blk_bias && chunk_pass && llama_prefill_chunk_gpu_mask() && ubatch.n_seqs_unq <= 32;
+        if (gpu_bias) {
+            qsa->blk_meta = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_blocks, n_stream);
+            qsa->tok_meta = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);
+            ggml_set_input(qsa->blk_meta);
+            ggml_set_input(qsa->tok_meta);
+            ggml_format_name(qsa->blk_meta, "qsa_blk_meta_%d", (int) r);
+            ggml_format_name(qsa->tok_meta, "qsa_tok_meta_%d", (int) r);
+            qsa->bias = ggml_reshape_3d(ctx0,
+                    ggml_mask_from_meta(ctx0, qsa->blk_meta, qsa->tok_meta, GGML_TYPE_F32, GGML_MASK_META_STRICT),
+                    n_blocks, n_tps, n_stream);
+        } else {
+            qsa->bias  = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
+        }
 
         if (blk_bias) {
             if (r > 1) {
@@ -892,7 +910,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         ggml_set_input(qsa->blk_cells);
         ggml_set_input(qsa->blk_pos);
-        ggml_set_input(qsa->bias);
+        if (!gpu_bias) {
+            ggml_set_input(qsa->bias);
+        }
 
         inp = qsa.get();
         res->add_input(std::move(qsa));

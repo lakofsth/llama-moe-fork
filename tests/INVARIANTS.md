@@ -179,3 +179,18 @@ One sentence per invariant; each names the test that pins it.
   (tests/prefill-chunk-mutate.py on 798434b6e, of 63): the mask cache 48, the QSA cache 48, the key without the chunk
   slot 56 (wrong masks), both clears removed 56 (a chunk reuses the previous chunk's fills); one clear alone is enough,
   so the mutation removes both. CPU proxy (the fixture, n_kv <= 512, 119 chunk decodes): set_inputs 90 -> 31 ms.
+
+- **PREFILL-CHUNK-GPU-MASK (fork-chunk-loop P3a, 2026-10-28).** With LLAMA_PREFILL_CHUNK_GPU_MASK=1, a chunk pass's
+  attention KQ mask and its qwen4exp QSA block bias are built in the graph by GGML_OP_MASK_FROM_META from per-cell and
+  per-token metadata (I32 [4, n, n_stream]: value, the bits of the ubatch's sequences the cell holds, 2-D position
+  extension; per token its threshold, its sequence bit and extension), and the values it produces are byte for byte
+  the host fill's: 0 where the host writes 0 and -INFINITY where it writes -INFINITY (F16 for flash attention, else
+  F32), with the host's causal rule (keep p_cell <= p_token; with 2-D positions, at equal positions drop a cell whose
+  extension is_2d_gt the token's) and its QSA rule (keep a pooled block whose first index is below the token's tail
+  and whose sequence set holds the token's sequence). So the graph's outputs are bit for bit those of the host masks,
+  and what crosses to the device per pass is the metadata (16 bytes per cell and per token), not the masks.
+  SWA, ALiBi, the per-cell QSA bias, more than 32 sequences in a stream, and every graph outside the chunk loop keep
+  the host fill. Pinned by `tests/test-mask-from-meta.cpp` (the op on CPU and CUDA against the host fill functions,
+  byte for byte: n_kv not a multiple of 256, unified KV with several sequences, cells of other slots, empty cells,
+  2-D positions, the QSA rule) and `tests/test-prefill-chunk.cpp` (the chunk path with the op, CPU, bit-identical to
+  the host masks).

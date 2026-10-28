@@ -1110,7 +1110,22 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
     }
 
-    if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
+    if (inp_attn->self_kq_meta_cells) {
+        // PREFILL-CHUNK-GPU-MASK: the device builds the mask; the host writes 16 bytes per cell and per token
+        if (inp_attn->self_kq_meta_cells->buffer && inp_attn->self_kq_meta_toks->buffer) {
+            if (cache && cache->get(cache_k, llm_graph_input_cache::KQ_META_CELLS, inp_attn->self_kq_meta_cells) &&
+                         cache->get(cache_k, llm_graph_input_cache::KQ_META_TOKS,  inp_attn->self_kq_meta_toks)) {
+                cache->n_reuse++;
+            } else {
+                mctx->get_attn()->set_input_kq_meta(inp_attn->self_kq_meta_cells, inp_attn->self_kq_meta_toks, ubatch);
+                if (cache) {
+                    cache->put(cache_k, llm_graph_input_cache::KQ_META_CELLS, inp_attn->self_kq_meta_cells);
+                    cache->put(cache_k, llm_graph_input_cache::KQ_META_TOKS,  inp_attn->self_kq_meta_toks);
+                    cache->n_fill++;
+                }
+            }
+        }
+    } else if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
         // PREFILL-CHUNK-INPUTS: a chunk computes the mask of ubatch k once and copies it into k's later passes
         if (cache && cache->get(cache_k, llm_graph_input_cache::KQ_MASK, inp_attn->self_kq_mask)) {
             cache->n_reuse++;
@@ -3126,7 +3141,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+                   bool   gpu_mask = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -3136,7 +3152,23 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        // PREFILL-CHUNK-GPU-MASK: the mask is built on the device from metadata, where the metadata can express it
+        const int mode = gpu_mask ? llama_kv_cells_kq_meta_mode(hparams, hparams.swa_type, cparams.causal_attn, ubatch.is_pos_2d()) : -1;
+        const int64_t n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        if (mode >= 0 && ubatch.n_seqs_unq <= 32 && ubatch.n_tokens % n_stream == 0) {
+            const int64_t n_kv = mctx_cur->get_n_kv();
+            inp->self_kq_meta_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_kv, n_stream);
+            inp->self_kq_meta_toks  = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, ubatch.n_tokens/n_stream, n_stream);
+            ggml_set_input(inp->self_kq_meta_cells);
+            ggml_set_input(inp->self_kq_meta_toks);
+            ggml_set_name(inp->self_kq_meta_cells, "attn_inp_kq_meta_cells");
+            ggml_set_name(inp->self_kq_meta_toks,  "attn_inp_kq_meta_toks");
+            inp->self_kq_mask = ggml_mask_from_meta(ctx0, inp->self_kq_meta_cells, inp->self_kq_meta_toks,
+                    cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32, (enum ggml_mask_meta_mode) mode);
+            ggml_set_name(inp->self_kq_mask, "attn_kq_mask_from_meta");
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+        }
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -3906,11 +3938,17 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), chunk_pass && llama_prefill_chunk_gpu_mask());
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, input_cache, chunk_k);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+}
+
+bool llama_prefill_chunk_gpu_mask() {
+    // read per graph build (cheap), so a test can turn it on for one context and not another
+    const char * e = getenv("LLAMA_PREFILL_CHUNK_GPU_MASK");
+    return e && atoi(e) != 0;
 }
 
 bool llm_graph_input_cache::get(uint32_t k, int32_t kind, ggml_tensor * dst) const {

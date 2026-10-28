@@ -11323,6 +11323,58 @@ void ggml_compute_forward_dsv4_hc_pre(
     }
 }
 
+// ggml_compute_forward_mask_from_meta (fork, fork-chunk-loop, PREFILL-CHUNK-GPU-MASK)
+//
+// The reference for the CUDA kernel. Definition: ggml.h ggml_mask_from_meta.
+
+static inline bool ggml_mask_meta_keep(const int32_t * c, const int32_t * t, int32_t mode) {
+    if ((((uint32_t) c[1]) >> (t[1] & 31) & 1u) == 0) {
+        return false;
+    }
+    switch (mode) {
+        case GGML_MASK_META_ANY:       return true;
+        case GGML_MASK_META_CAUSAL:    return c[0] <= t[0];
+        case GGML_MASK_META_CAUSAL_2D: return c[0] != t[0] ? c[0] < t[0] : !(c[3] > t[3] || (c[3] == t[3] && c[2] > t[2]));
+        case GGML_MASK_META_STRICT:    return c[0] < t[0];
+    }
+    return false;
+}
+
+void ggml_compute_forward_mask_from_meta(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * cells = dst->src[0];
+    const ggml_tensor * toks  = dst->src[1];
+
+    const int32_t mode    = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_cells = dst->ne[0];
+    const int64_t n_tps   = dst->ne[1];
+    const int64_t n_s     = dst->ne[3];
+
+    const int32_t * cd = (const int32_t *) cells->data;
+    const int32_t * td = (const int32_t *) toks->data;
+
+    const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    for (int64_t r = params->ith; r < n_tps*n_s; r += params->nth) {
+        const int64_t s = r / n_tps;
+        const int64_t i = r % n_tps;
+
+        const int32_t * t = td + (s*n_tps + i)*4;
+        char * row = (char *) dst->data + s*dst->nb[3] + i*dst->nb[1];
+
+        for (int64_t j = 0; j < n_cells; ++j) {
+            const bool k = ggml_mask_meta_keep(cd + (s*n_cells + j)*4, t, mode);
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) row)[j] = k ? keep16 : drop16;
+            } else {
+                ((float *) row)[j] = k ? 0.0f : -INFINITY;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_hc_mix (fork, fork-kernel-fusion)
 //
 // The reference for the CUDA kernels: one thread, every product summed in double, the weights

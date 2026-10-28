@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "HC_MIX",
+    "MASK_FROM_META",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "hc_mix(x, w_norm, w_down, w_up, w_inject)",
+    "mask_from_meta(cells, toks)",
 
     "unary(x)",
 
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6560,6 +6562,32 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_mask_from_meta (fork, fork-chunk-loop)
+
+struct ggml_tensor * ggml_mask_from_meta(
+        struct ggml_context    * ctx,
+        struct ggml_tensor     * cells,
+        struct ggml_tensor     * toks,
+        enum ggml_type           type,
+        enum ggml_mask_meta_mode mode) {
+    GGML_ASSERT(cells->type == GGML_TYPE_I32 && toks->type == GGML_TYPE_I32);
+    GGML_ASSERT(cells->ne[0] == 4 && toks->ne[0] == 4);
+    GGML_ASSERT(cells->ne[2] == toks->ne[2] && cells->ne[3] == 1 && toks->ne[3] == 1);
+    GGML_ASSERT(ggml_is_contiguous(cells) && ggml_is_contiguous(toks));
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(mode >= GGML_MASK_META_ANY && mode <= GGML_MASK_META_STRICT);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, cells->ne[1], toks->ne[1], 1, cells->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) mode);
+
+    result->op     = GGML_OP_MASK_FROM_META;
+    result->src[0] = cells;
+    result->src[1] = toks;
+
+    return result;
 }
 
 // ggml_hc_mix

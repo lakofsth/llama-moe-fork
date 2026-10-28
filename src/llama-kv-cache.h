@@ -244,6 +244,7 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_meta   (ggml_tensor * cells_meta, ggml_tensor * toks_meta, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -464,6 +465,7 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_meta   (ggml_tensor * cells_meta, ggml_tensor * toks_meta, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -505,3 +507,34 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 };
+
+// fork (fork-chunk-loop, PREFILL-CHUNK-GPU-MASK): the host KQ mask fill (what llama_kv_cache::set_input_kq_mask does),
+// and the per-cell / per-token metadata GGML_OP_MASK_FROM_META builds the same mask from
+void llama_kv_cells_fill_kq_mask(
+        const llama_hparams                & hparams,
+        const llama_ubatch                 * ubatch,
+        const std::vector<llama_kv_cells>  & v_cells,
+        const std::vector<uint32_t>        & seq_to_stream,
+        uint32_t                             n_swa,
+        llama_swa_type                       swa_type,
+        ggml_tensor                        * dst,
+        bool                                 causal_attn);
+
+// the op's mode for this mask, or -1 where the metadata cannot express it (ALiBi, SWA)
+int llama_kv_cells_kq_meta_mode(const llama_hparams & hparams, llama_swa_type swa_type, bool causal_attn, bool is_2d);
+
+// up to 32 sequence ids, each with a bit
+struct llama_seq_bit_map {
+    std::vector<llama_seq_id> seqs;
+    int      bit (llama_seq_id seq_id) const;               // -1 if absent
+    bool     add (llama_seq_id seq_id);                     // false if a 33rd
+    uint32_t bits(const llama_kv_cells & cells, uint32_t j) const; // the bits of the sequences cell j holds
+};
+
+// cells_meta I32 [4, n_kv, n_stream], toks_meta I32 [4, n_tokens/n_stream, n_stream]; false: more than 32 sequences
+bool llama_kv_cells_fill_kq_meta(
+        const llama_ubatch                 * ubatch,
+        const std::vector<llama_kv_cells>  & v_cells,
+        const std::vector<uint32_t>        & seq_to_stream,
+        ggml_tensor                        * cells_meta,
+        ggml_tensor                        * toks_meta);

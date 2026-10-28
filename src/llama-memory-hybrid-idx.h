@@ -2,6 +2,7 @@
 
 #include "llama-memory-hybrid.h"
 
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -84,9 +85,11 @@ public:
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns], 0 on a whole block wholly before
     // the query's tail and -inf on every other block, with the tail named apart in
     //   tail_idxs I32 [ratio - 1, n_tokens/ns, ns] the query's tail cells, then the sentinel n_kv (nullptr if ratio == 1)
+    // blk_meta, tok_meta (PREFILL-CHUNK-GPU-MASK, per-block bias only): I32 [4, n_blocks, ns] and [4, n_tokens/ns, ns], the
+    // metadata GGML_OP_MASK_FROM_META builds bias from on the device (bias is then not written)
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, int64_t n_kv) const;
+                       bool blk_bias, int64_t n_kv, ggml_tensor * blk_meta = nullptr, ggml_tensor * tok_meta = nullptr) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -149,7 +152,7 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, ggml_tensor * tail_idxs, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * blk_meta = nullptr, ggml_tensor * tok_meta = nullptr) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
@@ -164,3 +167,11 @@ private:
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
 };
+
+// fork (fork-chunk-loop, PREFILL-CHUNK-GPU-MASK): the QSA per-block bias of one stream as the host writes it (n_tps rows
+// of n_blocks: 0 where block b < n_bid starts below the token's tail and holds its sequence, else -INFINITY), and the
+// metadata GGML_OP_MASK_FROM_META (STRICT) builds the same rows from; false: more than 32 sequences in the stream
+void llama_qsa_fill_blk_bias(float * bias, int64_t n_blocks, int32_t n_bid, const int32_t * bid_idx, int64_t n_tps,
+        const llama_seq_id * tok_seq, const int64_t * tok_tail, const std::function<bool(int32_t, llama_seq_id)> & blk_has);
+bool llama_qsa_fill_blk_meta(int32_t * blk_meta, int32_t * tok_meta, int64_t n_blocks, int32_t n_bid, const int32_t * bid_idx,
+        int64_t n_tps, const llama_seq_id * tok_seq, const int64_t * tok_tail, const std::function<bool(int32_t, llama_seq_id)> & blk_has);

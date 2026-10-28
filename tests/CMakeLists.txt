@@ -271,6 +271,7 @@ llama_build_and_test(test-kv-seqrm.cpp) # fork-strata-ports: seq_rm of one seque
 llama_build_and_test(test-prefill-chunk.cpp) # fork-chunk-loop: layer-major prefill chunks are bit-identical to micro-batch-major (PREFILL-CHUNK)
 llama_build_and_test(test-server-batch-policy.cpp) # fork-chunk-loop P3a: the server's batch cap while slots generate (PREFILL-CHUNK-MIXED)
 llama_build_and_test(test-moe-prefetch-policy.cpp) # fork-chunk-loop P3a: prefetch on chunk passes only (PREFILL-CHUNK-PF-ONLY)
+llama_build_and_test(test-mask-from-meta.cpp) # fork-chunk-loop: GGML_OP_MASK_FROM_META equals the host mask fills (PREFILL-CHUNK-GPU-MASK)
 llama_build_and_test(test-moe-pf-ring.cpp) # fork-chunk-loop P2: the chunk prefetch ring planner (PREFILL-CHUNK-PF)
 llama_build_and_test(test-moe-prefetch.cpp) # fork-kernel-fusion: copy-stream expert prefetch vs the stock upload (P1)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)

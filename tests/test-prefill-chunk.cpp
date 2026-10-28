@@ -155,6 +155,7 @@ struct run_cfg {
     uint32_t c;        // 0: LLAMA_PREFILL_CHUNK unset
     uint32_t g;
     bool     trace = false; // LLAMA_PREFILL_CHUNK_TRACE=1 for this run
+    bool     gpu_mask = false; // LLAMA_PREFILL_CHUNK_GPU_MASK=1: the mask and QSA bias built by GGML_OP_MASK_FROM_META
 };
 
 struct scenario {
@@ -188,6 +189,7 @@ struct run_out {
 static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg, const std::vector<llama_token> & toks) {
     // the trace (read per decode) is on for one configuration only: its runs must match the untraced baseline bit for bit
     if (cfg.trace) setenv("LLAMA_PREFILL_CHUNK_TRACE", "1", 1); else unsetenv("LLAMA_PREFILL_CHUNK_TRACE");
+    if (cfg.gpu_mask) setenv("LLAMA_PREFILL_CHUNK_GPU_MASK", "1", 1); else unsetenv("LLAMA_PREFILL_CHUNK_GPU_MASK");
     if (cfg.c == 0) {
         unsetenv("LLAMA_PREFILL_CHUNK");
         unsetenv("LLAMA_PREFILL_CHUNK_GROUP");
@@ -365,6 +367,8 @@ int main(int argc, char ** argv) {
 
     const std::vector<run_cfg> cfgs = {
         { 2, 4 }, { 3, 4 }, { 5, 4 }, { 2, 1, true }, { 3, 1 }, { 4, 8 }, { 3, 12 },
+        // the masks built from metadata by GGML_OP_MASK_FROM_META (here on the CPU backend)
+        { 2, 1, false, true }, { 3, 4, false, true }, { 5, 12, false, true },
     };
 
     int n_fail = 0, n_check = 0;
@@ -395,7 +399,8 @@ int main(int argc, char ** argv) {
                 // A backend sampler's uniform_<n> is written only for a sequence with an output in the ubatch (an
                 // inactive sampler runs on a dummy row and its result is dropped): on either path the others hold
                 // whatever the compute buffer held, so they are not compared; the sampled tokens are.
-                auto skip  = [](const std::string & n) { return n.rfind("uniform_", 0) == 0; };
+                // the GPU-mask runs' metadata inputs have no counterpart in the baseline (it sends the masks)
+                auto skip  = [](const std::string & n) { return n.rfind("uniform_", 0) == 0 || n.find("_meta") != std::string::npos; };
                 auto named = [](const std::string & n) { return !n.empty() && n.rfind("leaf_", 0) != 0; };
                 std::map<std::pair<int64_t, std::string>, const std::vector<uint8_t> *> by_name;
                 std::multiset<std::pair<int64_t, std::vector<uint8_t>>> unnamed;
@@ -422,6 +427,18 @@ int main(int argc, char ** argv) {
                 }
                 if (n_bad) { ok = false; why += " inputs " + std::to_string(n_bad) + " differ, first " + first_bad; }
                 if (n_named == 0 && !sc.first_out) { ok = false; why += " no-inputs-traced"; }
+                // the GPU-mask runs must have used the op: their passes send the mask's and the QSA bias's metadata
+                if (cfg.gpu_mask && cur.n_passes > 0) {
+                    bool kq = false, qsa = false;
+                    for (const auto & r : cur.inputs) { kq |= r.name == "attn_inp_kq_meta_cells"; qsa |= r.name.rfind("qsa_blk_meta", 0) == 0; }
+                    if (!kq)  { ok = false; why += " no-kq-meta"; }
+                    if (!qsa) { ok = false; why += " no-qsa-meta"; }
+                }
+                if (!cfg.gpu_mask) {
+                    for (const auto & r : cur.inputs) {
+                        if (r.name.find("_meta") != std::string::npos) { ok = false; why += " meta-without-gpu-mask"; break; }
+                    }
+                }
             }
             // PREFILL-CHUNK-INPUTS: each chunk ubatch computes its KQ mask and its QSA set (one compress ratio in this
             // fixture) once; a group size that leaves several attention passes per ubatch reuses them
@@ -454,8 +471,8 @@ int main(int argc, char ** argv) {
             if (base.sampled != cur.sampled) { ok = false; why += " sampled-tokens"; }
             if (sc.sampling && base.sampled.size() != 3*sc.steps.size()) { ok = false; why += " sampled-count " + std::to_string(base.sampled.size()); }
 
-            printf("%-4s %-17s C=%u G=%-2u passes=%-4" PRId64 " applies=%" PRId64 " input fills=%" PRId64 " reuses=%" PRId64 "%s\n",
-                    ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cur.n_passes, cur.n_apply, cur.n_fill, cur.n_reuse, why.c_str());
+            printf("%-4s %-17s C=%u G=%-2u%s passes=%-4" PRId64 " applies=%" PRId64 " input fills=%" PRId64 " reuses=%" PRId64 "%s\n",
+                    ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cfg.gpu_mask ? " gm" : "   ", cur.n_passes, cur.n_apply, cur.n_fill, cur.n_reuse, why.c_str());
             if (!ok) n_fail++;
         }
     }
