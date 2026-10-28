@@ -2381,6 +2381,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // (a pass of several layers, or a chunk of one ubatch, has nothing to keep: the stock per-graph ring)
             const bool pf_chunk = group == 1;
             ggml_backend_sched_moe_pf_chunk(sched.get(), pf_chunk);
+
+            // PREFILL-CHUNK-INPUTS: fills live for one chunk
+            prefill_chunk_input_cache.clear();
             std::vector<const ggml_tensor *> pf_next;
 
             for (int32_t il0 = 0; applied && il0 < n_layer && status == GGML_STATUS_SUCCESS; il0 += group) {
@@ -2439,6 +2442,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (pf_chunk) {
                 ggml_backend_sched_moe_pf_chunk(sched.get(), false);
             }
+            prefill_chunk_input_cache.clear();
 
             if (status != GGML_STATUS_SUCCESS) {
                 // no ubatch of the chunk is complete -> remove the whole chunk from the memory module
@@ -2462,6 +2466,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
             i_first += n_chunk;
             prefill_chunk_n_ubatch += n_chunk;
+            prefill_chunk_n_chunk_ubatch += n_chunk;
 
             if (more && n_chunk == prefill_chunk) {
                 more = mctx->next();
@@ -3334,6 +3339,7 @@ llm_graph_params llama_context::graph_params(
         params.chunk_res_in  = range->res_in;
         params.chunk_res_out = range->res_out;
         params.chunk_pass    = true;
+        params.input_cache   = const_cast<llm_graph_input_cache *>(&prefill_chunk_input_cache);
     }
 
     return params;

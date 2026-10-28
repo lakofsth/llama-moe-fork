@@ -438,6 +438,10 @@ public:
     int64_t prefill_chunk_n_apply  = 0;
     int64_t prefill_chunk_n_passes = 0;
     int64_t prefill_chunk_n_ubatch = 0;
+    int64_t prefill_chunk_n_chunk_ubatch = 0; // ubatches run by the chunk path
+
+    // PREFILL-CHUNK-INPUTS: inputs filled once per chunk ubatch (n_fill / n_reuse count its use)
+    llm_graph_input_cache prefill_chunk_input_cache;
     // LLAMA_MOE_PREFETCH_PP, from the scheduler after each decode: slot uploads, slot reads, bytes uploaded
     int64_t prefill_pf_n_upload = 0;
     int64_t prefill_pf_n_read   = 0;

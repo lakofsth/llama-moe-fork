@@ -1107,7 +1107,16 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
 
     if (inp_attn->self_kq_mask && inp_attn->self_kq_mask->buffer) {
-        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+        // PREFILL-CHUNK-INPUTS: a chunk computes the mask of ubatch k once and copies it into k's later passes
+        if (cache && cache->get(cache_k, llm_graph_input_cache::KQ_MASK, inp_attn->self_kq_mask)) {
+            cache->n_reuse++;
+        } else {
+            mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+            if (cache) {
+                cache->put(cache_k, llm_graph_input_cache::KQ_MASK, inp_attn->self_kq_mask);
+                cache->n_fill++;
+            }
+        }
     }
 
     if (inp_attn->self_k_rot && inp_attn->self_k_rot->buffer) {
@@ -1118,6 +1127,7 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    // not cached: s_copy() resets the rollback index it reads, and the chunk loop accounts for that per pass
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy && inp_rs->s_copy->buffer) {
@@ -1512,6 +1522,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     chunk_pass       (params.chunk_pass),
+    input_cache      (params.input_cache),
+    chunk_k          (params.chunk_k),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -3877,9 +3889,28 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
 
-    auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+    auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, input_cache, chunk_k);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+}
+
+bool llm_graph_input_cache::get(uint32_t k, int32_t kind, ggml_tensor * dst) const {
+    const auto it = data.find({ k, kind });
+    if (it == data.end() || dst == nullptr || dst->buffer == nullptr || !ggml_backend_buffer_is_host(dst->buffer) ||
+            it->second.size() != ggml_nbytes(dst)) {
+        return false;
+    }
+    memcpy(dst->data, it->second.data(), it->second.size());
+    return true;
+}
+
+void llm_graph_input_cache::put(uint32_t k, int32_t kind, const ggml_tensor * src) {
+    if (src == nullptr || src->buffer == nullptr || !ggml_backend_buffer_is_host(src->buffer)) {
+        return;
+    }
+    auto & v = data[{ k, kind }];
+    v.resize(ggml_nbytes(src));
+    memcpy(v.data(), src->data, v.size());
 }
 
 llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {

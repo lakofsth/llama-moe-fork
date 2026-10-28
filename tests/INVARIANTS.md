@@ -163,3 +163,16 @@ One sentence per invariant; each names the test that pins it.
   expert tensors through the per-graph ring. Pinned by `tests/test-moe-prefetch-policy.cpp`
   (src/llama-moe-prefetch-policy.h, the decision build_moe_ffn takes); the graph flag it reads is part of
   allow_reuse.
+
+- **PREFILL-CHUNK-INPUTS (fork-chunk-loop P3a, 2026-10-28).** Within a chunk, every pass over ubatch k sees the same
+  memory metadata (PREFILL-CHUNK), so the inputs computed from it are the same: the attention KQ mask (mem_hybrid) and
+  the qwen4exp QSA tables (k_idxs, cell_blk, blk_cells, blk_pos, bias, tail_idxs) are filled once per ubatch of the
+  chunk, on its first pass that reads them, and copied into the later passes' input tensors; the cache is keyed by
+  (k, input kind) and checked by byte size, and is cleared at every chunk's start and end, so no fill outlives its
+  chunk. The recurrent s_copy is not cached: it is cheap, and it is what advances rs_idx (chunk_save emulates that
+  once per ubatch; caching must not add or remove an advance). Outside the chunk loop nothing is cached. Found by
+  the server gate's trace arm (server-20261028T005245Z, XT): set_inputs took 1.7-1.85 s of a's 6.3 s 8192-token
+  chunk batches, against 0.14 s for the same batch with one sequence in the cache: the mask and QSA fills are
+  O(n_kv x n_tokens) and ran on each of a ubatch's 12 attention-layer passes. Pinned by `tests/test-prefill-chunk.cpp`
+  (the existing identity checks on logits, h_nextn, state and every named input a pass saw, plus: each chunk ubatch
+  fills its mask and QSA set exactly once, and later passes reuse them).

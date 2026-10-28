@@ -662,17 +662,41 @@ public:
     const llama_cross * cross = nullptr;
 };
 
+// fork (fork-chunk-loop P3a, PREFILL-CHUNK-INPUTS): the inputs a chunk computes once per ubatch and copies into that
+// ubatch's later passes. Owned by llama_context, cleared at every chunk's start and end; nullptr outside the chunk loop.
+struct llm_graph_input_cache {
+    enum kind : int32_t {
+        KQ_MASK = 0,
+        QSA     = 16, // + 8*ratio + the tensor's index in the set
+    };
+
+    std::map<std::pair<uint32_t, int32_t>, std::vector<uint8_t>> data; // (ubatch in the chunk, kind) -> bytes
+
+    int64_t n_fill  = 0; // inputs computed (per kind set: one per mask, one per QSA set)
+    int64_t n_reuse = 0; // inputs copied from an earlier pass
+
+    void clear() { data.clear(); }
+
+    // copy the cached bytes of (k, kind) into dst; false if absent, of another size, or dst is not in host memory
+    bool get(uint32_t k, int32_t kind, ggml_tensor * dst) const;
+    void put(uint32_t k, int32_t kind, const ggml_tensor * src);
+};
+
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
 public:
     llm_graph_input_mem_hybrid(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
             std::unique_ptr<llm_graph_input_rs>      inp_rs,
-            const llama_memory_hybrid_context *      mctx) :
+            const llama_memory_hybrid_context *      mctx,
+            llm_graph_input_cache *                  cache   = nullptr,
+            uint32_t                                 cache_k = 0) :
         inp_attn(std::move(inp_attn)),
         inp_rs(std::move(inp_rs)),
         cparams(cparams),
-        mctx(mctx) { }
+        mctx(mctx),
+        cache(cache),
+        cache_k(cache_k) { }
     virtual ~llm_graph_input_mem_hybrid() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -688,6 +712,10 @@ public:
     const llama_cparams cparams;
 
     const llama_memory_hybrid_context * mctx;
+
+    // fork: PREFILL-CHUNK-INPUTS, the KQ mask of chunk slot cache_k (nullptr: always computed)
+    llm_graph_input_cache * cache;
+    uint32_t                cache_k;
 };
 
 class llm_graph_input_mem_hybrid_k : public llm_graph_input_i {
@@ -825,6 +853,7 @@ struct llm_graph_params {
     ggml_tensor * chunk_res_in  = nullptr;
     ggml_tensor * chunk_res_out = nullptr;
     bool          chunk_pass    = false; // a pass of the chunk loop (also with the whole layer range)
+    llm_graph_input_cache * input_cache = nullptr; // PREFILL-CHUNK-INPUTS, chunk passes only
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -892,7 +921,8 @@ struct llm_graph_params {
             chunk_k       != other.chunk_k       ||
             chunk_res_in  != other.chunk_res_in  ||
             chunk_res_out != other.chunk_res_out ||
-            chunk_pass    != other.chunk_pass) {
+            chunk_pass    != other.chunk_pass    ||
+            input_cache   != other.input_cache) {
             return false;
         }
 
@@ -1063,8 +1093,10 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
-    // fork: llm_graph_params::chunk_pass
+    // fork: llm_graph_params::chunk_pass, input_cache, chunk_k
     const bool chunk_pass;
+    llm_graph_input_cache * const input_cache;
+    const uint32_t chunk_k;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

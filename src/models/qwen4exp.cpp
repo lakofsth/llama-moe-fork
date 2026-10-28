@@ -749,13 +749,39 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
 // one mean-pooled indexer key scores each block; set_input resolves the cache layout
 class llama_model_qwen4exp::llm_graph_input_qsa : public llm_graph_input_i {
 public:
-    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
-        mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
+    llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias,
+                        llm_graph_input_cache * cache = nullptr, uint32_t cache_k = 0) :
+        mctx(mctx), ratio(ratio), blk_bias(blk_bias), cache(cache), cache_k(cache_k) {}
     virtual ~llm_graph_input_qsa() = default;
 
     void set_input(const llama_ubatch * ubatch) override {
+        // PREFILL-CHUNK-INPUTS: the set of ubatch k is computed once per chunk and copied into k's later passes
+        ggml_tensor * ts[6] = { k_idxs, cell_blk, blk_cells, blk_pos, bias, tail_idxs };
+        const int32_t kind0 = llm_graph_input_cache::QSA + 8*(int32_t) ratio;
+        if (cache) {
+            bool all = true;
+            for (int i = 0; i < 6 && all; ++i) {
+                all = ts[i] == nullptr || cache->data.count({ cache_k, kind0 + i }) > 0;
+            }
+            if (all) {
+                bool ok = true;
+                for (int i = 0; i < 6 && ok; ++i) {
+                    ok = ts[i] == nullptr || cache->get(cache_k, kind0 + i, ts[i]);
+                }
+                if (ok) {
+                    cache->n_reuse++;
+                    return;
+                }
+            }
+        }
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, tail_idxs, ubatch, ratio, blk_bias);
+        if (cache) {
+            for (int i = 0; i < 6; ++i) {
+                if (ts[i]) cache->put(cache_k, kind0 + i, ts[i]);
+            }
+            cache->n_fill++;
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -803,6 +829,10 @@ public:
     // per-block bias: the host decides which blocks a query may select and names its tail, so the selection is
     // over blocks (llama_qsa_select_cells); per-cell bias: the older cell-level top-k, kept for non-causal and alibi
     const bool blk_bias;
+
+    // fork: PREFILL-CHUNK-INPUTS, the set of chunk slot cache_k (nullptr: always computed)
+    llm_graph_input_cache * cache;
+    const uint32_t          cache_k;
 };
 
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
@@ -843,7 +873,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     if (it != qsa_inps.end()) {
         inp = it->second;
     } else {
-        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
+        auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias, input_cache, chunk_k);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);

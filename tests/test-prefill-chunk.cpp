@@ -176,6 +176,8 @@ struct run_out {
     std::vector<llama_token> sampled; // backend-sampled tokens, per decode call and output row
     int64_t n_apply  = 0;
     int64_t n_passes = 0;
+    int64_t n_chunk_ub = 0; // ubatches the chunk path ran
+    int64_t n_fill = 0, n_reuse = 0; // PREFILL-CHUNK-INPUTS
     bool    ok = true;
 };
 
@@ -286,6 +288,9 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     out.inputs   = ctx->prefill_chunk_inputs;
     out.n_apply  = ctx->prefill_chunk_n_apply;
     out.n_passes = ctx->prefill_chunk_n_passes;
+    out.n_chunk_ub = ctx->prefill_chunk_n_chunk_ubatch;
+    out.n_fill   = ctx->prefill_chunk_input_cache.n_fill;
+    out.n_reuse  = ctx->prefill_chunk_input_cache.n_reuse;
 
     llama_free(ctx);
     for (auto * ch : chains) llama_sampler_free(ch);
@@ -407,6 +412,15 @@ int main(int argc, char ** argv) {
                 if (n_bad) { ok = false; why += " inputs " + std::to_string(n_bad) + " differ, first " + first_bad; }
                 if (n_named == 0 && !sc.first_out) { ok = false; why += " no-inputs-traced"; }
             }
+            // PREFILL-CHUNK-INPUTS: each chunk ubatch computes its KQ mask and its QSA set (one compress ratio in this
+            // fixture) once; a group size that leaves several attention passes per ubatch reuses them
+            if (!sc.first_out) {
+                if (cur.n_fill != 2*cur.n_chunk_ub) { ok = false; why += " input-fills " + std::to_string(cur.n_fill) + "!=2x" + std::to_string(cur.n_chunk_ub); }
+                if (cfg.g < N_LAYER && cur.n_reuse == 0) { ok = false; why += " no-input-reuse"; }
+                if (cfg.g >= N_LAYER && cur.n_reuse != 0) { ok = false; why += " input-reuse-with-one-pass"; }
+            }
+            if (base.n_fill != 0 || base.n_reuse != 0) { ok = false; why += " baseline-used-the-cache"; }
+
             // each ubatch applied once, as on the micro-batch path
             if (cur.n_apply != base.n_apply) { ok = false; why += " apply-count " + std::to_string(cur.n_apply) + "!=" + std::to_string(base.n_apply); }
 
@@ -419,8 +433,8 @@ int main(int argc, char ** argv) {
             if (base.sampled != cur.sampled) { ok = false; why += " sampled-tokens"; }
             if (sc.sampling && base.sampled.size() != 3*sc.steps.size()) { ok = false; why += " sampled-count " + std::to_string(base.sampled.size()); }
 
-            printf("%-4s %-17s C=%u G=%-2u passes=%-4" PRId64 " applies=%" PRId64 "%s\n",
-                    ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cur.n_passes, cur.n_apply, why.c_str());
+            printf("%-4s %-17s C=%u G=%-2u passes=%-4" PRId64 " applies=%" PRId64 " input fills=%" PRId64 " reuses=%" PRId64 "%s\n",
+                    ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cur.n_passes, cur.n_apply, cur.n_fill, cur.n_reuse, why.c_str());
             if (!ok) n_fail++;
         }
     }
