@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+static std::set<std::string> g_gpu_mask_notes; // LLAMA_PREFILL_CHUNK_GPU_MASK: lines the library logged
+
 static const uint32_t N_VOCAB = 128;
 static const uint32_t N_EMBD  = 256;
 static const uint32_t N_HEAD  = 2;
@@ -322,6 +324,9 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_log_set([](ggml_log_level level, const char * text, void *) {
+        if (strstr(text, "LLAMA_PREFILL_CHUNK_GPU_MASK:")) {
+            g_gpu_mask_notes.insert(text);
+        }
         if (level >= GGML_LOG_LEVEL_WARN && strstr(text, "LLAMA_PREFILL_CHUNK")) {
             fputs(text, stderr);
         }
@@ -480,6 +485,18 @@ int main(int argc, char ** argv) {
     llama_model_free(model);
     llama_backend_free();
 
+    // the device path announces itself once per process: both builds on the device, never a host fallback
+    {
+        int dev = 0, host = 0;
+        for (const auto & t : g_gpu_mask_notes) {
+            dev  += t.find("on the device") != std::string::npos;
+            host += t.find("on the host")   != std::string::npos;
+        }
+        n_check++;
+        const bool ok = dev == 2 && host == 0;
+        printf("%s gpu-mask notes: %d on the device, %d on the host\n", ok ? "ok  " : "FAIL", dev, host);
+        if (!ok) n_fail++;
+    }
     printf("%d of %d checks failed\n", n_fail, n_check);
     return n_fail == 0 ? 0 : 1;
 }

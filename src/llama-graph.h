@@ -670,6 +670,9 @@ public:
 
 // fork (fork-chunk-loop, PREFILL-CHUNK-GPU-MASK): LLAMA_PREFILL_CHUNK_GPU_MASK=1, read per graph build
 bool llama_prefill_chunk_gpu_mask();
+// logs (at WARN, as the other LLAMA_PREFILL_CHUNK once-lines, so a server at its default level shows it) once per process, per (what, on_device), whether a chunk pass with LLAMA_PREFILL_CHUNK_GPU_MASK=1 built `what`
+// on the device or kept the host fill, so a gate can tell the device path was taken (its output is the same either way)
+void llama_prefill_chunk_gpu_mask_note(const char * what, bool on_device);
 
 // fork (fork-chunk-loop P3a, PREFILL-CHUNK-INPUTS): the inputs a chunk computes once per ubatch and copies into that
 // ubatch's later passes. Owned by llama_context, cleared at every chunk's start and end; nullptr outside the chunk loop.

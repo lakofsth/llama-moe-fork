@@ -28,6 +28,8 @@
 #include <typeinfo>
 #if defined(__GNUC__)
 #include <cxxabi.h>
+#include <mutex>
+#include <set>
 #endif
 #include <unordered_set>
 
@@ -3169,6 +3171,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         } else {
             inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         }
+        if (gpu_mask) {
+            llama_prefill_chunk_gpu_mask_note("the KQ mask", inp->self_kq_meta_cells != nullptr);
+        }
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -3943,6 +3948,16 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, input_cache, chunk_k);
 
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
+}
+
+void llama_prefill_chunk_gpu_mask_note(const char * what, bool on_device) {
+    static std::mutex mtx;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(mtx);
+    if (seen.insert(std::string(what) + (on_device ? "+" : "-")).second) {
+        LLAMA_LOG_WARN("LLAMA_PREFILL_CHUNK_GPU_MASK: a chunk pass builds %s %s (logged once)\n", what,
+                on_device ? "on the device from metadata" : "on the host (the metadata cannot express it here)");
+    }
 }
 
 bool llama_prefill_chunk_gpu_mask() {

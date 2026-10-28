@@ -884,6 +884,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         // PREFILL-CHUNK-GPU-MASK: in a chunk pass the per-block bias is built on the device from 16 bytes per block and token
         const bool gpu_bias = blk_bias && chunk_pass && llama_prefill_chunk_gpu_mask() && ubatch.n_seqs_unq <= 32;
+        if (chunk_pass && llama_prefill_chunk_gpu_mask()) {
+            llama_prefill_chunk_gpu_mask_note("the QSA bias", gpu_bias);
+        }
         if (gpu_bias) {
             qsa->blk_meta = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_blocks, n_stream);
             qsa->tok_meta = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 4, n_tps, n_stream);

@@ -193,4 +193,11 @@ One sentence per invariant; each names the test that pins it.
   the host fill. Pinned by `tests/test-mask-from-meta.cpp` (the op on CPU and CUDA against the host fill functions,
   byte for byte: n_kv not a multiple of 256, unified KV with several sequences, cells of other slots, empty cells,
   2-D positions, the QSA rule) and `tests/test-prefill-chunk.cpp` (the chunk path with the op, CPU, bit-identical to
-  the host masks).
+  the host masks). The device path says once per process, at WARN, whether each of the two was built on the device
+  or kept the host fill ("LLAMA_PREFILL_CHUNK_GPU_MASK: a chunk pass builds ..."), because a gate cannot tell from the
+  output; test-prefill-chunk requires both on the device and none on the host. Red first (`tests/prefill-chunk-mutate.py`
+  on the CPU op and fills, 0 of 216 failing unmutated): G1 causal off by one (`<` for `<=`) 16 of 216, G2 the sequence
+  check dropped 76, G3 the 2-D tie dropped 16, G4 the extension x/y swapped 16, G5 a cell shared by sequences given
+  one bit 32, G6 unpooled QSA blocks given metadata 9; N1 the KQ note dropped fails test-prefill-chunk. The CUDA
+  kernel's own mutations (K1-K5, `tests/prefill-chunk-kmutate.py`, run through `tests/prefill-chunk-run-mask-test.sh`
+  under an exclusive GPU claim) are owed a GPU run.
