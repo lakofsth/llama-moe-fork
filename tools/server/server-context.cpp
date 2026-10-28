@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-batch-policy.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -3117,6 +3118,19 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
+        // fork (fork-chunk-loop P3a, PREFILL-CHUNK-MIXED): under LLAMA_PREFILL_CHUNK a batch carrying a generating
+        // token is held to the served -b, so its step, and the generating slots' per-token latency, stay the served ones
+        {
+            static const server_batch_policy batch_policy = [] {
+                const server_batch_policy p = server_batch_policy::from_env();
+                if (p.mixed_cap > 0) {
+                    SRV_WRN("LLAMA_PREFILL_CHUNK: a batch that carries a generating token holds at most %d tokens (LLAMA_PREFILL_CHUNK_MIXED_BATCH)\n", p.mixed_cap);
+                }
+                return p;
+            }();
+            n_batch = batch_policy.cap(n_batch, batch.size());
+        }
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;

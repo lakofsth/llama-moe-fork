@@ -142,3 +142,11 @@ One sentence per invariant; each names the test that pins it.
   seam (events, the slot pointer swap, the copy stream) runs only on CUDA; gated by
   <bench>/chunk-loop/gate-bits-p2.sh (copy tests/prefill-chunk-gate-bits-p2.sh), with a
   LLAMA_MOE_PF_TRACE=1 arm.
+
+- **PREFILL-CHUNK-MIXED (fork-chunk-loop P3a, 2026-10-28).** With LLAMA_PREFILL_CHUNK set (C >= 2), a server batch that
+  carries any generating slot's token (sampled or draft) holds at most LLAMA_PREFILL_CHUNK_MIXED_BATCH tokens in all
+  (default 2048, the served -b; 0 = no cap), so while a slot generates, every batch is the one the served recipe
+  builds and its step time, hence the generating slots' per-token latency, is the served one; a batch with no
+  generating token fills to n_batch (the -b 8192 that lets a chunk hold 8 ubatches). Unset (or C < 2), the batch is
+  filled as before. Pinned by `tests/test-server-batch-policy.cpp` (tools/server/server-batch-policy.h, the cap the
+  server's update_slots applies before it adds prompt tokens).
