@@ -23,9 +23,17 @@ struct llama_moe_prefetch_policy {
         return p;
     }
 
-    // has_pf_map: the layer has a compact-id map (a split layer under LLAMA_MOE_PREFETCH_PP); chunk_pass: the graph
-    // is a pass of the chunk loop
-    bool use(bool has_pf_map, bool op_offload, int64_t n_tokens, bool chunk_pass) const {
-        return ring > 0 && has_pf_map && op_offload && n_tokens >= min_tokens && (!chunk_only || chunk_pass);
+    // PREFETCH-PP-MIN-SEQS (review F2): a ubatch split equally over n_seqs sequences holds n_seqs * floor(n_ubatch /
+    // n_seqs) tokens (1023 for 3 sequences at -ub 1024, 1020 for 6), so the minimum is rounded down to a multiple of
+    // n_seqs: the ubatch the default would let through for one sequence is let through for several
+    bool wide(int64_t n_tokens, int64_t n_seqs) const {
+        const int64_t m = n_seqs > 1 ? (min_tokens / n_seqs) * n_seqs : min_tokens;
+        return n_tokens >= (m < 32 ? 32 : m);
+    }
+
+    // has_pf_map: the layer has a compact-id map (a split layer under LLAMA_MOE_PREFETCH_PP); n_seqs: the ubatch's
+    // sequences when it is split equally (else 1); chunk_pass: the graph is a pass of the chunk loop
+    bool use(bool has_pf_map, bool op_offload, int64_t n_tokens, int64_t n_seqs, bool chunk_pass) const {
+        return ring > 0 && has_pf_map && op_offload && wide(n_tokens, n_seqs) && (!chunk_only || chunk_pass);
     }
 };

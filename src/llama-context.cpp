@@ -13,6 +13,7 @@
 #include "llama-moe-heat.h" // fork: online-heat counter access (registry-resolved)
 #include "llama-ext.h"
 #include "llama-sampler.h"
+#include "llama-moe-prefetch-policy.h"
 #include "llama.h"
 
 #include <cinttypes>
@@ -2434,10 +2435,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             // apply each ubatch of the chunk once and keep the metadata it leaves
             uint32_t n_chunk = 0;
             bool applied = true;
-            std::vector<uint32_t> n_tokens_k;
+            std::vector<uint32_t> n_tokens_k, n_seqs_k; // n_seqs_k: sequences of an equal split, else 1
             while (true) {
                 const auto & ubatch = mctx->get_ubatch();
                 n_tokens_k.push_back(ubatch.n_tokens);
+                n_seqs_k.push_back(ubatch.equal_seqs() ? ubatch.n_seqs : 1);
                 for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                     const auto & seq_id = ubatch.seq_id[i][0];
                     pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
@@ -2496,7 +2498,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     // (only if that group's first ubatch is wide enough to read them through the prefetch)
                     pf_next.clear();
                     if (pf_chunk && il1 < n_layer && prefill_chunk_pf_min > 0) {
-                        if (n_tokens_k[0] >= (uint32_t) prefill_chunk_pf_min) {
+                        // the rule build_moe_ffn applies to that ubatch (PREFETCH-PP-MIN-SEQS), read once as it does
+                        static const llama_moe_prefetch_policy pf_policy = llama_moe_prefetch_policy::from_env();
+                        if (pf_policy.wide(n_tokens_k[0], n_seqs_k[0])) {
                             for (int32_t il = il1; il < std::min(il1 + group, n_layer); ++il) {
                                 const auto & L = model.layers[il];
                                 if (!L.moe_split.map_cpu_pf) {

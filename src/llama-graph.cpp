@@ -2418,7 +2418,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // scheduler aborts rather than run them).
         // fork (P3a): under LLAMA_PREFILL_CHUNK only the chunk loop's passes use the ring (PREFILL-CHUNK-PF-ONLY)
         static const llama_moe_prefetch_policy pf_policy = llama_moe_prefetch_policy::from_env();
-        const bool use_pf = pf_policy.use(msplit->map_cpu_pf != nullptr, cparams.op_offload, n_tokens, chunk_pass);
+        const bool use_pf = pf_policy.use(msplit->map_cpu_pf != nullptr, cparams.op_offload, n_tokens,
+                ubatch.equal_seqs() ? (int64_t) ubatch.n_seqs : 1, chunk_pass);
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, use_pf ? msplit->map_cpu_pf : msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
         // the counting op matches "ffn_moe_ids_cpu-<il>" by substring: only the model that

@@ -222,6 +222,18 @@ One sentence per invariant; each names the test that pins it.
   prefetch on (R=3, and X's C=8 G=1) against off at X's pack, byte for byte, with an off-vs-off control and the adapt
   rounds and swaps equal in every arm; red first on the F1 commit with only that call reverted.
 
+- **PREFETCH-PP-MIN-SEQS (fork-chunk-loop review F2, 2026-10-28).** A ubatch reads its host experts through the
+  prefetch ring when it is at least LLAMA_MOE_PREFETCH_PP_MIN rows (default 1024, never below 32) rounded down to a
+  multiple of its sequences when it is split equally: split_equal gives n_seqs * floor(n_ubatch / n_seqs) tokens
+  (1023 for 3 sequences at -ub 1024, 1020 for 6), which the plain minimum refused, so with 3 or more concurrent
+  prompts the ring was never used. One rule (`llama_moe_prefetch_policy::wide`, src/llama-moe-prefetch-policy.h) for
+  build_moe_ffn's choice and the chunk loop's next-group hints. Output unchanged either way (P1: the ring's matmul
+  reads the stock path's experts bit for bit); only which path carries them. Pinned by
+  `tests/test-moe-prefetch-policy.cpp` (n_seqs 1..8 at -ub 1024: the split_equal width uses the ring, one row per
+  sequence fewer does not; an explicit minimum rounds the same; the 32-row floor). Red first: MS1 the minimum not
+  rounded (the pre-fix rule, 5 of 28), MS2 the floor dropped (1 of 28). The two call sites pass the ubatch's
+  sequences; that the trio's batches now read slots shows in the server gate's trace arm (prefetch reads per batch).
+
 - **SAMPLER-RESERVE (fork-chunk-loop, 2026-10-28).** Setting or removing a backend sampler on a sequence
   (`llama_set_sampler`, which the server calls at every request's launch and release) reserves the scheduler again
   only when the shapes the last reserve sized each sequence for do not cover the new sampler set: a sampler's shape is
