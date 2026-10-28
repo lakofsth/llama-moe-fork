@@ -1793,6 +1793,7 @@ struct ggml_sched_moe_pf {
         size_t need() const { return experts.size() * input->nb[2] + pad + 512; }
     };
     int                                 R          = 0;
+    uint64_t                            id         = 0; // serial number, kept by ggml_backend_sched_moe_pf_move
     int                                 backend_id = -1;
     ggml_backend_t                      copy_backend = NULL;
     std::vector<ggml_backend_buffer_t>  buf;
@@ -1841,6 +1842,8 @@ static ggml_sched_moe_pf * ggml_backend_sched_moe_pf_get(ggml_backend_sched_t sc
     if (sched->moe_pf == NULL) {
         ggml_sched_moe_pf * pf = new ggml_sched_moe_pf();
         pf->R = ggml_backend_sched_moe_pf_ring();
+        static std::atomic<uint64_t> n_ring { 0 };
+        pf->id = ++n_ring;
         GGML_ASSERT(pf->R > 0 && "compact ids in the graph with LLAMA_MOE_PREFETCH_PP unset");
         pf->buf.assign(pf->R, NULL); pf->ctx.assign(pf->R, NULL); pf->slot.assign(pf->R, NULL); pf->size.assign(pf->R, 0);
         pf->ev_up.assign(pf->R, NULL); pf->ev_read.assign(pf->R, NULL); pf->read_recorded.assign(pf->R, false);
@@ -1869,6 +1872,40 @@ void ggml_backend_sched_moe_pf_next(ggml_backend_sched_t sched, const struct ggm
     ggml_sched_moe_pf * pf = ggml_backend_sched_moe_pf_get(sched);
     pf->next.assign(weights, weights + n);
     pf->next_last = last;
+}
+
+void ggml_backend_sched_moe_pf_move(ggml_backend_sched_t dst, ggml_backend_sched_t src) {
+    if (src == NULL || dst == NULL || src->moe_pf == NULL) {
+        return;
+    }
+    GGML_ASSERT(dst->moe_pf == NULL && "the new scheduler already has a prefetch ring");
+    ggml_sched_moe_pf * pf = src->moe_pf;
+    GGML_ASSERT(dst->n_backends == src->n_backends);
+    for (int b = 0; b < src->n_backends; b++) {
+        GGML_ASSERT(dst->backends[b] == src->backends[b] && "the prefetch ring moves only between schedulers over the same backends");
+    }
+    // nothing of src's may still read or write a slot
+    if (pf->copy_backend) {
+        ggml_backend_synchronize(pf->copy_backend);
+    }
+    for (int b = 0; b < src->n_backends; b++) {
+        ggml_backend_synchronize(src->backends[b]);
+    }
+    // what a fresh ring knows: no slot holds anything, no graph planned, no hints, chunk mode off
+    pf->ring.invalidate();
+    pf->chunk      = false;
+    pf->chunk_ring = false;
+    pf->next.clear();
+    pf->next_last  = false;
+    pf->entries.clear();
+    pf->hints.clear();
+    pf->entry_of_split.assign(dst->n_splits, -1);
+    src->moe_pf = NULL;
+    dst->moe_pf = pf;
+}
+
+uint64_t ggml_backend_sched_moe_pf_id(ggml_backend_sched_t sched) {
+    return sched && sched->moe_pf ? sched->moe_pf->id : 0;
 }
 
 void ggml_backend_sched_moe_pf_stats(ggml_backend_sched_t sched, int64_t * n_upload, int64_t * n_read, int64_t * n_bytes) {

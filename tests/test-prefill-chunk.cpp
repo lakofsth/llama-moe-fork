@@ -312,6 +312,84 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     return out;
 }
 
+// SAMPLER-RESERVE: requests as the server makes them with --backend-sampling: per request a fresh sampler chain on its
+// slot's sequence (the sequence cleared), a prompt, then generated tokens, then the sampler removed at release
+struct req { std::vector<llama_seq_id> seqs; int32_t top_k; };
+struct req_out {
+    std::vector<llama_token>          sampled;
+    std::vector<std::vector<uint8_t>> state;   // after each request
+    std::vector<int64_t>              n_reserve; // reserves made during each request
+    std::vector<uint64_t>             ring;    // the prefetch ring's serial after each request
+    bool ok = true;
+};
+
+static req_out run_requests(llama_model * model, const std::vector<req> & reqs, const run_cfg & cfg, bool always,
+        const std::vector<llama_token> & toks) {
+    if (always) setenv("LLAMA_SAMPLER_RESERVE_ALWAYS", "1", 1); else unsetenv("LLAMA_SAMPLER_RESERVE_ALWAYS");
+    unsetenv("LLAMA_PREFILL_CHUNK_TRACE");
+    unsetenv("LLAMA_PREFILL_CHUNK_GPU_MASK");
+    if (cfg.c == 0) {
+        unsetenv("LLAMA_PREFILL_CHUNK");
+        unsetenv("LLAMA_PREFILL_CHUNK_GROUP");
+    } else {
+        setenv("LLAMA_PREFILL_CHUNK",       std::to_string(cfg.c).c_str(), 1);
+        setenv("LLAMA_PREFILL_CHUNK_GROUP", std::to_string(cfg.g).c_str(), 1);
+    }
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = N_CTX; cp.n_batch = N_CTX; cp.n_ubatch = 16; cp.n_seq_max = 3; cp.kv_unified = true;
+    cp.n_threads = 4; cp.n_threads_batch = 4; cp.n_rs_seq = 2; cp.no_perf = true;
+    llama_context * ctx = llama_init_from_model(model, cp);
+    GGML_ASSERT(ctx);
+
+    req_out out;
+    size_t it = 0;
+    for (size_t r = 0; r < reqs.size(); ++r) {
+        const int64_t n0 = ctx->n_sched_reserve;
+        std::vector<llama_sampler *> chains;
+        for (llama_seq_id s : reqs[r].seqs) {
+            llama_memory_seq_rm(llama_get_memory(ctx), s, -1, -1);
+            llama_sampler * ch = llama_sampler_chain_init(llama_sampler_chain_default_params());
+            llama_sampler_chain_add(ch, llama_sampler_init_top_k(reqs[r].top_k));
+            llama_sampler_chain_add(ch, llama_sampler_init_top_p(0.95f, 1));
+            llama_sampler_chain_add(ch, llama_sampler_init_temp(0.6f));
+            llama_sampler_chain_add(ch, llama_sampler_init_dist(100 + (uint32_t) r));
+            if (!llama_set_sampler(ctx, s, ch)) { out.ok = false; }
+            chains.push_back(ch);
+        }
+        // a 40-token prompt per sequence (output on its last token), then 3 generated tokens each
+        std::vector<llama_token> last(reqs[r].seqs.size());
+        for (int step = 0; step < 4 && out.ok; ++step) {
+            const int n = step == 0 ? 40 : 1;
+            llama_batch batch = llama_batch_init(n*(int) reqs[r].seqs.size(), 0, 1);
+            for (size_t k = 0; k < reqs[r].seqs.size(); ++k) {
+                for (int i = 0; i < n; ++i) {
+                    const llama_pos p = step == 0 ? i : 39 + step;
+                    common_batch_add(batch, step == 0 ? toks[it++ % toks.size()] : last[k], p, { reqs[r].seqs[k] }, i + 1 == n);
+                }
+            }
+            if (llama_decode(ctx, batch) != 0) { out.ok = false; }
+            int o = 0;
+            for (int i = 0; i < batch.n_tokens && out.ok; ++i) {
+                if (!batch.logits[i]) continue;
+                last[o] = llama_get_sampled_token_ith(ctx, i);
+                out.sampled.push_back(last[o++]);
+            }
+            llama_batch_free(batch);
+        }
+        std::vector<uint8_t> st(llama_state_get_size(ctx));
+        st.resize(llama_state_get_data(ctx, st.data(), st.size()));
+        out.state.push_back(std::move(st));
+        // release, as the server's slot release does
+        for (llama_seq_id s : reqs[r].seqs) llama_set_sampler(ctx, s, nullptr);
+        for (auto * ch : chains) llama_sampler_free(ch);
+        out.n_reserve.push_back(ctx->n_sched_reserve - n0);
+        out.ring.push_back(ctx->prefill_pf_ring_id());
+    }
+    llama_free(ctx);
+    unsetenv("LLAMA_SAMPLER_RESERVE_ALWAYS");
+    return out;
+}
+
 static bool same_bytes(const std::vector<float> & a, const std::vector<float> & b) {
     return a.size() == b.size() && (a.empty() || memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0);
 }
@@ -322,6 +400,9 @@ int main(int argc, char ** argv) {
         seed = std::stoull(argv[1]);
     }
 
+    // SAMPLER-RESERVE: the scheduler reads LLAMA_MOE_PREFETCH_PP once; with it set the chunk path makes a prefetch ring
+    // (on the CPU it holds nothing: no layer is split), so the ring's life across reserves can be checked
+    setenv("LLAMA_MOE_PREFETCH_PP", "2", 1);
     llama_backend_init();
     llama_log_set([](ggml_log_level level, const char * text, void *) {
         if (strstr(text, "LLAMA_PREFILL_CHUNK_GPU_MASK:")) {
@@ -479,6 +560,44 @@ int main(int argc, char ** argv) {
             printf("%-4s %-17s C=%u G=%-2u%s passes=%-4" PRId64 " applies=%" PRId64 " input fills=%" PRId64 " reuses=%" PRId64 "%s\n",
                     ok ? "ok" : "FAIL", sc.name, cfg.c, cfg.g, cfg.gpu_mask ? " gm" : "   ", cur.n_passes, cur.n_apply, cur.n_fill, cur.n_reuse, why.c_str());
             if (!ok) n_fail++;
+        }
+    }
+
+    // SAMPLER-RESERVE: a sampler change reserves only when the reserved shapes do not cover it, and the output is the
+    // output of a reserve on every change (LLAMA_SAMPLER_RESERVE_ALWAYS=1, upstream), bit for bit; the prefetch ring
+    // outlives every reserve
+    {
+        // round robin over the three slots as the server's LRU slot choice does; one request with another top-k (a new
+        // shape: reserve), one back at the old shape on a sequence the last reserve sized for top-k 40 (reserve), and
+        // two slots at once
+        const std::vector<req> reqs = {
+            { { 0 }, 20 }, { { 1 }, 20 }, { { 2 }, 20 }, { { 0 }, 20 }, { { 1 }, 40 }, { { 2 }, 20 }, { { 0 }, 20 },
+            { { 0, 1 }, 20 },
+        };
+        const std::vector<int64_t> want_skip   = { 1, 0, 0, 0, 1, 1, 0, 0 };
+        const std::vector<int64_t> want_always = { 1, 1, 1, 1, 1, 1, 1, 1 };
+        for (const run_cfg & cfg : { run_cfg { 0, 0 }, run_cfg { 8, 1 } }) {
+            const req_out ref = run_requests(model, reqs, cfg, true,  toks);
+            const req_out cur = run_requests(model, reqs, cfg, false, toks);
+            std::string why;
+            if (!ref.ok || !cur.ok)                 why += " failed";
+            if (cur.sampled != ref.sampled)         why += " sampled-differs";
+            if (cur.state   != ref.state)           why += " state-differs";
+            if (ref.n_reserve != want_always)       why += " always-reserves";
+            if (cur.n_reserve != want_skip)         why += " reserves";
+            if (cfg.c > 0) {
+                for (const auto * o : { &ref, &cur }) {
+                    for (uint64_t id : o->ring) if (id == 0 || id != o->ring[0]) { why += " ring-replaced"; break; }
+                }
+            }
+            int64_t n_ref = 0, n_cur = 0;
+            for (auto v : ref.n_reserve) n_ref += v;
+            for (auto v : cur.n_reserve) n_cur += v;
+            n_check++;
+            printf("%-4s sampler-reserve   C=%u G=%u reserves %" PRId64 " (always: %" PRId64 "), %zu tokens sampled, ring %llu..%llu%s\n",
+                    why.empty() ? "ok" : "FAIL", cfg.c, cfg.g, n_cur, n_ref, cur.sampled.size(),
+                    (unsigned long long) (cur.ring.empty() ? 0 : cur.ring.front()), (unsigned long long) (cur.ring.empty() ? 0 : cur.ring.back()), why.c_str());
+            if (!why.empty()) n_fail++;
         }
     }
 

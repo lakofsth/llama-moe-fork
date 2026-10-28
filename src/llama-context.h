@@ -380,6 +380,12 @@ private:
 
     bool sched_need_reserve = true;
 
+    // fork (SAMPLER-RESERVE): the backend-sampler shape (llama_sampler_backend_shape) the last reserve sized each
+    // sequence for. A sampler change that every sequence's reserved shape covers needs no new reserve.
+    std::map<llama_seq_id, uint64_t> sampling_reserved;
+    bool sampling_covered() const;
+    void sampling_changed();
+
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
@@ -464,6 +470,11 @@ public:
 
     bool prefill_chunk_trace = false;
     std::vector<input_record> prefill_chunk_inputs;
+
+    // SAMPLER-RESERVE: sched_reserve() calls that reserved (rebuilt the scheduler)
+    int64_t n_sched_reserve = 0;
+    // and the scheduler's LLAMA_MOE_PREFETCH_PP ring, by serial number (0: none)
+    uint64_t prefill_pf_ring_id() const { return ggml_backend_sched_moe_pf_id(sched.get()); }
 private:
     void prefill_chunk_trace_inputs(ggml_cgraph * gf, int64_t ubatch);
 

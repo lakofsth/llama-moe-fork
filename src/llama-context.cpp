@@ -716,6 +716,12 @@ static int llama_graph_n_input_tensors(ggml_cgraph * gf) {
     return (int) users.size();
 }
 
+// SAMPLER-RESERVE: LLAMA_SAMPLER_RESERVE_ALWAYS=1 reserves on every sampler change, as upstream (read per call)
+static bool llama_sampler_reserve_always() {
+    const char * e = getenv("LLAMA_SAMPLER_RESERVE_ALWAYS");
+    return e && atoi(e) != 0;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;
@@ -728,6 +734,41 @@ void llama_context::sched_reserve() {
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
+
+    n_sched_reserve++;
+
+    // SAMPLER-RESERVE: with a backend sampler set, reserve as if every sequence without one had the largest of the set,
+    // so a later sampler of that shape on any sequence is covered (one reserve, not one per request on each slot)
+    struct samplers_restore {
+        std::map<llama_seq_id, llama_sampler *> & dst;
+        std::map<llama_seq_id, llama_sampler *>   saved;
+        ~samplers_restore() { dst = std::move(saved); }
+    } samplers_restore_guard { sampling.samplers, sampling.samplers };
+    if (!sampling.samplers.empty() && !llama_sampler_reserve_always()) {
+        llama_sampler * proto = nullptr;
+        for (const auto & [seq_id, smpl] : sampling.samplers) {
+            if (!proto || llama_sampler_backend_n_nodes(smpl) > llama_sampler_backend_n_nodes(proto)) {
+                proto = smpl;
+            }
+        }
+        for (llama_seq_id s = 0; s < (llama_seq_id) cparams.n_seq_max; ++s) {
+            sampling.samplers.emplace(s, proto);
+        }
+    }
+    sampling_reserved.clear();
+    for (const auto & [seq_id, smpl] : sampling.samplers) {
+        sampling_reserved[seq_id] = llama_sampler_backend_shape(smpl);
+    }
+
+    // SAMPLER-RESERVE: the new scheduler takes the old one's LLAMA_MOE_PREFETCH_PP ring (its slot buffers, events and
+    // copy stream), so a reserve does not free and grow the ring again; what the slots held is forgotten
+    auto new_sched = [this](size_t max_nodes, bool pp) {
+        ggml_backend_sched_t s = ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, pp, cparams.op_offload);
+        if (sched) {
+            ggml_backend_sched_moe_pf_move(s, sched.get());
+        }
+        sched.reset(s);
+    };
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
@@ -742,7 +783,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    new_sched(max_nodes, cparams.pipeline_parallel);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -781,7 +822,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                new_sched(max_nodes, false);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1374,6 +1415,26 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// SAMPLER-RESERVE: a sampler set or removed changes the graph's sampling nodes. The scheduler is reserved again only
+// when the shapes the last reserve sized each sequence for do not cover the new set (LLAMA_SAMPLER_RESERVE_ALWAYS=1:
+// on every change, as upstream). Removing a sampler never needs one; nor does a sampler with a shape already reserved.
+bool llama_context::sampling_covered() const {
+    for (const auto & [seq_id, sampler] : sampling.samplers) {
+        const auto it = sampling_reserved.find(seq_id);
+        if (it == sampling_reserved.end() || it->second != llama_sampler_backend_shape(sampler)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// called after the sampler set changed
+void llama_context::sampling_changed() {
+    if (llama_sampler_reserve_always() || !sampling_covered()) {
+        sched_need_reserve = true;
+    }
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1387,10 +1448,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
             warned = true;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        if (sampling.samplers.erase(seq_id) > 0) {
+            sampling_changed();
         }
-        sampling.samplers.erase(seq_id);
         return false;
     }
 
@@ -1407,7 +1467,7 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampling.samplers[seq_id] = sampler;
 
-        sched_need_reserve = true;
+        sampling_changed();
 
         return true;
     }
@@ -1415,18 +1475,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
+        if (sampling.samplers.erase(seq_id) > 0) {
+            sampling_changed();
         }
-
-        sampling.samplers.erase(seq_id);
 
         return false;
     }
 
     sampling.samplers.erase(seq_id);
 
-    sched_need_reserve = true;
+    sampling_changed();
 
     return true;
 }
@@ -2571,7 +2629,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const int64_t up0 = prefill_pf_n_upload, rd0 = prefill_pf_n_read;
         ggml_backend_sched_moe_pf_stats(sched.get(), &prefill_pf_n_upload, &prefill_pf_n_read, &prefill_pf_n_bytes);
         if (chunk_trace) {
-            // a reserve recreates the scheduler, and its counters start again from 0
+            // the ring keeps its counters across a reserve (SAMPLER-RESERVE); a new ring starts them again from 0
             const int64_t d_up = prefill_pf_n_upload >= up0 ? prefill_pf_n_upload - up0 : prefill_pf_n_upload;
             const int64_t d_rd = prefill_pf_n_read   >= rd0 ? prefill_pf_n_read   - rd0 : prefill_pf_n_read;
             std::set<llama_seq_id> seqs;

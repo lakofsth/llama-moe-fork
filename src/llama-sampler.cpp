@@ -634,6 +634,40 @@ static uint32_t llama_sampler_backend_probe_n_nodes(const llama_sampler_backend_
     return std::max<uint32_t>(ggml_graph_n_nodes(probe.gf), n_tensors);
 }
 
+// SAMPLER-RESERVE: FNV-1a over the probe's tensors in creation order: op, type, ne, flags, and each source and view
+// source by its index (op parameters are left out: they change values, not what the allocator places)
+static uint64_t llama_sampler_backend_probe_shape(const llama_sampler_backend_probe & probe) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](int64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= (uint64_t) ((v >> (8*b)) & 0xff);
+            h *= 1099511628211ull;
+        }
+    };
+    std::unordered_map<const ggml_tensor *, int64_t> idx;
+    for (auto * t = ggml_get_first_tensor(probe.ctx.get()); t; t = ggml_get_next_tensor(probe.ctx.get(), t)) {
+        idx[t] = (int64_t) idx.size();
+        mix(t->op);
+        mix(t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix(t->ne[d]);
+        }
+        mix(t->flags);
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            const auto it = t->src[i] ? idx.find(t->src[i]) : idx.end();
+            mix(t->src[i] ? (it != idx.end() ? it->second : -2) : -1);
+        }
+        const auto iv = t->view_src ? idx.find(t->view_src) : idx.end();
+        mix(t->view_src ? (iv != idx.end() ? iv->second : -2) : -1);
+    }
+    mix(ggml_graph_n_nodes(probe.gf));
+    for (int i = 0; i < ggml_graph_n_nodes(probe.gf); ++i) {
+        const auto it = idx.find(ggml_graph_node(probe.gf, i));
+        mix(it != idx.end() ? it->second : -2);
+    }
+    return h;
+}
+
 // check if all ggml ops used by the sampler are supported by the backend
 static bool llama_sampler_backend_support(
         llama_sampler              * smpl,
@@ -766,6 +800,7 @@ static bool llama_sampler_chain_backend_init(
 
     auto probe = llama_sampler_backend_probe_graph(smpl, 128*1024, GGML_DEFAULT_GRAPH_SIZE, false);
     chain->n_nodes = llama_sampler_backend_probe_n_nodes(probe);
+    chain->shape   = llama_sampler_backend_probe_shape(probe) ^ chain->n_nodes;
 
     return res;
 }
@@ -845,7 +880,7 @@ static void llama_sampler_chain_copy_state(const struct llama_sampler * src, str
         llama_sampler_copy(src_chain->samplers[i].ptr, dst_chain->samplers[i].ptr);
     }
 
-    // note: is_init, n_nodes and is_backend belong to the current sampling graph
+    // note: is_init, n_nodes, shape and is_backend belong to the current sampling graph
     dst_chain->params      = src_chain->params;
     dst_chain->cur         = src_chain->cur;
     dst_chain->t_sample_us = src_chain->t_sample_us;
@@ -874,12 +909,23 @@ struct llama_sampler * llama_sampler_chain_init(struct llama_sampler_chain_param
             /* .params               = */ params,
             /* .is_init              = */ false,
             /* .n_nodes              = */ 0,
+            /* .shape                = */ 0,
             /* .samplers             = */ {},
             /* .cur                  = */ {},
             /* .t_sample_us          = */ 0,
             /* .n_sample             = */ 0,
         }
     );
+}
+
+uint64_t llama_sampler_backend_shape(const llama_sampler * sampler) {
+    GGML_ASSERT(sampler != nullptr);
+    GGML_ASSERT(sampler->iface == &llama_sampler_chain_i);
+
+    const auto * chain = (const llama_sampler_chain *) sampler->ctx;
+    GGML_ASSERT(chain->is_init);
+
+    return chain->shape;
 }
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler) {

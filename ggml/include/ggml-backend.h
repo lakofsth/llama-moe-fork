@@ -369,8 +369,14 @@ extern "C" {
     // Turning chunk mode on or off forgets what the slots hold.
     GGML_API void                 ggml_backend_sched_moe_pf_chunk(ggml_backend_sched_t sched, bool on);
     GGML_API void                 ggml_backend_sched_moe_pf_next(ggml_backend_sched_t sched, const struct ggml_tensor * const * weights, int n, bool last);
-    // uploads issued, entries read from a slot, bytes uploaded, since the scheduler was created
+    // uploads issued, entries read from a slot, bytes uploaded, since the ring was created (it moves across reserves)
     GGML_API void                 ggml_backend_sched_moe_pf_stats(ggml_backend_sched_t sched, int64_t * n_upload, int64_t * n_read, int64_t * n_bytes);
+    // fork (SAMPLER-RESERVE): hand src's prefetch ring (its slot buffers, their sizes, events and copy stream, and its
+    // counters) to dst, a scheduler over the same backends that has none, after src's uploads and reads have finished;
+    // what the slots held is forgotten, as a new ring knows nothing. No ring in src: nothing. _id: the ring's serial
+    // number (0: none), which stays with the ring when it moves.
+    GGML_API void                 ggml_backend_sched_moe_pf_move(ggml_backend_sched_t dst, ggml_backend_sched_t src);
+    GGML_API uint64_t             ggml_backend_sched_moe_pf_id(ggml_backend_sched_t sched);
 
     //
     // Meta backend

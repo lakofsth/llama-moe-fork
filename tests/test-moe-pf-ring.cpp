@@ -13,9 +13,11 @@
 //   with G=1 and R a multiple of a layer's entries, the ring is the size the stock prefetch gives it (every host entry in
 //   layer order, slot m % R); always at most R slots of the largest entry.
 #include "../ggml/src/ggml-moe-pf-ring.h"
+#include "ggml-backend.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -145,6 +147,8 @@ static result run(const model & m, int R, int C, int G, const std::vector<int> &
 }
 
 int main() {
+    // SAMPLER-RESERVE (below): the scheduler reads LLAMA_MOE_PREFETCH_PP once, at its first prefetch call
+    setenv("LLAMA_MOE_PREFETCH_PP", "2", 1);
     int n_fail = 0, n_check = 0;
     auto check = [&](bool ok, const std::string & what) {
         n_check++;
@@ -245,6 +249,32 @@ int main() {
                 printf("served prediction (C=%d G=1 R=%d): %ld uploads for %ld slot reads (the stock prefetch uploads %ld)\n", C, R, r.uploads, r.reads, r.reads);
             }
         }
+    }
+
+    // SAMPLER-RESERVE: a reserve's new scheduler takes the old one's prefetch ring (ggml_backend_sched_moe_pf_move):
+    // the ring (by its serial) leaves src and is dst's; no ring in src moves nothing; freeing both frees it once
+    {
+        ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        ggml_backend_t bes[1] = { cpu };
+        auto mk = [&]() { return ggml_backend_sched_new(bes, nullptr, 1, 64, false, false); };
+        ggml_backend_sched_t s1 = mk(), s2 = mk(), s3 = mk();
+        check(ggml_backend_sched_moe_pf_id(s1) == 0, "ring move: a new scheduler has a ring before its first prefetch call");
+        ggml_backend_sched_moe_pf_chunk(s1, true); // creates s1's ring, in chunk mode
+        const uint64_t a = ggml_backend_sched_moe_pf_id(s1);
+        check(a != 0, "ring move: no ring after the first prefetch call");
+        ggml_backend_sched_moe_pf_move(s2, s1);
+        check(ggml_backend_sched_moe_pf_id(s2) == a, "ring move: dst does not hold src's ring");
+        check(ggml_backend_sched_moe_pf_id(s1) == 0, "ring move: src still holds the ring");
+        ggml_backend_sched_moe_pf_move(s3, s1); // src has none: nothing moves
+        check(ggml_backend_sched_moe_pf_id(s3) == 0, "ring move: an empty src gave dst a ring");
+        ggml_backend_sched_moe_pf_chunk(s3, false);
+        const uint64_t b = ggml_backend_sched_moe_pf_id(s3);
+        check(b != 0 && b != a, "ring move: a scheduler's own new ring is not a new serial");
+        ggml_backend_sched_free(s1);
+        ggml_backend_sched_free(s2);
+        ggml_backend_sched_free(s3);
+        ggml_backend_free(cpu);
+        printf("ring move: rings %llu and %llu\n", (unsigned long long) a, (unsigned long long) b);
     }
 
     printf("%d of %d checks failed\n", n_fail, n_check);

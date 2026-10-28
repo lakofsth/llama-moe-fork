@@ -201,3 +201,23 @@ One sentence per invariant; each names the test that pins it.
   one bit 32, G6 unpooled QSA blocks given metadata 9; N1 the KQ note dropped fails test-prefill-chunk. The CUDA
   kernel's own mutations (K1-K5, `tests/prefill-chunk-kmutate.py`, run through `tests/prefill-chunk-run-mask-test.sh`
   under an exclusive GPU claim) are owed a GPU run.
+- **SAMPLER-RESERVE (fork-chunk-loop, 2026-10-28).** Setting or removing a backend sampler on a sequence
+  (`llama_set_sampler`, which the server calls at every request's launch and release) reserves the scheduler again
+  only when the shapes the last reserve sized each sequence for do not cover the new sampler set: a sampler's shape is
+  `llama_sampler_backend_shape`, a hash of its probe graph's tensors (op, type, ne, flags, wiring; op parameters left
+  out, as they change values, not what the allocator places). A reserve made with any backend sampler set sizes every
+  sequence without one for the largest sampler set, so one reserve covers that shape on every slot; removing a
+  sampler never reserves. A reserve's new scheduler takes the old one's LLAMA_MOE_PREFETCH_PP ring
+  (`ggml_backend_sched_moe_pf_move`: slot buffers, events, copy stream, counters; what the slots held forgotten), so
+  the ring is not freed and grown again. The output is bit for bit that of a reserve on every change
+  (LLAMA_SAMPLER_RESERVE_ALWAYS=1, upstream's behaviour). Pinned by `tests/test-prefill-chunk.cpp` (sampler-reserve:
+  server-shaped requests round robin over three slots, one with another top-k, two slots at once, C=0 and C=8 G=1;
+  the sampled tokens and the state after each request equal the always-reserve run's, the reserves per request are
+  exactly {1,0,0,0,1,1,0,0} against {1,...,1}, and the ring's serial never changes) and `tests/test-moe-pf-ring.cpp`
+  (the move hands the ring over, an empty source moves nothing). Red first (`tests/prefill-chunk-mutate.py`): Q1
+  coverage always true (0 reserves), Q2 coverage ignoring the shape (1), Q3 the reserve not padded (8), Q4 a removal
+  reserving (8), Q5 the shape hash without ne (1), Q6 the ring not moved (ring replaced) each fail sampler-reserve; Q7
+  a move leaving the ring in the source crashes test-moe-pf-ring (double free). Note Q1, Q2 and Q5 kept the output
+  identical: a graph larger than the reserve is still allocated on demand (ggml_backend_sched_alloc_splits grows
+  the buffers), so a missed reserve costs time, not output; only the node budget (graph_max_nodes, sized at the
+  reserve) is hard, and exceeding it aborts rather than computes wrong.

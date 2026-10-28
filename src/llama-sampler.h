@@ -17,6 +17,10 @@ struct llama_sampler_chain {
 
     uint32_t n_nodes = 0;
 
+    // fork (SAMPLER-RESERVE): what the chain's backend graph allocates, from the probe graph .backend_init() builds:
+    // a hash of every tensor's op, type, shape, flags and sources, not of op parameters (values, not sizes)
+    uint64_t shape = 0;
+
     struct info {
         bool is_backend;
 
@@ -36,6 +40,8 @@ struct llama_sampler_chain {
 };
 
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
+// SAMPLER-RESERVE: two chains with the same shape add the same tensors (by op, type, size and wiring) to a graph
+uint64_t llama_sampler_backend_shape(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
 struct llama_sampler * llama_sampler_init_dry_testing(
