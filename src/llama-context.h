@@ -471,6 +471,9 @@ public:
     bool prefill_chunk_trace = false;
     std::vector<input_record> prefill_chunk_inputs;
 
+    // ADAPT-PF: LLAMA_MOE_ADAPT rounds this context ran, and the swaps they made (llama-prefill-dump --warm reports them)
+    int64_t moe_adapt_n_rounds = 0;
+    int64_t moe_adapt_n_swaps  = 0;
     // SAMPLER-RESERVE: sched_reserve() calls that reserved (rebuilt the scheduler)
     int64_t n_sched_reserve = 0;
     // and the scheduler's LLAMA_MOE_PREFETCH_PP ring, by serial number (0: none)

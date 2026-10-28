@@ -59,7 +59,41 @@ inline std::vector<llama_moe_swap> llama_moe_adapt_select(
 struct llama_moe_adapt_maps {
     std::vector<int32_t> mc, mg, mgpp; // map_cpu, map_gpu, map_gpu_pp
     std::vector<float>   kc, kg;       // mask_cpu, mask_gpu
+    // LLAMA_MOE_PREFETCH_PP (ADAPT-PF): map_cpu_pf, and the prefetch plan (the host-served experts, ascending)
+    std::vector<int32_t> pf, pf_list;
 };
+
+// ADAPT-PF: from map_cpu's values mc (own id = host-served, else its sentinel), map_cpu_pf (a host-served e -> its index
+// in the ascending list of host-served experts; a resident one keeps its sentinel) and that list, the scheduler's plan
+inline void llama_moe_adapt_pf_maps(const std::vector<int32_t> & mc, std::vector<int32_t> & pf, std::vector<int32_t> & list) {
+    pf.resize(mc.size());
+    list.clear();
+    for (size_t e = 0; e < mc.size(); e++) {
+        if (mc[e] == (int32_t) e) { pf[e] = (int32_t) list.size(); list.push_back((int32_t) e); }
+        else                      { pf[e] = mc[e]; }
+    }
+}
+
+// ADAPT-PF: a layer's map tensors (opaque here); map_cpu_pf is null without LLAMA_MOE_PREFETCH_PP
+struct llama_moe_adapt_map_tensors {
+    void * map_cpu, * map_cpu_pf, * map_gpu, * map_gpu_pp, * mask_cpu, * mask_gpu;
+};
+
+// ADAPT-PF: publish a layer's maps. set(tensor, data, bytes) writes one tensor (async on the compute stream, or
+// synchronously); plan(list) registers the prefetch plan. map_cpu_pf and the plan go with map_cpu, from the same mc,
+// so the compact ids a graph reads and the experts the ring uploads never disagree.
+template <class Set, class Plan>
+inline void llama_moe_adapt_write_maps(const llama_moe_adapt_maps & m, const llama_moe_adapt_map_tensors & t, Set && set, Plan && plan) {
+    set(t.map_cpu, m.mc.data(), m.mc.size()*sizeof(int32_t));
+    if (t.map_cpu_pf) {
+        set(t.map_cpu_pf, m.pf.data(), m.pf.size()*sizeof(int32_t));
+        plan(m.pf_list);
+    }
+    set(t.map_gpu,    m.mg.data(),   m.mg.size()*sizeof(int32_t));
+    set(t.map_gpu_pp, m.mgpp.data(), m.mgpp.size()*sizeof(int32_t));
+    set(t.mask_cpu,   m.kc.data(),   m.kc.size()*sizeof(float));
+    set(t.mask_gpu,   m.kg.data(),   m.kg.size()*sizeof(float));
+}
 
 // cpu_sentinel(e): map_cpu's value for a GPU-resident expert (the fork's per-expert sentinel encoding).
 template <class SentinelFn>
@@ -78,6 +112,7 @@ inline void llama_moe_adapt_build_maps(llama_moe_adapt_maps & m, const std::vect
         m.mc[e] = cpu_sentinel(e); m.mg[e] = (int32_t) g; m.mgpp[e] = (int32_t) g;
         m.kc[e] = 0.0f; m.kg[e] = 1.0f;
     }
+    llama_moe_adapt_pf_maps(m.mc, m.pf, m.pf_list);
 }
 
 struct llama_moe_adapt_layer {
@@ -88,7 +123,8 @@ struct llama_moe_adapt_layer {
 
 // IO, all enqueued (none blocks the host):
 //   wait_done(dev)       the compute stream of dev waits for dev's last end_copies
-//   set_maps(l)          rebuild layer l's five maps from cur/inflight, async on its compute stream
+//   set_maps(l)          rebuild layer l's maps from cur/inflight, async on its compute stream (the five, and with
+//                        LLAMA_MOE_PREFETCH_PP map_cpu_pf and the plan: llama_moe_adapt_write_maps, ADAPT-PF)
 //   begin_copies(dev)    record copy-free on dev's compute stream; dev's copy stream waits on it
 //   copy(l, g, e)        expert e's tensors into layer l's slot g, on the copy stream
 //   end_copies(dev)      record copy-done on dev's copy stream

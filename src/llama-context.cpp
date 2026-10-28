@@ -2771,7 +2771,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (!async) synchronize();
                     int64_t h = 0, t = 0;
                     const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t, async ? moe_adapt_io.get() : nullptr);
-                    if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; }
+                    if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; moe_adapt_n_swaps += sw; }
+                    moe_adapt_n_rounds++;
                 }
                 if (++moe_since_check >= 64) {
                     moe_since_check = 0;

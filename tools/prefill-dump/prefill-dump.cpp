@@ -6,7 +6,11 @@
 // seed, no logits are read, and after the prefill N tokens are sampled and fed back one at a time (decode batches,
 // so the micro-batch path); the tokens go to PREFIX.bin after the h_nextn rows and to the summary.
 //
-// usage: llama-prefill-dump --prompt-file F --out PREFIX [--n-tokens N] [--all-logits] [--sample N] <llama-server args>
+// --warm N (ADAPT-PF gate): first decode N single tokens (the prompt's first N, one decode each, as generation does),
+// so LLAMA_MOE_ADAPT runs its rounds (one per LLAMA_MOE_ADAPT_EVERY decodes) and moves experts before the prompt; the
+// warm sequence is then removed and the prompt prefilled as usual. The rounds and swaps go to the summary.
+//
+// usage: llama-prefill-dump --prompt-file F --out PREFIX [--n-tokens N] [--all-logits] [--sample N] [--warm N] <llama-server args>
 //   --all-logits: every row but each batch's first requests output (more rows compared; not the server's pattern)
 #include "arg.h"
 #include "common.h"
@@ -40,6 +44,7 @@ int main(int argc, char ** argv) {
     int  n_tokens_max = 20000;
     bool all_logits   = false;
     int  n_sample     = 0;
+    int  n_warm       = 0; // ADAPT-PF: single-token decodes before the prompt
 
     std::vector<char *> rest = { argv[0] };
     for (int i = 1; i < argc; i++) {
@@ -48,6 +53,7 @@ int main(int argc, char ** argv) {
         if (!strcmp(argv[i], "--n-tokens")    && i + 1 < argc) { n_tokens_max = atoi(argv[++i]); continue; }
         if (!strcmp(argv[i], "--all-logits"))                  { all_logits   = true; continue; }
         if (!strcmp(argv[i], "--sample")      && i + 1 < argc) { n_sample     = atoi(argv[++i]); continue; }
+        if (!strcmp(argv[i], "--warm")        && i + 1 < argc) { n_warm       = atoi(argv[++i]); continue; }
         rest.push_back(argv[i]);
     }
     if (prompt_path.empty() || out_prefix.empty()) {
@@ -95,6 +101,20 @@ int main(int argc, char ** argv) {
     const int n_embd  = llama_model_n_embd_out(model);
 
     llama_memory_clear(llama_get_memory(ctx), true);
+
+    if (n_warm > 0) {
+        llama_batch wb = llama_batch_init(1, 0, 1);
+        for (int i = 0; i < n_warm; ++i) {
+            common_batch_clear(wb);
+            common_batch_add(wb, toks[i % n_tok], i, { 0 }, true);
+            if (llama_decode(ctx, wb) != 0) { LOG_ERR("warm decode %d failed\n", i); return 1; }
+        }
+        llama_synchronize(ctx);
+        llama_batch_free(wb);
+        llama_memory_clear(llama_get_memory(ctx), true);
+        LOG_INF("warm: %d decodes, %lld adapt rounds, %lld swaps\n", n_warm, (long long) ctx->moe_adapt_n_rounds, (long long) ctx->moe_adapt_n_swaps);
+    }
+    const int64_t warm_rounds = ctx->moe_adapt_n_rounds, warm_swaps = ctx->moe_adapt_n_swaps;
 
     FILE * fbin = fopen((out_prefix + ".bin").c_str(), "wb");
     FILE * ftxt = fopen((out_prefix + ".txt").c_str(), "w");
@@ -178,6 +198,8 @@ int main(int argc, char ** argv) {
         fprintf(ftxt, "state %zu bytes digest %016" PRIx64 "\n", st.size(), fnv1a(st.data(), st.size()));
     }
 
+    fprintf(ftxt, "warm %d decodes: adapt rounds %" PRId64 " swaps %" PRId64 "; after the prompt: rounds %" PRId64 " swaps %" PRId64 "\n",
+            n_warm, warm_rounds, warm_swaps, ctx->moe_adapt_n_rounds, ctx->moe_adapt_n_swaps);
     fprintf(ftxt, "all digest %016" PRIx64 " prefill %.3f s %.0f t/s chunk_passes %" PRId64 " applies %" PRId64
             " pf_uploads %" PRId64 " pf_reads %" PRId64 " pf_MiB %.0f\n",
             h_all, t_prefill, n_tok/t_prefill, ctx->prefill_chunk_n_passes, ctx->prefill_chunk_n_apply,

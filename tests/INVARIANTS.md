@@ -114,7 +114,8 @@ One sentence per invariant; each names the test that pins it.
   the original ids: the scheduler's slot holds the registered plan in plan order, the slot is uploaded only after the
   matmul R entries earlier has finished reading it, and the matmul runs only after its own upload — so outputs equal
   the stock path's bit for bit, across new graphs, reused graphs and plan changes. Every site that writes map_cpu
-  writes map_cpu_pf and the plan from the same values (llama_moe_split_set_pf). Pinned by `tests/test-moe-prefetch.cpp`
+  writes map_cpu_pf and the plan from the same values (llama_moe_split_set_pf; the async adaptive tier's set_maps did
+  not until 28 Oct: see ADAPT-PF). Pinned by `tests/test-moe-prefetch.cpp`
   (R = 1..4; red with the upload's source offset taken from the slot index, with the compute stream's wait on the
   upload removed, and with the copy stream's wait on the earlier read removed).
 
@@ -203,6 +204,24 @@ One sentence per invariant; each names the test that pins it.
   under an exclusive GPU claim, 28 Oct 04:38Z, log <bench>/chunk-loop/gm-kmutate.log, CPU and CUDA
   backends, 292 checks): K1 causal off by one 16 of 292, K2 the sequence check dropped 76, K3 the 2-D tie dropped 16,
   K4 STRICT off by one 11, K5 the stream offset dropped 32.
+- **ADAPT-PF (fork-chunk-loop review F1, 2026-10-28).** Every publish of a split layer's maps by the adaptive tier,
+  synchronous or async (LLAMA_MOE_ADAPT_ASYNC's set_maps, at admit and at evict), writes map_cpu_pf and registers the
+  scheduler's prefetch plan from the same map_cpu values as the other five maps: the plan is exactly the experts the
+  CPU serves (mask_cpu 1, an in-flight slot's expert and an evicted one included), ascending, and map_cpu_pf gives each
+  its index in the plan, a resident expert its sentinel. The async path publishes through `llama_moe_adapt_write_maps`
+  (src/llama-moe-adapt.h), the maps from `llama_moe_adapt_build_maps`, so a prefill through the prefetch ring after any
+  number of adapt rounds is bit for bit the prefill without it. Before the fix the async set_maps left map_cpu_pf and
+  the plan at their init values: an expert evicted to the host after init kept its sentinel and was missing from the
+  plan, so its routed contribution was zero on every prefetch-path batch, accumulating over the process lifetime.
+  Pinned by `tests/test-moe-adapt-async.cpp` (A: 200 rounds through the shared writer, every publish writes the six
+  maps and the plan and they agree with the masks; E: no map_cpu_pf, no plan). Red first (`tests/prefill-chunk-mutate.py`):
+  AP1 build_maps not filling pf (crash), AP2 the writer without the plan (1174 violations), AP3 without map_cpu_pf
+  (2348), AP4 the plan rank off by one (1174). The model-side call (llama_moe_adapt_model_io::set_maps) needs split
+  layers on a device, so it is held by the GPU gate `<bench>/chunk-loop/gate-adapt-pf.sh` (copy
+  tests/prefill-chunk-gate-adapt-pf.sh): llama-prefill-dump --warm 64 (16 async rounds, as served) then a 20k prefill,
+  prefetch on (R=3, and X's C=8 G=1) against off at X's pack, byte for byte, with an off-vs-off control and the adapt
+  rounds and swaps equal in every arm; red first on the F1 commit with only that call reverted.
+
 - **SAMPLER-RESERVE (fork-chunk-loop, 2026-10-28).** Setting or removing a backend sampler on a sequence
   (`llama_set_sampler`, which the server calls at every request's launch and release) reserves the scheduler again
   only when the shapes the last reserve sized each sequence for do not cover the new sampler set: a sampler's shape is

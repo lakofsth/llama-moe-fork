@@ -4,9 +4,13 @@
 //   (2) no map admits a copied slot before the compute stream has waited on that copy's done event, and
 //   (3) every published map is consistent: each expert resident on exactly one side, an in-flight slot on neither.
 // The checker is itself checked on two hand-misordered sequences that must be caught.
+// ADAPT-PF: every map set_maps publishes goes through llama_moe_adapt_write_maps, and with LLAMA_MOE_PREFETCH_PP
+// (map_cpu_pf present) it writes map_cpu_pf and the prefetch plan with map_cpu: the plan is exactly the experts the CPU
+// serves (mask_cpu 1), ascending, and map_cpu_pf gives each its index in it, a resident one its sentinel.
 
 #include "../src/llama-moe-adapt.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <map>
 #include <random>
@@ -28,6 +32,11 @@ struct fake_io {
     std::map<int, std::set<std::pair<int,int>>> pending, done_recorded;
     std::set<std::pair<int,int>> copied, visible;              // slots ever copied; copies the compute stream has waited on
     std::vector<std::string> violations;
+    // ADAPT-PF: the tensors written by the latest publish, and the latest plan per layer
+    int t_cpu = 0, t_pf = 0, t_gpu = 0, t_gpu_pp = 0, t_kc = 0, t_kg = 0; // stand-ins for the six tensors
+    std::map<const void *, std::vector<uint8_t>> written;
+    std::vector<std::vector<int32_t>> plan;
+    int n_plans = 0;
 
     static int sentinel(int e) { return NEXP + 1 + e; }
 
@@ -51,6 +60,27 @@ struct fake_io {
         }
         for (size_t g = 0; g < cur.size(); g++) {
             if (g < fl.size() && fl[g] && m.kg[cur[g]] == 1.0f) violations.push_back("in-flight slot's expert marked GPU-resident");
+        }
+        // ADAPT-PF: publish through the shared writer, then check what it wrote against the masks
+        written.clear();
+        const llama_moe_adapt_map_tensors t = { &t_cpu, &t_pf, &t_gpu, &t_gpu_pp, &t_kc, &t_kg };
+        bool planned = false;
+        llama_moe_adapt_write_maps(m, t,
+            [&](void * dst, const void * data, size_t size) { written[dst].assign((const uint8_t *) data, (const uint8_t *) data + size); },
+            [&](const std::vector<int32_t> & list) { if ((size_t) l >= plan.size()) plan.resize(l + 1); plan[l] = list; planned = true; n_plans++; });
+        if (written.size() != 6 || !planned) violations.push_back("publish did not write all six maps and the plan");
+        std::vector<int32_t> want_list;
+        for (int e = 0; e < NEXP; e++) if (m.kc[e] == 1.0f) want_list.push_back(e);
+        if (planned && plan[l] != want_list) violations.push_back("plan is not the CPU-served experts of layer " + std::to_string(l));
+        const auto & pfb = written[&t_pf];
+        if (pfb.size() != NEXP*sizeof(int32_t)) { violations.push_back("map_cpu_pf has the wrong size"); }
+        else {
+            const int32_t * pf = (const int32_t *) pfb.data();
+            for (int e = 0; e < NEXP; e++) {
+                const auto it = std::find(want_list.begin(), want_list.end(), e);
+                const int32_t want = it != want_list.end() ? (int32_t) (it - want_list.begin()) : m.mc[e];
+                if (pf[e] != want) { violations.push_back("map_cpu_pf of expert " + std::to_string(e) + " disagrees with map_cpu"); break; }
+            }
         }
         published[l] = m;
     }
@@ -117,7 +147,8 @@ int main() {
         }
         CHECK(total > 100, "too few swaps to exercise the ordering: %d", total);
         CHECK(w.io.violations.empty(), "real ordering: %zu violations, first: %s", w.io.violations.size(), w.io.violations.empty() ? "" : w.io.violations[0].c_str());
-        std::printf("A: %d swaps over 200 rounds, %zu violations\n", total, w.io.violations.size());
+        CHECK(w.io.n_plans > 200, "too few plans published: %d", w.io.n_plans);
+        std::printf("A: %d swaps over 200 rounds, %d plans, %zu violations\n", total, w.io.n_plans, w.io.violations.size());
     }
     // (B) checker power 1: copying before the eviction is published must be caught
     {
@@ -141,6 +172,17 @@ int main() {
         llama_moe_adapt_maps m; llama_moe_adapt_build_maps(m, cur, fl, NEXP, fake_io::sentinel);
         CHECK(m.kg[6] == 0.0f && m.kc[6] == 1.0f && m.mc[6] == 6 && m.mgpp[6] == 3, "in-flight expert 6 not CPU-served");
         CHECK(m.kg[5] == 1.0f && m.mg[5] == 0 && m.mc[5] == fake_io::sentinel(5), "resident expert 5 wrong");
+    }
+    // (E) ADAPT-PF: without map_cpu_pf (no LLAMA_MOE_PREFETCH_PP) the writer writes the five and registers no plan
+    {
+        std::vector<int32_t> cur = { 5, 6, 7 }; std::vector<uint8_t> fl = { 0, 1, 0 };
+        llama_moe_adapt_maps m; llama_moe_adapt_build_maps(m, cur, fl, NEXP, fake_io::sentinel);
+        int a, b, c, d, e2; int n_set = 0, n_plan = 0;
+        const llama_moe_adapt_map_tensors t = { &a, nullptr, &b, &c, &d, &e2 };
+        llama_moe_adapt_write_maps(m, t, [&](void *, const void *, size_t) { n_set++; }, [&](const std::vector<int32_t> &) { n_plan++; });
+        CHECK(n_set == 5 && n_plan == 0, "no map_cpu_pf: %d writes, %d plans", n_set, n_plan);
+        // the in-flight expert 6 is CPU-served: in the plan at its rank among the host experts
+        CHECK(m.pf[6] == 5 && m.pf_list.size() == NEXP - 2 && m.pf[5] == fake_io::sentinel(5), "pf of the in-flight expert");
     }
     if (n_fail) { std::fprintf(stderr, "test-moe-adapt-async: %d failures\n", n_fail); return 1; }
     std::printf("test-moe-adapt-async: OK\n");

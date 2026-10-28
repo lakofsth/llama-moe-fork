@@ -1715,20 +1715,21 @@ static int32_t llama_moe_cpu_sentinel(const llama_moe_split & ms, int n_expert, 
 // sentinel), set map_cpu_pf (non-resident e -> its index in the ascending non-resident list; resident -> the same
 // sentinel) and register that list as the scheduler's prefetch plan for each of the layer's host expert tensors.
 // Every site that writes map_cpu calls this with the same mc, so the compact ids and the slot order never disagree.
-static void llama_moe_split_set_pf(const llama_layer & L, llama_moe_split & ms, const std::vector<int32_t> & mc) {
-    if (!ms.map_cpu_pf) return;
-    const int n_expert = (int) mc.size();
-    std::vector<int32_t> pf(n_expert), list;
-    for (int e = 0; e < n_expert; e++) {
-        if (mc[e] == e) { pf[e] = (int32_t) list.size(); list.push_back(e); }
-        else            { pf[e] = mc[e]; }
-    }
-    ggml_backend_tensor_set(ms.map_cpu_pf, pf.data(), 0, pf.size()*sizeof(int32_t));
+// The async tier's set_maps writes them through llama_moe_adapt_write_maps (ADAPT-PF), with the same plan helper.
+static void llama_moe_split_plan(const llama_layer & L, const std::vector<int32_t> & list) {
     const ggml_tensor * ts[3] = { L.ffn_gate_up_exps ? L.ffn_gate_up_exps : L.ffn_gate_exps,
                                   L.ffn_gate_up_exps ? nullptr : L.ffn_up_exps, L.ffn_down_exps };
     for (const ggml_tensor * t : ts) {
         if (t) ggml_backend_sched_moe_pf_plan(t, list.data(), (int) list.size());
     }
+}
+
+static void llama_moe_split_set_pf(const llama_layer & L, llama_moe_split & ms, const std::vector<int32_t> & mc) {
+    if (!ms.map_cpu_pf) return;
+    std::vector<int32_t> pf, list;
+    llama_moe_adapt_pf_maps(mc, pf, list);
+    ggml_backend_tensor_set(ms.map_cpu_pf, pf.data(), 0, pf.size()*sizeof(int32_t));
+    llama_moe_split_plan(L, list);
 }
 
 static void llama_moe_heat_split_init(llama_model_base & model, llama_model_loader & ml) {
@@ -2519,11 +2520,14 @@ struct llama_moe_adapt_model_io {
         auto & ms = layers[lay[k]].moe_split;
         llama_moe_adapt_maps m;
         llama_moe_adapt_build_maps(m, ms.cur_experts, ms.inflight, n_expert, [&](int e) { return llama_moe_cpu_sentinel(ms, n_expert, e); });
-        io.set_async(ms.map_cpu,    m.mc.data(),   m.mc.size()*sizeof(int32_t));
-        io.set_async(ms.map_gpu,    m.mg.data(),   m.mg.size()*sizeof(int32_t));
-        io.set_async(ms.map_gpu_pp, m.mgpp.data(), m.mgpp.size()*sizeof(int32_t));
-        io.set_async(ms.mask_cpu,   m.kc.data(),   m.kc.size()*sizeof(float));
-        io.set_async(ms.mask_gpu,   m.kg.data(),   m.kg.size()*sizeof(float));
+        // ADAPT-PF: map_cpu_pf and the prefetch plan with map_cpu (before 28 Oct they were left at their init values:
+        // an expert evicted to the host kept its sentinel in map_cpu_pf and was missing from the plan, so its routed
+        // contribution was zero on every prefetch-path batch). The plan is the host's: it takes effect for the next
+        // graph the scheduler computes, which runs after these writes on the compute stream.
+        const llama_moe_adapt_map_tensors t = { ms.map_cpu, ms.map_cpu_pf, ms.map_gpu, ms.map_gpu_pp, ms.mask_cpu, ms.mask_gpu };
+        llama_moe_adapt_write_maps(m, t,
+            [&](void * dst, const void * data, size_t size) { io.set_async((ggml_tensor *) dst, data, size); },
+            [&](const std::vector<int32_t> & list) { llama_moe_split_plan(layers[lay[k]], list); });
     }
     void copy(int k, int g, int e) {
         auto & L  = layers[lay[k]];
