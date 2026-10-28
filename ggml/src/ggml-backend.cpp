@@ -1818,6 +1818,11 @@ struct ggml_sched_moe_pf {
     std::vector<entry>                  hints;    // this graph's planned hint uploads
     int64_t                             n_upload = 0, n_read = 0, n_bytes = 0;
     bool                                warned_wide = false;
+    // PF-GROW-FALLBACK (review F5): a slot this graph needs could not be grown (the device is full), so this graph's
+    // entries are uploaded into their own weight copies at their split (the stock path's place) and read there
+    bool                                fallback = false;
+    int64_t                             n_fallback = 0;
+    bool                                warned_grow = false;
 
     void free_slot(int j) {
         if (buf[j]) { ggml_backend_buffer_free(buf[j]); buf[j] = NULL; }
@@ -1916,7 +1921,15 @@ void ggml_backend_sched_moe_pf_stats(ggml_backend_sched_t sched, int64_t * n_upl
 }
 
 // slot j must hold need bytes: reallocate it (both streams drained first; its content is lost)
-static void ggml_backend_sched_moe_pf_grow(ggml_backend_sched_t sched, ggml_sched_moe_pf * pf, int j, size_t need) {
+// LLAMA_MOE_PF_GROW_FAIL_AFTER=N (gate only): every grow after the first N fails, as on a full device
+static bool ggml_backend_sched_moe_pf_grow_refused() {
+    static const long after = [] { const char * e = getenv("LLAMA_MOE_PF_GROW_FAIL_AFTER"); return e ? atol(e) : -1L; }();
+    static long n = 0;
+    return after >= 0 && n++ >= after;
+}
+
+// grow slot j to need bytes; false (the slot left empty, nothing aborted) when the device cannot give them
+static bool ggml_backend_sched_moe_pf_grow(ggml_backend_sched_t sched, ggml_sched_moe_pf * pf, int j, size_t need) {
     ggml_backend_synchronize(pf->copy_backend);
     ggml_backend_synchronize(sched->backends[pf->backend_id]);
     pf->free_slot(j);
@@ -1924,13 +1937,31 @@ static void ggml_backend_sched_moe_pf_grow(ggml_backend_sched_t sched, ggml_sche
     pf->ctx[j]  = ggml_init(ip);
     pf->slot[j] = ggml_new_tensor_1d(pf->ctx[j], GGML_TYPE_I8, (int64_t) need);
     ggml_format_name(pf->slot[j], "moe_pf_slot_%d", j);
-    pf->buf[j]  = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(sched->backends[pf->backend_id]), need);
+    pf->buf[j]  = ggml_backend_sched_moe_pf_grow_refused() ? NULL :
+                  ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(sched->backends[pf->backend_id]), need);
     if (pf->buf[j] == NULL || ggml_backend_tensor_alloc(pf->buf[j], pf->slot[j], ggml_backend_buffer_get_base(pf->buf[j])) != GGML_STATUS_SUCCESS) {
-        GGML_ABORT("moe-prefetch: cannot allocate slot %d (%.1f MiB) on %s", j, need/1024.0/1024.0, ggml_backend_name(sched->backends[pf->backend_id]));
+        if (!pf->warned_grow) {
+            pf->warned_grow = true;
+            GGML_LOG_WARN("moe-prefetch: cannot grow slot %d to %.1f MiB on %s: graphs that need it upload their host experts at "
+                          "their split instead (PF-GROW-FALLBACK; logged once)\n", j, need/1024.0/1024.0, ggml_backend_name(sched->backends[pf->backend_id]));
+        }
+        pf->free_slot(j);
+        pf->ring.set_size(j, 0); // the planner must not count on it (it recorded the size it asked for)
+        return false;
     }
     ggml_backend_buffer_clear(pf->buf[j], 0);
     pf->size[j] = need;
     GGML_LOG_WARN("moe-prefetch: slot %d of %d on %s: %.1f MiB\n", j, pf->R, ggml_backend_name(sched->backends[pf->backend_id]), need/1024.0/1024.0);
+    return true;
+}
+
+// PF-GROW-FALLBACK: this graph reads no slot
+static void ggml_backend_sched_moe_pf_fallback(ggml_sched_moe_pf * pf) {
+    for (auto & e : pf->entries) { e.slot = -1; e.upload = false; e.after = -1; }
+    pf->hints.clear();
+    pf->chunk_ring = false;
+    pf->ring.invalidate();
+    pf->fallback = true;
 }
 
 // LLAMA_MOE_PF_TRACE=1: one WARN line per planned chunk graph, for the first LLAMA_MOE_PF_TRACE_N (default 400):
@@ -1970,7 +2001,7 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
         std::lock_guard<std::mutex> lock(g_moe_pf_mutex);
         gen = g_moe_pf_gen;
     }
-    if (pf) { pf->entries.clear(); pf->hints.clear(); pf->entry_of_split.assign(sched->n_splits, -1); pf->chunk_ring = false; }
+    if (pf) { pf->entries.clear(); pf->hints.clear(); pf->entry_of_split.assign(sched->n_splits, -1); pf->chunk_ring = false; pf->fallback = false; }
     for (int s = 0; s < sched->n_splits; s++) {
         struct ggml_backend_sched_split * split = &sched->splits[s];
         for (int n = 0; n < split->graph.n_nodes; n++) {
@@ -2104,10 +2135,16 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
         d = pf->ring.plan(it_e, it_h, last);
     }
     if (pf->chunk && d.grow.size() == (size_t) pf->R) {
+        bool grown = true;
         for (int j = 0; j < pf->R; j++) {
             if (d.grow[j] > pf->size[j]) {
-                ggml_backend_sched_moe_pf_grow(sched, pf, j, d.grow[j]);
+                grown = ggml_backend_sched_moe_pf_grow(sched, pf, j, d.grow[j]) && grown;
             }
+        }
+        if (!grown) {
+            ggml_backend_sched_moe_pf_fallback(pf);
+            ggml_backend_sched_moe_pf_trace(pf, gen, last, "fallback");
+            return;
         }
         for (size_t i = 0; i < pf->entries.size(); i++) {
             pf->entries[i].slot   = d.slot[i];
@@ -2140,7 +2177,13 @@ static void ggml_backend_sched_moe_pf_collect(ggml_backend_sched_t sched) {
         if (need == 0 || need <= pf->size[j]) {
             continue;
         }
-        ggml_backend_sched_moe_pf_grow(sched, pf, j, need);
+        if (!ggml_backend_sched_moe_pf_grow(sched, pf, j, need)) {
+            ggml_backend_sched_moe_pf_fallback(pf);
+            if (pf->chunk) {
+                ggml_backend_sched_moe_pf_trace(pf, gen, last, "fallback");
+            }
+            return;
+        }
         pf->ring.set_size(j, need);
     }
     for (size_t i = 0; i < pf->entries.size(); i++) {
@@ -2224,7 +2267,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     if (ggml_backend_sched_moe_pf_ring() > 0) {
         ggml_backend_sched_moe_pf_collect(sched);
         pf = sched->moe_pf;
-        if (pf != NULL && pf->chunk_ring) {
+        if (pf != NULL && pf->fallback) {
+            // PF-GROW-FALLBACK: nothing goes ahead; each entry is uploaded at its split
+        } else if (pf != NULL && pf->chunk_ring) {
             for (const auto & e : pf->entries) {
                 if (e.upload && e.after < 0) ggml_backend_sched_moe_pf_upload(pf, e);
             }
@@ -2480,17 +2525,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // fork: LLAMA_MOE_PREFETCH_PP — this split's weight is in slot i % R: wait for its upload, read it there
         const int pf_i = pf != NULL ? pf->entry_of_split[split_id] : -1;
-        void * pf_saved = NULL;
-        ggml_backend_buffer_t pf_saved_buf = NULL;
-        if (pf_i >= 0) {
+        // PF-REDIRECT-RESTORE (review F4): the split's weight copy points at the slot only while the split's launches
+        // are issued; the guard puts its data and buffer back on every way out of this iteration (a failed launch
+        // returned before the restore and left the copy pointing at the slot)
+        struct pf_redirect {
+            struct ggml_tensor *  t   = NULL;
+            void *                data = NULL;
+            ggml_backend_buffer_t buf  = NULL;
+            void restore() { if (t) { t->data = data; t->buffer = buf; t = NULL; } }
+            ~pf_redirect() { restore(); }
+        } pf_redir;
+        if (pf_i >= 0 && pf->fallback) {
+            // PF-GROW-FALLBACK: the experts, in slot order, into the split's own copy of the weight on its stream (the
+            // stock path's copy, at the stock path's place), then the pad zeroed where it lies inside the copy
+            const auto & e = pf->entries[pf_i];
+            const size_t es = e.input->nb[2];
+            const int n = (int) e.experts.size();
+            for (int k = 0; k < n; ) {
+                const int c0 = k;
+                while (k + 1 < n && e.experts[k + 1] == e.experts[k] + 1) { k++; }
+                ggml_backend_tensor_set_async(split_backend, e.input_cpy, (const uint8_t *) e.input->data + (size_t) e.experts[c0] * es,
+                                              (size_t) c0 * es, (size_t) (k - c0 + 1) * es);
+                k++;
+            }
+            const size_t pad = std::min(e.pad, ggml_nbytes(e.input_cpy) - std::min(ggml_nbytes(e.input_cpy), (size_t) n * es));
+            if (pad > 0 && pf->zeros) {
+                ggml_backend_tensor_set_async(split_backend, e.input_cpy, ggml_backend_buffer_get_base(pf->zeros), (size_t) n * es, pad);
+            }
+            pf->n_fallback++;
+        } else if (pf_i >= 0) {
             const int j = pf->entries[pf_i].slot;
             ggml_backend_event_wait(split_backend, pf->ev_up[j]);
             // data AND buffer: the kernels must see the slot as what it is (not a compute-buffer tensor whose
             // allocation padding they may clear — mmq.cu clears ggml_nbytes(src0).. alloc, past the slot's end)
-            pf_saved     = pf->entries[pf_i].input_cpy->data;
-            pf_saved_buf = pf->entries[pf_i].input_cpy->buffer;
-            pf->entries[pf_i].input_cpy->data   = pf->slot[j]->data;
-            pf->entries[pf_i].input_cpy->buffer = pf->buf[j];
+            struct ggml_tensor * cpy = pf->entries[pf_i].input_cpy;
+            pf_redir.t = cpy; pf_redir.data = cpy->data; pf_redir.buf = cpy->buffer;
+            cpy->data   = pf->slot[j]->data;
+            cpy->buffer = pf->buf[j];
         }
 
         if (!sched->callback_eval) {
@@ -2570,10 +2641,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (pf_i >= 0) {
+        if (pf_i >= 0 && !pf->fallback) {
             const int j = pf->entries[pf_i].slot;
-            pf->entries[pf_i].input_cpy->data   = pf_saved; // the launches above captured the slot address
-            pf->entries[pf_i].input_cpy->buffer = pf_saved_buf;
+            pf_redir.restore(); // the launches above captured the slot address
             ggml_backend_event_record(pf->ev_read[j], split_backend);
             pf->read_recorded[j] = true;
             pf->n_read++;

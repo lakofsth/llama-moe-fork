@@ -234,6 +234,29 @@ One sentence per invariant; each names the test that pins it.
   rounded (the pre-fix rule, 5 of 28), MS2 the floor dropped (1 of 28). The two call sites pass the ubatch's
   sequences; that the trio's batches now read slots shows in the server gate's trace arm (prefetch reads per batch).
 
+- **PF-REDIRECT-RESTORE (fork-chunk-loop review F4, 2026-10-28).** While a split's launches are issued, its host
+  weight's device copy (input_cpy) points at the prefetch slot (data and buffer); a scope guard in
+  ggml_backend_sched_compute_splits puts both back on every way out of that split, including a launch that fails and
+  returns its status (before the fix those two returns left the copy pointing at the slot, for whatever next used the
+  scheduler's tensor). No test reaches it: a failing backend launch needs a fault-injecting device, and the CPU
+  backend cannot host the compact-id split. Held by construction (one restore, in the guard's destructor; the normal
+  path's explicit restore is the guard's).
+
+- **PF-GROW-FALLBACK (fork-chunk-loop review F5, 2026-10-28).** When a prefetch slot a graph needs cannot be grown
+  (the device's allocation fails; card 0 runs at 31,938 of 32,000 MiB and, after ADAPT-PF, plans and so slot sizes
+  change at runtime), the scheduler does not abort: that graph reads no slot, and each of its prefetch entries is
+  uploaded, in slot order, into its split's own copy of the weight on the split's stream (the stock path's copy at the
+  stock path's place), its pad zeroed where it lies inside the copy; the next graph tries the grow again. Logged once
+  ("moe-prefetch: cannot grow slot ..."). Output is the slot path's bit for bit: the same bytes at the same offsets
+  read by the same kernel. LLAMA_MOE_PF_GROW_FAIL_AFTER=N (gates only) fails every grow after the first N. Sizing the
+  slots for the worst case at init instead was not taken: with the async tier a layer's host-served set is its
+  non-resident experts plus every in-flight slot's, bounded only by the layer's packed count, so the worst case is a
+  slot the size of a whole layer's expert tensor, which card 0 cannot hold. Pinned by `tests/test-moe-prefetch.cpp`
+  run with LLAMA_MOE_PF_GROW_FAIL_AFTER=0 and =1 (the slot path and the fallback agree exactly with the stock upload
+  and the fallback is logged; GPU, through `tests/prefill-chunk-run-mask-test.sh` GPU_TEST=test-moe-prefetch), with
+  mutations FB1 (the fallback uploads nothing), FB2 (the split ignores the fallback), FB3 (a failed grow aborts, the
+  pre-fix behaviour) in `tests/prefill-chunk-pfmutate.py`, owed a GPU run; and end to end by gate-adapt-pf.sh's onf arm.
+
 - **SAMPLER-RESERVE (fork-chunk-loop, 2026-10-28).** Setting or removing a backend sampler on a sequence
   (`llama_set_sampler`, which the server calls at every request's launch and release) reserves the scheduler again
   only when the shapes the last reserve sized each sequence for do not cover the new sampler set: a sampler's shape is

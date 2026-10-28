@@ -10,6 +10,9 @@
 // read/upload events and plan updates are all exercised. A compact id read through the stock upload would select
 // the wrong expert, so agreement also proves the slot path served the run; the log must name allocated slots.
 // R = LLAMA_MOE_PREFETCH_PP (default 3 here: slots mix W1- and W2-sized entries). Skips (exit 0) without CUDA.
+// PF-GROW-FALLBACK (review F5): run again with LLAMA_MOE_PF_GROW_FAIL_AFTER=N (every slot grow after the first N
+// fails, as on a full device): a graph that needs a slot it cannot grow uploads its experts into its own weight copy
+// at its split, and must still agree exactly; the run must log the fallback. N=0: no slot ever; N=1: a mixed ring.
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -26,10 +29,12 @@
 
 static const int K = 256, M = 64, E = 16, U = 4, T = 64, L = 3;
 static int slot_lines = 0;
+static int fallback_lines = 0; // PF-GROW-FALLBACK
 
 static void log_cb(ggml_log_level level, const char * text, void * ud) {
     (void) ud;
     if (strstr(text, "moe-prefetch: slot")) slot_lines++;
+    if (strstr(text, "moe-prefetch: cannot grow slot")) fallback_lines++;
     if (level >= GGML_LOG_LEVEL_WARN) fputs(text, stderr);
 }
 
@@ -153,7 +158,11 @@ int main() {
         }
         ggml_free(gr.ctx); ggml_free(gp.ctx);
     }
-    if (slot_lines == 0) { printf("FAIL no prefetch slot was allocated (the slot path never ran)\n"); fails++; }
+    const char * fail_after = getenv("LLAMA_MOE_PF_GROW_FAIL_AFTER");
+    if (fail_after) {
+        if (fallback_lines == 0) { printf("FAIL LLAMA_MOE_PF_GROW_FAIL_AFTER=%s but no grow failed (the fallback never ran)\n", fail_after); fails++; }
+        else                     { printf("ok   the fallback ran (%d slot allocation line(s) before it)\n", slot_lines); }
+    } else if (slot_lines == 0) { printf("FAIL no prefetch slot was allocated (the slot path never ran)\n"); fails++; }
     else                 { printf("ok   %d prefetch slot allocation line(s)\n", slot_lines); }
 
     ggml_backend_sched_free(sched);
