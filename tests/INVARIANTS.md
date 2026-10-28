@@ -175,4 +175,7 @@ One sentence per invariant; each names the test that pins it.
   chunk batches, against 0.14 s for the same batch with one sequence in the cache: the mask and QSA fills are
   O(n_kv x n_tokens) and ran on each of a ubatch's 12 attention-layer passes. Pinned by `tests/test-prefill-chunk.cpp`
   (the existing identity checks on logits, h_nextn, state and every named input a pass saw, plus: each chunk ubatch
-  fills its mask and QSA set exactly once, and later passes reuse them).
+  fills its mask and QSA set exactly once, and later passes reuse them). Each mechanism reverted alone is red
+  (tests/prefill-chunk-mutate.py on 798434b6e, of 63): the mask cache 48, the QSA cache 48, the key without the chunk
+  slot 56 (wrong masks), both clears removed 56 (a chunk reuses the previous chunk's fills); one clear alone is enough,
+  so the mutation removes both. CPU proxy (the fixture, n_kv <= 512, 119 chunk decodes): set_inputs 90 -> 31 ms.
