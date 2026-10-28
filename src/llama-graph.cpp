@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-moe-prefetch-policy.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1510,6 +1511,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    chunk_pass       (params.chunk_pass),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2366,9 +2368,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // scheduler's prefetch slot, so its ids are COMPACT (map_cpu_pf, the slot order) and the tensor carries the
         // name the scheduler keys on. Requires op_offload: on the CPU these ids would select the wrong experts (the
         // scheduler aborts rather than run them).
-        static const int pf_ring = [] { const char * e = getenv("LLAMA_MOE_PREFETCH_PP"); const int r = e ? atoi(e) : 0; return r > 0 ? r : 0; }();
-        static const int pf_min  = [] { const char * e = getenv("LLAMA_MOE_PREFETCH_PP_MIN"); const int v = e ? atoi(e) : 1024; return v < 32 ? 32 : v; }();
-        const bool use_pf = pf_ring > 0 && msplit->map_cpu_pf != nullptr && cparams.op_offload && n_tokens >= pf_min;
+        // fork (P3a): under LLAMA_PREFILL_CHUNK only the chunk loop's passes use the ring (PREFILL-CHUNK-PF-ONLY)
+        static const llama_moe_prefetch_policy pf_policy = llama_moe_prefetch_policy::from_env();
+        const bool use_pf = pf_policy.use(msplit->map_cpu_pf != nullptr, cparams.op_offload, n_tokens, chunk_pass);
         ggml_tensor * ids_cpu = ggml_reshape_2d(ctx0,
                 ggml_get_rows(ctx0, use_pf ? msplit->map_cpu_pf : msplit->map_cpu, sel_flat), n_expert_used, n_tokens);
         // the counting op matches "ffn_moe_ids_cpu-<il>" by substring: only the model that

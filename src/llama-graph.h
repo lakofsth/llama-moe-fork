@@ -824,6 +824,7 @@ struct llm_graph_params {
     uint32_t      chunk_k       = 0;
     ggml_tensor * chunk_res_in  = nullptr;
     ggml_tensor * chunk_res_out = nullptr;
+    bool          chunk_pass    = false; // a pass of the chunk loop (also with the whole layer range)
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -890,7 +891,8 @@ struct llm_graph_params {
             il_end        != other.il_end        ||
             chunk_k       != other.chunk_k       ||
             chunk_res_in  != other.chunk_res_in  ||
-            chunk_res_out != other.chunk_res_out) {
+            chunk_res_out != other.chunk_res_out ||
+            chunk_pass    != other.chunk_pass) {
             return false;
         }
 
@@ -1060,6 +1062,9 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // fork: llm_graph_params::chunk_pass
+    const bool chunk_pass;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

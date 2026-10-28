@@ -3333,6 +3333,7 @@ llm_graph_params llama_context::graph_params(
         params.chunk_k       = range->k;
         params.chunk_res_in  = range->res_in;
         params.chunk_res_out = range->res_out;
+        params.chunk_pass    = true;
     }
 
     return params;

@@ -153,3 +153,13 @@ One sentence per invariant; each names the test that pins it.
   to n_batch (the -b 8192 that lets a chunk hold 8 ubatches). Unset (or C < 2), the batch is filled as before. Pinned
   by `tests/test-server-batch-policy.cpp` (tools/server/server-batch-policy.h, the caps the server's update_slots
   applies; red with either cap reverted or the default off: tests/prefill-chunk-mutate.py B1-B3).
+
+- **PREFILL-CHUNK-PF-ONLY (fork-chunk-loop P3a, 2026-10-28).** With LLAMA_PREFILL_CHUNK set (C >= 2) and
+  LLAMA_MOE_PREFETCH_PP=R, a graph reads its host experts through the prefetch ring (compact ids) only if it is a pass
+  of the chunk loop; every other graph (a batch carrying a generating token, a single-ubatch batch) uploads the routed
+  experts as the stock path does, unless LLAMA_MOE_PREFETCH_CHUNK_ONLY=0. Without LLAMA_PREFILL_CHUNK the prefetch
+  applies to every wide graph as before (LLAMA_MOE_PREFETCH_CHUNK_ONLY=1 restricts it anyway). Found by the server
+  gate's trace arm (server-20261028T005245Z, XT): each capped 2048-token mixed step streamed all 93 non-resident host
+  expert tensors through the per-graph ring. Pinned by `tests/test-moe-prefetch-policy.cpp`
+  (src/llama-moe-prefetch-policy.h, the decision build_moe_ffn takes); the graph flag it reads is part of
+  allow_reuse.
