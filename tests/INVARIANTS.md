@@ -199,8 +199,10 @@ One sentence per invariant; each names the test that pins it.
   on the CPU op and fills, 0 of 216 failing unmutated): G1 causal off by one (`<` for `<=`) 16 of 216, G2 the sequence
   check dropped 76, G3 the 2-D tie dropped 16, G4 the extension x/y swapped 16, G5 a cell shared by sequences given
   one bit 32, G6 unpooled QSA blocks given metadata 9; N1 the KQ note dropped fails test-prefill-chunk. The CUDA
-  kernel's own mutations (K1-K5, `tests/prefill-chunk-kmutate.py`, run through `tests/prefill-chunk-run-mask-test.sh`
-  under an exclusive GPU claim) are owed a GPU run.
+  kernel's own mutations (`tests/prefill-chunk-kmutate.py`, run on the GPU through `tests/prefill-chunk-run-mask-test.sh`
+  under an exclusive GPU claim, 28 Oct 04:38Z, log <bench>/chunk-loop/gm-kmutate.log, CPU and CUDA
+  backends, 292 checks): K1 causal off by one 16 of 292, K2 the sequence check dropped 76, K3 the 2-D tie dropped 16,
+  K4 STRICT off by one 11, K5 the stream offset dropped 32.
 - **SAMPLER-RESERVE (fork-chunk-loop, 2026-10-28).** Setting or removing a backend sampler on a sequence
   (`llama_set_sampler`, which the server calls at every request's launch and release) reserves the scheduler again
   only when the shapes the last reserve sized each sequence for do not cover the new sampler set: a sampler's shape is
