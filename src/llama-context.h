@@ -442,6 +442,9 @@ public:
     int64_t prefill_pf_n_upload = 0;
     int64_t prefill_pf_n_read   = 0;
     int64_t prefill_pf_n_bytes  = 0;
+    // LLAMA_PREFILL_CHUNK_TRACE: graph build + alloc and set_inputs time within the current decode
+    int64_t prefill_trace_build_us = 0;
+    int64_t prefill_trace_set_us   = 0;
 
     struct input_record {
         int64_t              ubatch;

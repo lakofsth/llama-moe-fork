@@ -1519,6 +1519,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        const int64_t t_build0 = ggml_time_us();
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1544,6 +1545,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        prefill_trace_build_us += ggml_time_us() - t_build0;
     }
 
     // set the input data for the input tensors
@@ -1551,7 +1553,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        const int64_t t_set0 = ggml_time_us();
         res->set_inputs(&ubatch);
+        prefill_trace_set_us += ggml_time_us() - t_set0;
 
         if (prefill_chunk_trace) {
             prefill_chunk_trace_inputs(res->get_gf(), prefill_chunk_n_ubatch + (range ? range->k : 0));
@@ -2005,6 +2009,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     static const bool chunk_trace = [] { const char * e = getenv("LLAMA_PREFILL_CHUNK_TRACE"); return e && atoi(e) != 0; }();
     const int64_t t_decode_start_us = chunk_trace ? ggml_time_us() : 0;
     const int64_t n_passes_start    = prefill_chunk_n_passes;
+    prefill_trace_build_us = 0;
+    prefill_trace_set_us   = 0;
     int64_t t_reserve_us = 0;
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2535,12 +2541,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t d_rd = prefill_pf_n_read   >= rd0 ? prefill_pf_n_read   - rd0 : prefill_pf_n_read;
             std::set<llama_seq_id> seqs;
             for (const auto & t : batch_inp.tokens) seqs.insert(t.seq_ids.begin(), t.seq_ids.end());
-            LLAMA_LOG_WARN("%s: chunk-trace: %u tokens of %zu sequences, %u outputs, %s%s (%lld passes); reserve %.0f ms; prefetch uploads %lld reads %lld; %.0f ms\n",
+            LLAMA_LOG_WARN("%s: LLAMA_PREFILL_CHUNK_TRACE: %u tokens of %zu sequences, %u outputs, %s%s (%lld passes); reserve %.0f ms, graph builds %.0f ms, set_inputs %.0f ms; prefetch uploads %lld reads %lld; %.0f ms\n",
                     __func__, n_tokens_all, seqs.size(), n_outputs_all,
                     use_chunk ? "chunk path" : prefill_chunk < 2 ? "micro-batch path (chunk off)" :
                         n_tokens_all <= cparams.n_ubatch ? "micro-batch path (one ubatch)" : "micro-batch path: ",
                     !use_chunk && chunk_refusal ? chunk_refusal : "", (long long) (prefill_chunk_n_passes - n_passes_start),
-                    t_reserve_us/1000.0, (long long) d_up, (long long) d_rd, (ggml_time_us() - t_decode_start_us)/1000.0);
+                    t_reserve_us/1000.0, prefill_trace_build_us/1000.0, prefill_trace_set_us/1000.0, (long long) d_up, (long long) d_rd, (ggml_time_us() - t_decode_start_us)/1000.0);
         }
     }
 
