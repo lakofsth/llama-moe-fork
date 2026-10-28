@@ -154,6 +154,7 @@ static gguf_context_ptr get_gguf_ctx() {
 struct run_cfg {
     uint32_t c;        // 0: LLAMA_PREFILL_CHUNK unset
     uint32_t g;
+    bool     trace = false; // LLAMA_PREFILL_CHUNK_TRACE=1 for this run
 };
 
 struct scenario {
@@ -178,10 +179,15 @@ struct run_out {
     int64_t n_passes = 0;
     int64_t n_chunk_ub = 0; // ubatches the chunk path ran
     int64_t n_fill = 0, n_reuse = 0; // PREFILL-CHUNK-INPUTS
+    // LLAMA_PREFILL_CHUNK_TRACE (the last decode's): input classes timed, input bytes, tensor_set calls and bytes
+    size_t  tr_classes = 0; bool tr_mem_hybrid = false;
+    int64_t tr_input_bytes = 0, tr_ts_calls = 0, tr_ts_bytes = 0;
     bool    ok = true;
 };
 
 static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg, const std::vector<llama_token> & toks) {
+    // the trace (read per decode) is on for one configuration only: its runs must match the untraced baseline bit for bit
+    if (cfg.trace) setenv("LLAMA_PREFILL_CHUNK_TRACE", "1", 1); else unsetenv("LLAMA_PREFILL_CHUNK_TRACE");
     if (cfg.c == 0) {
         unsetenv("LLAMA_PREFILL_CHUNK");
         unsetenv("LLAMA_PREFILL_CHUNK_GROUP");
@@ -290,6 +296,11 @@ static run_out run(llama_model * model, const scenario & sc, const run_cfg & cfg
     out.n_passes = ctx->prefill_chunk_n_passes;
     out.n_chunk_ub = ctx->prefill_chunk_n_chunk_ubatch;
     out.n_fill   = ctx->prefill_chunk_input_cache.n_fill;
+    out.tr_classes     = ctx->prefill_trace_class_us.size();
+    for (const auto & kv : ctx->prefill_trace_class_us) out.tr_mem_hybrid |= kv.first.find("llm_graph_input_mem_hybrid") != std::string::npos;
+    out.tr_input_bytes = ctx->prefill_trace_input_bytes;
+    out.tr_ts_calls    = ctx->prefill_trace_ts_calls;
+    out.tr_ts_bytes    = ctx->prefill_trace_ts_bytes;
     out.n_reuse  = ctx->prefill_chunk_input_cache.n_reuse;
 
     llama_free(ctx);
@@ -353,7 +364,7 @@ int main(int argc, char ** argv) {
     };
 
     const std::vector<run_cfg> cfgs = {
-        { 2, 4 }, { 3, 4 }, { 5, 4 }, { 2, 1 }, { 3, 1 }, { 4, 8 }, { 3, 12 },
+        { 2, 4 }, { 3, 4 }, { 5, 4 }, { 2, 1, true }, { 3, 1 }, { 4, 8 }, { 3, 12 },
     };
 
     int n_fail = 0, n_check = 0;
@@ -420,6 +431,16 @@ int main(int argc, char ** argv) {
                 if (cfg.g >= N_LAYER && cur.n_reuse != 0) { ok = false; why += " input-reuse-with-one-pass"; }
             }
             if (base.n_fill != 0 || base.n_reuse != 0) { ok = false; why += " baseline-used-the-cache"; }
+
+            // the trace's split of set_inputs: filled when on (it times the mem_hybrid input, counts the input bytes and
+            // the tensor_set calls of the token and position inputs), empty when off
+            if (cfg.trace && cur.n_passes > 0) {
+                if (cur.tr_classes == 0 || !cur.tr_mem_hybrid) { ok = false; why += " trace-no-input-classes"; }
+                if (cur.tr_input_bytes <= 0)                     { ok = false; why += " trace-no-input-bytes"; }
+                if (cur.tr_ts_calls <= 0 || cur.tr_ts_bytes <= 0) { ok = false; why += " trace-no-tensor_set"; }
+                if (cur.tr_ts_bytes > cur.tr_input_bytes)        { ok = false; why += " trace-tensor_set-bytes>input-bytes"; }
+            }
+            if (!cfg.trace && (cur.tr_classes || cur.tr_input_bytes || cur.tr_ts_calls)) { ok = false; why += " trace-fields-set-while-off"; }
 
             // each ubatch applied once, as on the micro-batch path
             if (cur.n_apply != base.n_apply) { ok = false; why += " apply-count " + std::to_string(cur.n_apply) + "!=" + std::to_string(base.n_apply); }

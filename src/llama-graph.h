@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <string>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -970,6 +971,9 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // fork (LLAMA_PREFILL_CHUNK_TRACE): when set, set_inputs adds each input's wall time to its class's entry
+    std::map<std::string, int64_t> * trace_us = nullptr;
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

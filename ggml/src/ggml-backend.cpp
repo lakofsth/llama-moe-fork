@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <string>
 
@@ -336,6 +337,19 @@ void ggml_backend_tensor_get_2d_async(ggml_backend_t backend, const struct ggml_
     backend->iface.get_tensor_2d_async(backend, tensor, data, offset, size, n_copies, stride_tensor, stride_data);
 }
 
+static std::atomic<bool>    g_ts_trace{false};
+static std::atomic<int64_t> g_ts_calls{0}, g_ts_bytes{0}, g_ts_us{0};
+
+void ggml_backend_tensor_set_trace(bool on) {
+    g_ts_trace = on;
+}
+
+void ggml_backend_tensor_set_trace_read(int64_t * calls, int64_t * bytes, int64_t * us) {
+    if (calls) *calls = g_ts_calls.exchange(0);
+    if (bytes) *bytes = g_ts_bytes.exchange(0);
+    if (us)    *us    = g_ts_us.exchange(0);
+}
+
 void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     GGML_ASSERT(tensor);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -347,6 +361,15 @@ void ggml_backend_tensor_set(struct ggml_tensor * tensor, const void * data, siz
 
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
+
+    if (g_ts_trace) {
+        const int64_t t0 = ggml_time_us();
+        buf->iface.set_tensor(buf, tensor, data, offset, size);
+        g_ts_us    += ggml_time_us() - t0;
+        g_ts_calls += 1;
+        g_ts_bytes += (int64_t) size;
+        return;
+    }
 
     buf->iface.set_tensor(buf, tensor, data, offset, size);
 }

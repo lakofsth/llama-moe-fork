@@ -449,6 +449,12 @@ public:
     // LLAMA_PREFILL_CHUNK_TRACE: graph build + alloc and set_inputs time within the current decode
     int64_t prefill_trace_build_us = 0;
     int64_t prefill_trace_set_us   = 0;
+    // and within set_inputs: per input class, its wall time; the bytes of the graph inputs set; ggml_backend_tensor_set's
+    // calls, bytes and wall time (a memcpy into pinned host memory for llama's inputs: no stream, no wait)
+    bool    prefill_trace_on = false;
+    std::map<std::string, int64_t> prefill_trace_class_us;
+    int64_t prefill_trace_input_bytes = 0;
+    int64_t prefill_trace_ts_calls = 0, prefill_trace_ts_bytes = 0, prefill_trace_ts_us = 0;
 
     struct input_record {
         int64_t              ubatch;

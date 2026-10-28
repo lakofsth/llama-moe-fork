@@ -25,6 +25,10 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
+#if defined(__GNUC__)
+#include <cxxabi.h>
+#endif
 #include <unordered_set>
 
 // fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP=1 orders a split MoE layer's GPU work ahead of its CPU branch so
@@ -1382,6 +1386,21 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    if (trace_us) {
+        for (auto & input : inputs) {
+            const int64_t t0 = ggml_time_us();
+            input->set_input(ubatch);
+            std::string name = typeid(*input).name();
+#if defined(__GNUC__)
+            int st = 0;
+            char * dm = abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &st);
+            if (st == 0 && dm) name = dm;
+            free(dm);
+#endif
+            (*trace_us)[name] += ggml_time_us() - t0;
+        }
+        return;
+    }
     for (auto & input : inputs) {
         input->set_input(ubatch);
     }

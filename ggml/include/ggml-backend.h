@@ -90,6 +90,10 @@ extern "C" {
 
     // "offset" refers to the offset in tensor->data for setting/getting data
     GGML_API void ggml_backend_tensor_set   (      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+    // fork (fork-chunk-loop, LLAMA_PREFILL_CHUNK_TRACE): while on, ggml_backend_tensor_set counts its calls, bytes and
+    // wall time (process-wide); _read returns them and starts again from 0
+    GGML_API void ggml_backend_tensor_set_trace(bool on);
+    GGML_API void ggml_backend_tensor_set_trace_read(int64_t * calls, int64_t * bytes, int64_t * us);
     GGML_API void ggml_backend_tensor_get   (const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
     GGML_API void ggml_backend_tensor_set_2d(      struct ggml_tensor * tensor, const void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
