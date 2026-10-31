@@ -1838,6 +1838,16 @@ static void ggml_compute_forward_mul_mat_id(
                 // another device's branch") — contribute zero and skip the mapping.
                 if (i02 < 0 || i02 >= n_as) {
                     memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
+                    // fork-strata-ports TAIL-SKIP: -1-e is a non-resident expert e the tail skip left uncomputed —
+                    // the router's cold demand for e all the same, counted as if it had run (llama-graph.cpp)
+                    if (online_il >= 0 && i02 < 0) {
+                        const int64_t e = -1 - (int64_t) i02;
+                        if (e < n_as && e < GGML_MOE_ONLINE_MAX_EXPERTS) {
+                            g_moe_online_counts[online_il][e]++;
+                            g_moe_online_total[online_il]++;
+                        }
+                        continue;
+                    }
                     if (online_il >= 0) {
                         g_moe_online_sentinel[online_il]++;
                         g_moe_online_total[online_il]++;

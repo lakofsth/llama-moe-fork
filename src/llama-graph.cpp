@@ -34,12 +34,117 @@
 #include <set>
 #endif
 #include <unordered_set>
+#include <atomic>
+#include <map>
+#include <mutex>
 
 // fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP=1 orders a split MoE layer's GPU work ahead of its CPU branch so
 // the scheduler can overlap them (ggml-backend.cpp, the overlap cut and eager copies read the same variable).
 bool llama_moe_overlap() {
     static const bool v = [] { const char * e = std::getenv("LLAMA_MOE_OVERLAP"); return e && std::atoi(e) != 0; }();
     return v;
+}
+
+// fork-strata-ports TAIL-SKIP (Avalon 510abcb1a GGML_CUDA_MOE_TAIL_SKIP = Strata STRATA_ROUTE_TAIL_SKIP), opt-in:
+// LLAMA_MOE_TAIL_SKIP=R (1 <= R < n_expert_used; unset or 0 = off, the graph is then exactly the one without this code).
+// In a split MoE layer of the main model, a NON-RESIDENT expert (one the CPU branch would compute) that every token of
+// the pass routes only at rank >= R (rank = its position in that token's top-k by router weight, 0 = heaviest) is not
+// computed: its CPU-branch ids become -1-e, which the CPU mul_mat_id zeroes and skips (as a sentinel) and the online
+// heat counter still counts as cold demand for e, so the repin sees the router's demand unchanged. The other experts
+// keep the weights the router gave them (no renormalisation). Decode-shaped passes only (fewer than 32 tokens: below
+// the op-offload batch, so the ids never reach a device kernel) and not the prefetch-slot path. Changes the output.
+int llama_moe_tail_skip_rank() {
+    static const int r = [] {
+        const char * e = std::getenv("LLAMA_MOE_TAIL_SKIP");
+        const int v = e ? std::atoi(e) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return r;
+}
+
+struct llama_moe_tail_skip_params {
+    int32_t rank;     // R
+    int32_t n_expert; // ids >= n_expert are sentinels (GPU-resident), < n_expert non-resident experts
+};
+
+static std::atomic<int64_t> g_moe_tail_skip_experts{0}, g_moe_tail_skip_rows{0}, g_moe_tail_skip_cold_rows{0};
+
+void llama_moe_tail_skip_counts(int64_t * experts, int64_t * rows, int64_t * cold_rows) {
+    if (experts)   *experts   = g_moe_tail_skip_experts.load();
+    if (rows)      *rows      = g_moe_tail_skip_rows.load();
+    if (cold_rows) *cold_rows = g_moe_tail_skip_cold_rows.load();
+}
+
+// dst, ids: I32 [n_expert_used, n_tokens] (CPU-branch ids: < n_expert = non-resident expert, >= n_expert = sentinel);
+// w: F32 router weights [1, n_expert_used, n_tokens] in the same slot order
+void llama_moe_tail_skip_apply(ggml_tensor * dst, const ggml_tensor * ids, const ggml_tensor * w, int ith, int nth,
+                               void * userdata) {
+    (void) nth;
+    if (ith != 0) {
+        return;
+    }
+    const auto * p = (const llama_moe_tail_skip_params *) userdata;
+    const int64_t k = ids->ne[0], n_tok = ids->ne[1];
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32 && w->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->ne[0] == 1 && w->ne[1] == k && w->ne[2] == n_tok);
+    auto id_at = [&](int64_t t, int64_t q) -> int32_t & {
+        return *(int32_t *) ((char *) dst->data + t*dst->nb[1] + q*dst->nb[0]);
+    };
+    auto w_at = [&](int64_t t, int64_t q) {
+        return *(const float *) ((const char *) w->data + t*w->nb[2] + q*w->nb[1]);
+    };
+    thread_local std::vector<uint8_t> head, cold;
+    head.assign(p->n_expert, 0);
+    cold.assign(p->n_expert, 0);
+    thread_local std::vector<int32_t> rank;
+    rank.resize(k * n_tok);
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t q = 0; q < k; ++q) {
+            id_at(t, q) = *(const int32_t *) ((const char *) ids->data + t*ids->nb[1] + q*ids->nb[0]);
+            // rank by weight within the token: heavier slots, and equal ones earlier in the row, come first
+            const float wq = w_at(t, q);
+            int32_t r = 0;
+            for (int64_t q2 = 0; q2 < k; ++q2) {
+                const float w2 = w_at(t, q2);
+                r += (w2 > wq || (w2 == wq && q2 < q)) ? 1 : 0;
+            }
+            rank[t*k + q] = r;
+            const int32_t e = id_at(t, q);
+            if (e >= 0 && e < p->n_expert) {
+                cold[e] = 1;
+                if (r < p->rank) {
+                    head[e] = 1;
+                }
+            }
+        }
+    }
+    int64_t n_skip_e = 0, n_skip_r = 0, n_cold_r = 0;
+    for (int32_t e = 0; e < p->n_expert; ++e) {
+        n_skip_e += cold[e] && !head[e];
+    }
+    for (int64_t t = 0; t < n_tok; ++t) {
+        for (int64_t q = 0; q < k; ++q) {
+            int32_t & e = id_at(t, q);
+            if (e >= 0 && e < p->n_expert) {
+                n_cold_r++;
+                if (!head[e]) {
+                    e = -1 - e;
+                    n_skip_r++;
+                }
+            }
+        }
+    }
+    g_moe_tail_skip_experts   += n_skip_e;
+    g_moe_tail_skip_cold_rows += n_cold_r;
+    static std::atomic<int64_t> next_log{20000};
+    const int64_t rows = (g_moe_tail_skip_rows += n_skip_r);
+    if (rows >= next_log.load()) {
+        next_log += 20000;
+        // WARN on purpose: the served default log level hides INFO, and a measuring run reads this line
+        LLAMA_LOG_WARN("moe tail skip (rank >= %d): %lld non-resident experts skipped, %lld of %lld non-resident rows "
+                       "since the start\n", p->rank, (long long) g_moe_tail_skip_experts.load(), (long long) rows,
+                       (long long) g_moe_tail_skip_cold_rows.load());
+    }
 }
 
 // dedup helpers
@@ -2438,7 +2543,28 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         // owns the process-wide counters gets that name (see llama_model::moe_online_owner)
         // under the prefetch (LLAMA_MOE_PREFETCH_PP) the ids are compact slot indices, named for the scheduler's plan;
         // the online counters do not see them (as the stock upload path's prompt traffic is not counted either)
-        cb(ids_cpu, use_pf ? "ffn_moe_ids_pf" : msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc", il);
+        const char * ids_cpu_name = use_pf ? "ffn_moe_ids_pf" : msplit->online_counted ? "ffn_moe_ids_cpu" : "ffn_moe_ids_cpu_nc";
+        cb(ids_cpu, ids_cpu_name, il);
+        // fork-strata-ports TAIL-SKIP (opt-in, see llama_moe_tail_skip_rank): the CPU branch reads the skip's ids, and
+        // they carry the name the online counter and the scheduler key on; the router's ids keep a name of their own
+        ggml_tensor * ids_cpu_use = ids_cpu;
+        {
+            const int ts_rank = llama_moe_tail_skip_rank();
+            if (ts_rank > 0 && ts_rank < (int) n_expert_used && !use_pf && n_tokens < 32 && il >= 0 &&
+                il < (int) hparams.n_layer()) {
+                static std::mutex ts_mutex;
+                static std::map<int64_t, llama_moe_tail_skip_params> ts_params; // stable addresses for the op's userdata
+                llama_moe_tail_skip_params * ud;
+                {
+                    std::lock_guard<std::mutex> lock(ts_mutex);
+                    ud = &ts_params.emplace((int64_t) ts_rank << 32 | (uint32_t) n_expert,
+                                            llama_moe_tail_skip_params{ (int32_t) ts_rank, (int32_t) n_expert }).first->second;
+                }
+                cb(ids_cpu, "ffn_moe_ids_route", il);
+                ids_cpu_use = ggml_map_custom2(ctx0, ids_cpu, weights, llama_moe_tail_skip_apply, 1, ud);
+                cb(ids_cpu_use, ids_cpu_name, il);
+            }
+        }
         // The dummy-0 encoding (a CPU-resident slot re-labelled as packed expert 0, weight-masked)
         // is a contract only the quantized kernels honour: mmvq/mmq compute every (token, slot)
         // pair. mmf — the path for F16/BF16/F32 experts up to 16 tokens — keeps ONE slot per
@@ -2483,7 +2609,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         moe_overlap_extra = nullptr;
-        ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, arch, hparams, cur, ids_cpu,
+        ggml_tensor * ex_cpu = moe_ffn_chain_ds4(ctx0, arch, hparams, cur, ids_cpu_use,
                 up_exps, gate_exps, down_exps, gate_up_exps, type_op,
                 msplit->up_b_cpu, msplit->gate_b_cpu, msplit->down_b_cpu, il);
         cb(ex_cpu, "ffn_moe_split_cpu", il);

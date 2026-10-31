@@ -291,3 +291,15 @@ One sentence per invariant; each names the test that pins it.
   measured path — reuse or rebuild of the llama graph and scheduler plan, CUDA graph launch, capture or eager — and
   therefore every output token is the same as with neither set. Evidence is the temperature-0 identity run of the
   measuring unit (instrument on vs the served binary), not a unit test: the counters sit inside the server's graph path.
+
+- **TAIL-SKIP (fork-strata-ports, Avalon 510abcb1a = Strata STRATA_ROUTE_TAIL_SKIP, 2026-11-01; opt-in, Thomas
+  2026-10-31: "port as an OPT-IN dial, default OFF").** With LLAMA_MOE_TAIL_SKIP unset or 0 the split MoE graph is the
+  one built without the dial (same nodes, same names), so output is bit-identical to the base. With
+  LLAMA_MOE_TAIL_SKIP=R (1 <= R < n_expert_used), in a decode-shaped pass (fewer than 32 tokens, not the prefetch-slot
+  path) of a main-model split layer, a non-resident expert that every token of the pass routes only at rank >= R (rank by
+  router weight within the token, ties by slot) is not computed: its CPU-branch ids become -1-e, the CPU mul_mat_id
+  zeroes those rows, and every other expert — resident, or non-resident with any rank < R use in the pass — is computed
+  with the router's weight (no renormalisation). The online heat counter counts a -1-e slot as cold demand for e, never
+  as a resident hit, so the repin's view of the router is unchanged by the dial. Pinned by `tests/test-moe-tail-skip.cpp`
+  (the rule on a pass whose slot order is not its weight order; the CPU op's zeroing and counting of -1-e); the
+  bit-identity of the default is the measuring unit's temperature-0 run against the served binary.

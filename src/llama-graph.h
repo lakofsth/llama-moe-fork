@@ -956,6 +956,13 @@ struct llm_graph_params {
 // fork (fork-kernel-fusion): LLAMA_MOE_OVERLAP=1, see llama-graph.cpp
 bool llama_moe_overlap();
 
+// fork-strata-ports TAIL-SKIP: LLAMA_MOE_TAIL_SKIP=R (0 / unset = off), see llama-graph.cpp
+int  llama_moe_tail_skip_rank();
+void llama_moe_tail_skip_apply(ggml_tensor * dst, const ggml_tensor * ids, const ggml_tensor * w, int ith, int nth,
+                               void * userdata);
+void llama_moe_tail_skip_counts(int64_t * experts, int64_t * rows, int64_t * cold_rows);
+struct llama_moe_tail_skip_params;
+
 struct llm_graph_fused_node {
     llm_fused_op op;
     ggml_tensor * tensor;
