@@ -1,4 +1,6 @@
 #include "llama-graph.h"
+
+#include <typeinfo>
 #include "llama-moe-prefetch-policy.h"
 
 #include "llama-impl.h"
@@ -1468,7 +1470,13 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    reuse_refusal.clear();
     if (!this->params.allow_reuse(params)) {
+        // GRAPH-STATS: the coarse reason (what a shape-keyed graph cache would key on)
+        reuse_refusal = this->params.ubatch.n_tokens != params.ubatch.n_tokens ? "params:n_tokens"
+                      : this->params.ubatch.n_seqs_unq != params.ubatch.n_seqs_unq ? "params:n_seqs"
+                      : this->params.n_outputs != params.n_outputs ? "params:n_outputs"
+                      : "params:other";
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1484,6 +1492,10 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+
+        if (!cur && reuse_refusal.empty()) {
+            reuse_refusal = typeid(*input).name();
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);

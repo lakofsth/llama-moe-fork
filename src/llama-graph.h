@@ -996,6 +996,9 @@ public:
     // return true if the graph was updated and can be reused
     bool can_reuse(const llm_graph_params & params);
 
+    // fork GRAPH-STATS: why the last can_reuse() returned false ("params", or the first refusing input's type)
+    std::string reuse_refusal;
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);

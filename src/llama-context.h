@@ -426,6 +426,25 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // fork GRAPH-STATS: env LLAMA_GRAPH_STATS=<seconds> logs one WARN line per period per context with how often the
+    // llama graph (build_graph) and the scheduler plan (sched_reset + sched_alloc_graph: split + alloc) were rebuilt,
+    // and their host time, against the wall time of the decode calls they belong to. "small" = a ubatch of at most
+    // graph_stats_small_max tokens (decode steps: target verify windows and draft passes); "large" = prefill.
+    // Read-only bookkeeping: it changes no decision of the path it measures.
+    static constexpr uint32_t graph_stats_small_max = 32;
+    struct graph_stats_t {
+        int64_t period_us = 0; // 0 = off
+        int64_t t_last_us = 0;
+        int64_t n_dec_small = 0, us_dec_small = 0;           // decode() calls whose batch is small, and their wall
+        int64_t n_ub_small = 0, n_reuse_small = 0, n_build_small = 0;
+        int64_t us_graph_small = 0, us_plan_small = 0;       // build_graph, sched reset + alloc
+        int64_t n_ub_large = 0, n_build_large = 0, us_build_large = 0;
+        std::map<std::string, int64_t>  why;                  // small rebuilds by cause
+        std::map<std::string, int64_t>  shapes;               // small rebuilds by "tokens/outputs/seqs"
+        std::set<std::string>           seen;                 // distinct small shapes (process lifetime)
+    } gstats;
+    void graph_stats_tick();
+
     // fork: env LLAMA_PREFILL_CHUNK=C (0 = off) and LLAMA_PREFILL_CHUNK_GROUP=G (layers per pass)
     uint32_t prefill_chunk   = 0;
     uint32_t prefill_chunk_g = 0;

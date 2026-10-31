@@ -285,3 +285,9 @@ One sentence per invariant; each names the test that pins it.
   the first node's address, as upstream. Pinned by `tests/test-cuda-graph-key.cpp` (alternating shapes and
   alternating data buffers at the same node addresses, every round against the CPU backend, key off and on; more
   rounds served by a launched graph with the key on; red with the key ignoring shape, and with the comparison skipped).
+
+- **GRAPH-STATS (fork-strata-ports, Avalon port measurement, 2026-11-01).** LLAMA_GRAPH_STATS=<seconds> (llama) and
+  the host-time buckets of GGML_CUDA_GRAPH_STATS (CUDA) only count and time: with either set, every decision of the
+  measured path — reuse or rebuild of the llama graph and scheduler plan, CUDA graph launch, capture or eager — and
+  therefore every output token is the same as with neither set. Evidence is the temperature-0 identity run of the
+  measuring unit (instrument on vs the served binary), not a unit test: the counters sit inside the server's graph path.

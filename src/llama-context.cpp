@@ -16,6 +16,7 @@
 #include "llama-moe-prefetch-policy.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <map>
 #include <cmath>
@@ -318,6 +319,12 @@ llama_context::llama_context(
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
+    }
+
+    {
+        // GRAPH-STATS
+        const char * e = getenv("LLAMA_GRAPH_STATS");
+        gstats.period_us = e ? (int64_t) atoi(e) * 1000000 : 0;
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
@@ -1566,6 +1573,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype, range);
 
+    const bool gs_on    = gstats.period_us > 0;
+    const bool gs_small = ubatch.n_tokens <= graph_stats_small_max;
+    const bool gs_was_active = gf_res_prev_active == res;
+    if (gs_on) {
+        (gs_small ? gstats.n_ub_small : gstats.n_ub_large)++;
+    }
+
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
@@ -1577,8 +1591,22 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        if (gs_on && gs_small) {
+            gstats.n_reuse_small++;
+        }
     } else {
         const int64_t t_build0 = ggml_time_us();
+        if (gs_on && gs_small) {
+            const std::string why = graph_reuse_disable ? "reuse-disabled"
+                                  : !gs_was_active      ? (gf_res_prev_active ? "other-arena" : "inactive")
+                                  : res->reuse_refusal.empty() ? "unknown" : res->reuse_refusal;
+            gstats.why[why]++;
+            const std::string shape = std::to_string(ubatch.n_tokens) + "/" + std::to_string(gparams.n_outputs) + "/" +
+                                      std::to_string(ubatch.n_seqs_unq);
+            gstats.shapes[shape]++;
+            gstats.seen.insert(shape);
+        }
+        int64_t t_graph0 = 0, t_graph1 = 0;
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1587,7 +1615,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        t_graph0 = ggml_time_us();
         gf = model.build_graph(gparams);
+        t_graph1 = ggml_time_us();
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1604,7 +1634,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
-        prefill_trace_build_us += ggml_time_us() - t_build0;
+        const int64_t t_build1 = ggml_time_us();
+        prefill_trace_build_us += t_build1 - t_build0;
+        if (gs_on) {
+            if (gs_small) {
+                gstats.n_build_small++;
+                gstats.us_graph_small += t_graph1 - t_graph0;
+                gstats.us_plan_small  += (t_build1 - t_build0) - (t_graph1 - t_graph0);
+            } else {
+                gstats.n_build_large++;
+                gstats.us_build_large += t_build1 - t_build0;
+            }
+        }
     }
 
     // set the input data for the input tensors
@@ -2101,6 +2142,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     prefill_trace_input_bytes = 0;
     prefill_trace_ts_calls = prefill_trace_ts_bytes = prefill_trace_ts_us = 0;
     int64_t t_reserve_us = 0;
+    // GRAPH-STATS: the wall of a small decode, on every return path
+    struct gstats_guard {
+        llama_context * ctx; bool on; int64_t t0;
+        ~gstats_guard() {
+            if (on) {
+                ctx->gstats.n_dec_small++;
+                ctx->gstats.us_dec_small += ggml_time_us() - t0;
+                ctx->graph_stats_tick();
+            }
+        }
+    } gs_guard { this, gstats.period_us > 0 && batch_inp.tokens.size() <= graph_stats_small_max,
+                 gstats.period_us > 0 ? ggml_time_us() : 0 };
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
@@ -5206,6 +5259,42 @@ int llama_context::encode(const llama_batch & batch_inp) {
 int llama_context::decode(const llama_batch & batch_inp) {
     llama_batch_compat compat(this, batch_inp);
     return decode(*compat.batch_ext);
+}
+
+void llama_context::graph_stats_tick() {
+    const int64_t now = ggml_time_us();
+    if (gstats.t_last_us == 0) {
+        gstats.t_last_us = now;
+        return;
+    }
+    if (now - gstats.t_last_us < gstats.period_us) {
+        return;
+    }
+    auto & g = gstats;
+    const double build_ms = (g.us_graph_small + g.us_plan_small) / 1e3;
+    LLAMA_LOG_WARN("graph-stats[%p n_ctx %u]: %.0f s small(<=%u): decodes %lld wall %.1f ms, ubatches %lld reused %lld "
+                   "rebuilt %lld, build_graph %.1f ms + sched plan %.1f ms = %.1f ms (%.3f ms/rebuild, %.2f%% of decode "
+                   "wall), distinct shapes %zu; large: ubatches %lld rebuilt %lld build %.1f ms\n",
+                   (void *) this, cparams.n_ctx, (now - g.t_last_us) / 1e6, graph_stats_small_max,
+                   (long long) g.n_dec_small, g.us_dec_small / 1e3, (long long) g.n_ub_small, (long long) g.n_reuse_small,
+                   (long long) g.n_build_small, g.us_graph_small / 1e3, g.us_plan_small / 1e3, build_ms,
+                   g.n_build_small ? build_ms / g.n_build_small : 0.0,
+                   g.us_dec_small ? 100.0 * (g.us_graph_small + g.us_plan_small) / g.us_dec_small : 0.0,
+                   g.seen.size(), (long long) g.n_ub_large, (long long) g.n_build_large, g.us_build_large / 1e3);
+    std::string why, shapes;
+    for (auto & kv : g.why)    why    += " " + kv.first + "=" + std::to_string(kv.second);
+    std::vector<std::pair<int64_t, std::string>> v;
+    for (auto & kv : g.shapes) v.emplace_back(kv.second, kv.first);
+    std::sort(v.rbegin(), v.rend());
+    for (size_t i = 0; i < v.size() && i < 12; ++i) shapes += " " + v[i].second + "=" + std::to_string(v[i].first);
+    LLAMA_LOG_WARN("graph-stats[%p]: rebuild cause:%s; rebuilt shape tokens/outputs/seqs:%s\n", (void *) this,
+                   why.c_str(), shapes.c_str());
+    const auto seen = std::move(g.seen);
+    const int64_t period = g.period_us;
+    g = graph_stats_t();
+    g.period_us = period;
+    g.seen      = seen;
+    g.t_last_us = now;
 }
 
 ///

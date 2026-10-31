@@ -2648,6 +2648,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 struct ggml_cuda_graph_stats {
     std::atomic<uint64_t> computes{0}, incompatible{0}, eager{0}, resets{0}, captures{0}, instantiates{0},
                           update_fails{0}, launches{0};
+    // host us of ggml_backend_cuda_graph_compute by path: a warm graph launched, a capture (+instantiate/update),
+    // an eager (no graph) run
+    std::atomic<uint64_t> us_launch{0}, us_capture{0}, us_eager{0}, n_launch_only{0};
     std::atomic<int64_t>  last_print_us{0};
     std::atomic<size_t>   keys{0};
 };
@@ -2696,6 +2699,12 @@ static void ggml_cuda_graph_stats_tick() {
                   (unsigned long long) st.captures.exchange(0), (unsigned long long) st.instantiates.exchange(0),
                   (unsigned long long) st.update_fails.exchange(0), (unsigned long long) st.launches.exchange(0),
                   st.keys.load());
+    {
+        const uint64_t nl = st.n_launch_only.exchange(0), ul = st.us_launch.exchange(0), uc = st.us_capture.exchange(0),
+                       ue = st.us_eager.exchange(0);
+        GGML_LOG_WARN("cuda-graph-stats: host ms: warm launch %.1f (%llu, %.3f ms each), capture %.1f, eager %.1f\n",
+                      ul / 1e3, (unsigned long long) nl, nl ? ul / 1e3 / nl : 0.0, uc / 1e3, ue / 1e3);
+    }
     std::string top;
     {
         std::lock_guard<std::mutex> lock(g_cuda_graph_change_mutex);
@@ -4703,7 +4712,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    const int64_t t_eval0 = ggml_cuda_graph_stats_period_us() > 0 ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (t_eval0) {
+        const uint64_t dt = (uint64_t) (ggml_time_us() - t_eval0);
+        if (!use_cuda_graph) {
+            g_cuda_graph_stats.us_eager.fetch_add(dt, std::memory_order_relaxed);
+        } else if (cuda_graph_update_required) {
+            g_cuda_graph_stats.us_capture.fetch_add(dt, std::memory_order_relaxed);
+        } else {
+            g_cuda_graph_stats.us_launch.fetch_add(dt, std::memory_order_relaxed);
+            g_cuda_graph_stats.n_launch_only.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
 
     return GGML_STATUS_SUCCESS;
 }
