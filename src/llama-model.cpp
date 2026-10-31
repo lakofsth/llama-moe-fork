@@ -1351,10 +1351,28 @@ static void llama_model_pin_host_experts(const std::vector<std::pair<ggml_contex
         return;
     }
     const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+    // measurement knob (fork-strata-ports, 2026-11-01): GGML_CUDA_REGISTER_HOST_EXTRA=<substring>[,...] pins those host
+    // tensors too. For a private server whose uid has no RLIMIT_MEMLOCK for LLAMA_MLOCK_TENSORS: registering the PLE
+    // table keeps it resident the way the resident's mlock does (the driver pins without the rlimit). Unset = as before.
+    std::vector<std::string> extra;
+    if (const char * x = getenv("GGML_CUDA_REGISTER_HOST_EXTRA")) {
+        for (const char * q = x; *q; ) {
+            const char * c = strchr(q, ',');
+            const std::string tok = c ? std::string(q, c - q) : std::string(q);
+            if (!tok.empty()) extra.push_back(tok);
+            if (!c) break;
+            q = c + 1;
+        }
+    }
+    auto wanted = [&](const char * name) {
+        if (strstr(name, "_exps") != nullptr) return true;
+        for (const auto & e : extra) if (strstr(name, e.c_str()) != nullptr) return true;
+        return false;
+    };
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
     for (const auto & [ctx, bufs] : ctxs_bufs) {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-            if (!t->buffer || !t->data || !ggml_backend_buffer_is_host(t->buffer) || strstr(t->name, "_exps") == nullptr) {
+            if (!t->buffer || !t->data || !ggml_backend_buffer_is_host(t->buffer) || !wanted(t->name)) {
                 continue;
             }
             const uintptr_t b = (uintptr_t) t->data & ~(page - 1);
@@ -1383,7 +1401,8 @@ static void llama_model_pin_host_experts(const std::vector<std::pair<ggml_contex
             n_fail++;
         }
     }
-    LLAMA_LOG_INFO("%s: pinned %.1f MiB of host expert weights in %zu ranges (%zu tensors) in %.1f s; %d ranges (%.1f MiB) failed\n",
+    llama_log_internal(extra.empty() ? GGML_LOG_LEVEL_INFO : GGML_LOG_LEVEL_WARN, // the knob's run reads this line
+                   "%s: pinned %.1f MiB of host expert weights in %zu ranges (%zu tensors) in %.1f s; %d ranges (%.1f MiB) failed\n",
                    __func__, ok_bytes / 1048576.0, pinned.size(), ranges.size(), (ggml_time_us() - t0) / 1e6, n_fail, fail_bytes / 1048576.0);
 }
 
