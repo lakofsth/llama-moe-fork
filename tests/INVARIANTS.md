@@ -317,4 +317,9 @@ One sentence per invariant; each names the test that pins it.
   chunk range. LLAMA_GRAPH_KEEP_PLANS=0 turns it off. Pinned by `tests/test-sched-plan.cpp` (two graphs alternating on
   one scheduler with host-weight input copies across a GPU and a CPU split, every round against host arithmetic; no
   restore after the buffers are replaced, after plan_forget, and the aside plan survives a rebuild of the current graph);
+  the llama-level conditions by `tests/test-plan-restore.cpp` (a tiny CPU llama context alternating the two arenas: a
+  graph that reads the placement is not restored once the epoch its plan was kept at has moved, and is restored when it
+  has not; a graph that does not read it is restored across a move; graph_plans_clear drops the keys and the
+  scheduler's plans; and the plan-dropping sites, derived from src/llama-context.cpp at run time, are each exercised —
+  the epoch bumps themselves need a GPU heat split and are not reached there);
   end to end, the temperature-0 identity run against the served binary (b87cdc6ba) in the measuring unit.
