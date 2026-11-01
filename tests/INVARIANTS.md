@@ -323,3 +323,13 @@ One sentence per invariant; each names the test that pins it.
   scheduler's plans; and the plan-dropping sites, derived from src/llama-context.cpp at run time, are each exercised —
   the epoch bumps themselves need a GPU heat split and are not reached there);
   end to end, the temperature-0 identity run against the served binary (b87cdc6ba) in the measuring unit.
+
+- **LAYER-WALK (fork-plan-per-arena, fix for the saver and opt_init segfault, 2026-11-01).** No code walks llama_layer
+  (or any struct) by reinterpreting it as an array of ggml_tensor pointers; every walk over a layer's tensors
+  enumerates them from a source that cannot include a non-tensor member — the model's registry of the tensors it
+  created (llama_model::tensors_by_name), which llama_model_saver::add_tensors_from_model and llama_opt_init now read.
+  Sites derived from the code: `tests/test-layer-walk.cpp` scans every source file under src/ and refuses a cast to a
+  ggml_tensor pointer-to-pointer type and `sizeof(...)/sizeof(ggml_tensor *)` arithmetic (one side: a walk in another
+  shape is not recognised; the test proves both patterns match the removed walks and that the scan reached their
+  files). Behaviourally pinned by test-generate-models (SEGFAULT in gguf_find_tensor at 2e9b89a34, green after), which
+  is the fixture of test-recurrent-state-rollback (and its nemotron-h, dsv4, kimi-k3 variants) and test-save-load-state.

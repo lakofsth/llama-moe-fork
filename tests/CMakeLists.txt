@@ -278,6 +278,7 @@ llama_build_and_test(test-cuda-graph-key.cpp) # fork-strata-ports: CUDA graph ca
 llama_build_and_test(test-moe-tail-skip.cpp) # fork-strata-ports: Avalon/Strata tail skip of low-rank non-resident experts, opt-in (TAIL-SKIP)
 llama_build_and_test(test-sched-plan.cpp) # fork-strata-ports: a kept scheduler plan computes what a fresh split does; never restored past a buffer change (PLAN-PER-ARENA)
 llama_build_and_test(test-plan-restore.cpp ARGS ${PROJECT_SOURCE_DIR}/src/llama-context.cpp) # fork-strata-ports: llama_context restores a kept plan only at its placement epoch if its graph reads the placement; every plan-dropping site drops (PLAN-PER-ARENA)
+llama_build_and_test(test-layer-walk.cpp ARGS ${PROJECT_SOURCE_DIR}/src) # fork: no struct walked as an array of ggml_tensor pointers (LAYER-WALK)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

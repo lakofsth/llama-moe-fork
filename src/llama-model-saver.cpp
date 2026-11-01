@@ -499,17 +499,23 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_up);
 
     // looped architectures alias physical tensors across cache slots; save each
-    // tensor once. a different tensor with an existing name still asserts below
+    // tensor once
     std::unordered_set<const struct ggml_tensor *> seen;
 
-    for (const struct llama_layer & layer : model->layers) {
-        for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
-            const struct ggml_tensor * tensor = reinterpret_cast<const struct ggml_tensor * const *>(&layer)[i];
-            if (tensor == nullptr || !seen.insert(tensor).second) {
-                continue;
-            }
-            add_tensor(tensor);
+    // the per-layer tensors come from the model's own registry of the tensors it created
+    // (tensors_by_name), never from reading llama_layer as an array of tensor pointers:
+    // llama_layer holds non-tensor members (llama_moe_split's vectors, device, flags), so such
+    // a walk reads garbage as tensors (LAYER-WALK, tests/INVARIANTS.md). The registry holds
+    // exactly the tensors the loader expects in the file; a name already added is a
+    // TENSOR_DUPLICATED copy (the tied output, per-layer rope factors) and is saved once.
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        if (tensor == nullptr || !seen.insert(tensor).second) {
+            continue;
         }
+        if (gguf_find_tensor(gguf_ctx, tensor->name) >= 0) {
+            continue;
+        }
+        add_tensor(tensor);
     }
 }
 

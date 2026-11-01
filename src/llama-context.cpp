@@ -4527,10 +4527,11 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     llama_set_param(model->cls_out_b,       param_filter, param_filter_ud);
     llama_set_param(model->cls_norm,        param_filter, param_filter_ud);
 
-    for (struct llama_layer & layer : model->layers) {
-        for (size_t i = 0; i < sizeof(layer)/sizeof(struct ggml_tensor *); ++i) {
-            llama_set_param(reinterpret_cast<struct ggml_tensor **>(&layer)[i], param_filter, param_filter_ud);
-        }
+    // per-layer tensors from the model's registry of the tensors it created, never by reading
+    // llama_layer as an array of tensor pointers: it holds non-tensor members (llama_moe_split)
+    // (LAYER-WALK, tests/INVARIANTS.md)
+    for (const auto & [name, tensor] : model->tensors_by_name) {
+        llama_set_param(tensor, param_filter, param_filter_ud);
     }
 }
 
