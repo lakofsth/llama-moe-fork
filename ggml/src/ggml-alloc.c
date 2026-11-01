@@ -493,6 +493,10 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    // fork (PLAN-PER-ARENA): bumped whenever a buffer is freed or replaced, so an allocation made before it (a graph a
+    // scheduler kept aside, ggml_backend_sched_plan_*) is known to point into memory that may no longer exist
+    uint64_t generation;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -933,6 +937,7 @@ static bool ggml_gallocr_reserve_n_impl(
             }
 #endif
             ggml_vbuffer_free(galloc->buffers[i]);
+            galloc->generation++;
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
@@ -1095,6 +1100,10 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     }
 
     return true;
+}
+
+uint64_t ggml_gallocr_get_generation(ggml_gallocr_t galloc) {
+    return galloc->generation;
 }
 
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {

@@ -17,6 +17,7 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <map>
 #include <cmath>
@@ -29,6 +30,11 @@
 //
 // llama_context
 //
+
+// fork (fork-strata-ports, PLAN-PER-ARENA): the MoE placement epoch, process-wide (every context sees the trunk's
+// rounds). Moved by every repin and adaptive-tier round that swapped at least one expert slot; a kept scheduler plan
+// (llama_context::gf_plan_epoch) of a graph that reads the placement, made at another epoch, is never restored.
+static std::atomic<uint64_t> g_moe_placement_epoch{0};
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -316,6 +322,10 @@ llama_context::llama_context(
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
 
+        {
+            const char * e = getenv("LLAMA_GRAPH_KEEP_PLANS");
+            graph_keep_plans = e ? atoi(e) != 0 : true;
+        }
         if (graph_reuse_disable) {
             LLAMA_LOG_WARN("%s: graph reuse disabled\n", __func__);
         }
@@ -790,6 +800,7 @@ void llama_context::sched_reserve() {
     }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    gf_plan_key = {0, 0}; // a new scheduler follows: nothing it could restore
 
     new_sched(max_nodes, cparams.pipeline_parallel);
 
@@ -1026,6 +1037,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        graph_plans_clear();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1566,6 +1578,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    const int arena = n_outputs > 0; // the index get_gf_res_prev uses
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
@@ -1576,6 +1589,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool gs_on    = gstats.period_us > 0;
     const bool gs_small = ubatch.n_tokens <= graph_stats_small_max;
     const bool gs_was_active = gf_res_prev_active == res;
+    // PLAN-PER-ARENA: decode-sized graphs keep their scheduler plan across the other arena's runs
+    const bool keep_plan = graph_keep_plans && !graph_reuse_disable && !cparams.pipeline_parallel && range == nullptr &&
+                           ubatch.n_tokens <= graph_stats_small_max;
+    std::string plan_why; // GRAPH-STATS: why a kept plan was not restored ("" = none was kept)
     if (gs_on) {
         (gs_small ? gstats.n_ub_small : gstats.n_ub_large)++;
     }
@@ -1594,11 +1611,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         if (gs_on && gs_small) {
             gstats.n_reuse_small++;
         }
+    } else if (plan_restore(arena, res, gparams, keep_plan, plan_why)) {
+        // PLAN-PER-ARENA: the other arena ran last; this arena's graph is intact and its scheduler plan was kept, so it
+        // is current again with no build, split or allocation (its inputs are set below, as on any reuse)
+        gf_res_prev_active = res;
+        gf = res->get_gf();
+        n_reused++;
+        if (gs_on && gs_small) {
+            gstats.n_reuse_small++;
+            gstats.n_restore_small++;
+        }
     } else {
         const int64_t t_build0 = ggml_time_us();
         if (gs_on && gs_small) {
             const std::string why = graph_reuse_disable ? "reuse-disabled"
-                                  : !gs_was_active      ? (gf_res_prev_active ? "other-arena" : "inactive")
+                                  : !gs_was_active      ? (gf_res_prev_active ? "other-arena" + plan_why : "inactive")
                                   : res->reuse_refusal.empty() ? "unknown" : res->reuse_refusal;
             gstats.why[why]++;
             const std::string shape = std::to_string(ubatch.n_tokens) + "/" + std::to_string(gparams.n_outputs) + "/" +
@@ -1608,6 +1635,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
         int64_t t_graph0 = 0, t_graph1 = 0;
         gf_res_prev_active = nullptr;
+        // PLAN-PER-ARENA: this arena's graph is about to be freed, so a plan kept for it would name freed tensors
+        ggml_backend_sched_plan_forget(sched.get(), gf_plan_key[arena]);
+        gf_plan_key[arena] = 0;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1634,6 +1664,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+        if (keep_plan) {
+            gf_plan_key[arena]   = ++gf_plan_serial;
+            gf_plan_epoch[arena] = g_moe_placement_epoch.load(std::memory_order_relaxed);
+            ggml_backend_sched_plan_set(sched.get(), gf_plan_key[arena]);
+        }
         const int64_t t_build1 = ggml_time_us();
         prefill_trace_build_us += t_build1 - t_build0;
         if (gs_on) {
@@ -2829,6 +2864,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     int64_t h = 0, t = 0;
                     const int sw = const_cast<llama_model &>(model).moe_heat_adapt(&h, &t, async ? moe_adapt_io.get() : nullptr);
                     if (sw >= 0) { win_hits += h; win_tot += t; win_swaps += sw; moe_adapt_n_swaps += sw; }
+                    if (sw > 0) { g_moe_placement_epoch.fetch_add(1, std::memory_order_relaxed); } // PLAN-PER-ARENA
                     moe_adapt_n_rounds++;
                 }
                 if (++moe_since_check >= 64) {
@@ -2975,6 +3011,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     if (repin) {
                         synchronize();
                         const int swapped = const_cast<llama_model &>(model).moe_heat_repin();
+                        if (swapped > 0) { g_moe_placement_epoch.fetch_add(1, std::memory_order_relaxed); } // PLAN-PER-ARENA
                         if (swapped >= 0) {
                             if (gain >= 0.0) {
                                 LLAMA_LOG_WARN("moe-heat-online: hit-rate %.1f%%, projected gain %.1f pts >= %.1f -> repinned %d expert slots%s\n",
@@ -3340,6 +3377,38 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+// PLAN-PER-ARENA: make arena's graph current again from its kept scheduler plan. True only when the other arena ran
+// last, this arena's graph was built under a kept plan — at the current MoE placement epoch, if the graph reads the
+// placement (llm_graph_result::reads_moe_placement: the trunk's split layers; the MTP drafter's NextN block has no
+// split, so a swap changes nothing it reads) — the graph accepts the new parameters (can_reuse, the same test as any
+// reuse), and the scheduler still holds the plan with its allocation.
+bool llama_context::plan_restore(int arena, llm_graph_result * res, const llm_graph_params & gparams, bool keep_plan,
+                                 std::string & why) {
+    if (!keep_plan || gf_res_prev_active == nullptr || gf_res_prev_active == res || gf_plan_key[arena] == 0) {
+        return false;
+    }
+    if (res->reads_moe_placement && gf_plan_epoch[arena] != g_moe_placement_epoch.load(std::memory_order_relaxed)) {
+        why = ":placement";
+        return false;
+    }
+    if (!res->can_reuse(gparams)) {
+        why = ":" + (res->reuse_refusal.empty() ? std::string("unknown") : res->reuse_refusal);
+        return false;
+    }
+    if (!ggml_backend_sched_plan_use(sched.get(), gf_plan_key[arena])) {
+        why = ":plan-lost";
+        return false;
+    }
+    return true;
+}
+
+void llama_context::graph_plans_clear() {
+    gf_plan_key = {0, 0};
+    if (sched) {
+        ggml_backend_sched_plan_clear(sched.get());
+    }
+}
+
 llm_graph_result * llama_context::get_gf_res_prev() {
     auto & res = gf_res_prev[n_outputs > 0];
     if (!res) {
@@ -3424,6 +3493,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    graph_plans_clear();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -4538,6 +4608,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            graph_plans_clear(); // PLAN-PER-ARENA: this arena's graph is reset, and the scheduler is not used for it
             res->reset();
 
             auto * gf = model.build_graph(gparams);
@@ -5287,8 +5358,8 @@ void llama_context::graph_stats_tick() {
     for (auto & kv : g.shapes) v.emplace_back(kv.second, kv.first);
     std::sort(v.rbegin(), v.rend());
     for (size_t i = 0; i < v.size() && i < 12; ++i) shapes += " " + v[i].second + "=" + std::to_string(v[i].first);
-    LLAMA_LOG_WARN("graph-stats[%p]: rebuild cause:%s; rebuilt shape tokens/outputs/seqs:%s\n", (void *) this,
-                   why.c_str(), shapes.c_str());
+    LLAMA_LOG_WARN("graph-stats[%p]: rebuild cause:%s; rebuilt shape tokens/outputs/seqs:%s; kept plans restored %lld\n",
+                   (void *) this, why.c_str(), shapes.c_str(), (long long) g.n_restore_small);
     const auto seen = std::move(g.seen);
     const int64_t period = g.period_us;
     g = graph_stats_t();

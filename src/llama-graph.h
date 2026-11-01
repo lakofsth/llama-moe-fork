@@ -1006,6 +1006,11 @@ public:
     // fork GRAPH-STATS: why the last can_reuse() returned false ("params", or the first refusing input's type)
     std::string reuse_refusal;
 
+    // fork (PLAN-PER-ARENA): the graph reads the MoE placement — some layer was built with an active heat split
+    // (packed GPU slots, slot maps, CPU-branch sentinels), the only graph-side reader of it (build_moe_ffn's msplit).
+    // A kept scheduler plan of such a graph is not restored across a repin or an adaptive-tier swap.
+    bool reads_moe_placement = false;
+
     llm_graph_input_i * add_input(llm_graph_input_ptr input);
 
     void add_fused_node(llm_graph_fused_node result);

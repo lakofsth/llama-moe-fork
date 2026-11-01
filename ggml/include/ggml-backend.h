@@ -354,6 +354,19 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // fork (fork-strata-ports, PLAN-PER-ARENA): keep one graph's split and allocation aside while another graph runs on
+    // the same scheduler, so two graphs that alternate are each split and allocated once. plan_set(key) names the
+    // graph just allocated (key != 0, chosen by the caller and never reused for another graph); a reset then moves that
+    // state aside instead of dropping it (one aside: it replaces the previous one). plan_use(key) makes key's state
+    // current again without splitting or allocating, and returns false, changing nothing, unless key's state is current
+    // or aside, still allocated, and the allocator's buffers have not been freed or replaced since its plan_set. The
+    // caller must still set the graph's inputs. plan_forget(key) drops key's state; plan_clear drops every kept state.
+    // With more than one copy (pipeline parallelism) nothing is kept: plan_set names nothing and plan_use is false.
+    GGML_API void                 ggml_backend_sched_plan_set(ggml_backend_sched_t sched, uint64_t key);
+    GGML_API bool                 ggml_backend_sched_plan_use(ggml_backend_sched_t sched, uint64_t key);
+    GGML_API void                 ggml_backend_sched_plan_forget(ggml_backend_sched_t sched, uint64_t key);
+    GGML_API void                 ggml_backend_sched_plan_clear(ggml_backend_sched_t sched);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 

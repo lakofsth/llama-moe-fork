@@ -415,6 +415,21 @@ private:
 
     llm_graph_result * gf_res_prev_active = nullptr;
 
+    // fork (fork-strata-ports, PLAN-PER-ARENA): each arena's graph keeps its scheduler plan (split + allocation) when
+    // the other arena runs, so a decode that alternates the two (the MTP drafter: catch-up 0 outputs, draft 1 output)
+    // neither rebuilds the graph nor re-splits it at every switch. gf_plan_key[a]: the key arena a's graph was
+    // allocated under (ggml_backend_sched_plan_set; 0 = none kept); gf_plan_epoch[a]: the MoE placement epoch then
+    // (a repin or an adaptive-tier swap moves the epoch and drops the kept plan of every graph that reads the
+    // placement, llm_graph_result::reads_moe_placement). Small ubatches only
+    // (<= graph_stats_small_max tokens), never with pipeline parallelism or a prefill chunk range.
+    // env LLAMA_GRAPH_KEEP_PLANS=0 turns it off (every switch rebuilds, as before).
+    std::array<uint64_t, 2> gf_plan_key   = {0, 0};
+    std::array<uint64_t, 2> gf_plan_epoch = {0, 0};
+    uint64_t gf_plan_serial = 0;
+    bool     graph_keep_plans = true;
+    void graph_plans_clear(); // every kept plan of this context is dropped (its graphs were reset)
+    bool plan_restore(int arena, llm_graph_result * res, const llm_graph_params & gparams, bool keep_plan, std::string & why);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -439,6 +454,7 @@ private:
         int64_t n_ub_small = 0, n_reuse_small = 0, n_build_small = 0;
         int64_t us_graph_small = 0, us_plan_small = 0;       // build_graph, sched reset + alloc
         int64_t n_ub_large = 0, n_build_large = 0, us_build_large = 0;
+        int64_t n_restore_small = 0;                          // PLAN-PER-ARENA: reuses that restored a kept plan
         std::map<std::string, int64_t>  why;                  // small rebuilds by cause
         std::map<std::string, int64_t>  shapes;               // small rebuilds by "tokens/outputs/seqs"
         std::set<std::string>           seen;                 // distinct small shapes (process lifetime)

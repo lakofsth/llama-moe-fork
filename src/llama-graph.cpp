@@ -1496,6 +1496,8 @@ void llm_graph_result::reset() {
     inputs.clear();
     fused_nodes.clear();
 
+    reads_moe_placement = false;
+
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
     ggml_init_params params = {
@@ -2289,6 +2291,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          const struct llama_moe_split * msplit) const {
+    if (msplit && msplit->active()) {
+        res->reads_moe_placement = true; // PLAN-PER-ARENA
+    }
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN

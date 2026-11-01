@@ -276,6 +276,7 @@ llama_build_and_test(test-moe-pf-ring.cpp) # fork-chunk-loop P2: the chunk prefe
 llama_build_and_test(test-moe-prefetch.cpp) # fork-kernel-fusion: copy-stream expert prefetch vs the stock upload (P1)
 llama_build_and_test(test-cuda-graph-key.cpp) # fork-strata-ports: CUDA graph cache keyed by split shape; the key never changes a result (GRAPH-KEY)
 llama_build_and_test(test-moe-tail-skip.cpp) # fork-strata-ports: Avalon/Strata tail skip of low-rank non-resident experts, opt-in (TAIL-SKIP)
+llama_build_and_test(test-sched-plan.cpp) # fork-strata-ports: a kept scheduler plan computes what a fresh split does; never restored past a buffer change (PLAN-PER-ARENA)
 llama_test(test-jinja NAME test-jinja-py ARGS -py LABEL python)
 llama_build_and_test(test-json-schema.cpp)
 llama_build_and_test(test-chat-auto-parser.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})

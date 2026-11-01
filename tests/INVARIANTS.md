@@ -303,3 +303,18 @@ One sentence per invariant; each names the test that pins it.
   as a resident hit, so the repin's view of the router is unchanged by the dial. Pinned by `tests/test-moe-tail-skip.cpp`
   (the rule on a pass whose slot order is not its weight order; the CPU op's zeroing and counting of -1-e); the
   bit-identity of the default is the measuring unit's temperature-0 run against the served binary.
+
+- **PLAN-PER-ARENA (fork-strata-ports, narrow fix for the MTP drafter's per-step rebuilds, 2026-11-01; Thomas
+  2026-11-01: "commission narrow fix", not Avalon's 8-shape cache).** A llama graph restored from its kept scheduler plan
+  (llama_context::plan_restore -> ggml_backend_sched_plan_use, when the other output arena ran last) computes exactly what
+  the same graph computes when it is rebuilt, split and allocated afresh, because a plan is restored only while all of
+  these hold: the graph object it was made for is intact and accepts the new parameters (can_reuse, the test every reuse
+  passes), the scheduler's allocator has not freed or replaced a buffer since it was made (ggml_gallocr_get_generation),
+  if the graph reads the MoE placement (llm_graph_result::reads_moe_placement: built with an active heat split, whose
+  only graph-side reader is build_moe_ffn's msplit), no repin or adaptive-tier round has swapped an expert slot since it
+  was made (the placement epoch, moved at both call sites of moe_heat_repin and moe_heat_adapt), the context was not reset or reserved since (graph_plans_clear at
+  every site that resets gf_res_prev), and the pass is decode-sized (<= 32 tokens), has one scheduler copy and no prefill
+  chunk range. LLAMA_GRAPH_KEEP_PLANS=0 turns it off. Pinned by `tests/test-sched-plan.cpp` (two graphs alternating on
+  one scheduler with host-weight input copies across a GPU and a CPU split, every round against host arithmetic; no
+  restore after the buffers are replaced, after plan_forget, and the aside plan survives a rebuild of the current graph);
+  end to end, the temperature-0 identity run against the served binary (b87cdc6ba) in the measuring unit.
