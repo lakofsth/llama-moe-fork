@@ -37,12 +37,16 @@ redundant duplicates kept for history. Original authorship is preserved on both 
 | `LLAMA_MOE_REPIN_BIAS_K` | 0.4 | threshold compensation per unit of router bias |
 | `LLAMA_MOE_ROUTER_BIAS` | 0 | ε added to resident experts' selection scores |
 | `LLAMA_MOE_BIAS_GATE` | 0.05 | max relative routed-mass displacement per token; `0` = ungated (logs a warning — measured cost at ε=0.5: +2.6 % PPL on a narrow register but **+22 % on a wide one, +29 % on a mismatched map**; the gate holds all of these at noise level) |
-| `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (use with `-lv 2`) |
+| `LLAMA_MOE_HEAT_TRACE` | 0 | per-window hit-rate trace (raise verbosity: see below) |
 | `LLAMA_MOE_SPLIT_PP` | unset (off) | engage the heat-split on prompt-processing batches too (default: split runs for tg-shaped batches only, pp uses the stock chain). **Opt-in, and the dominant pp lever: ~2.6–2.8× prompt throughput** — measured on V4-Flash at `-ub 2048`, ~200 t/s with it on vs ~75 off (`pb-splitpp-disc`, 2026-07-21). Numerically parity-safe (~3–4 dp; the earlier m2 CUDA illegal-access was fixed in `48cea759b`). Set `LLAMA_MOE_SPLIT_PP=1` for prompt-heavy workloads |
 | `LLAMA_MOE_PREFETCH` | — | router-lookahead async prefetch (phase A). Measured no-op when weights are fully RAM/page-cache resident (Qwen3-235B warm-cache test); intended for genuinely NVMe-tail-streaming configs |
 | `LLAMA_MMAP_NO_PREFETCH` | 0 | skip whole-file MADV_WILLNEED at load |
 
-Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv 2`.
+Repin/trace events log at WARN; `llama-cli` defaults to error-only, so pass `-lv 2` there.
+On `llama-server` that is not enough: `-lv 2` suppresses library INFO, the
+class carrying the `moe-heat-split:` placement line, while server INFO still prints. Use `-lv 4`
+(or `-v`). `ENABLED` reports the split was built, not used: only a non-zero online hit rate shows
+it is consulted.
 
 ## Measured (fi-prose register, 5090 + DDR5, tg tokens/s)
 
